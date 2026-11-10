@@ -281,7 +281,7 @@ mod tests {
 
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::pty::{OpenptyResult, Winsize, openpty};
-    use nix::sys::termios::{self, LocalFlags, SetArg};
+    use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
     use nix::unistd::{pipe, write};
 
     use std::io;
@@ -302,6 +302,20 @@ mod tests {
         OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL).unwrap())
     }
 
+    fn assert_restored(fd: BorrowedFd<'_>, saved: &Termios) {
+        let actual = attrs(fd).unwrap();
+
+        #[cfg(target_os = "macos")]
+        let actual = {
+            let mut raw = nix::libc::termios::from(actual);
+            raw.c_lflag = (raw.c_lflag & !nix::libc::PENDIN)
+                | (saved.local_flags & LocalFlags::PENDIN).bits();
+            Termios::from(raw)
+        };
+
+        assert_eq!(&actual, saved);
+    }
+
     #[test]
     fn raw_mode_is_restored_on_drop() {
         let pty = pty();
@@ -316,7 +330,7 @@ mod tests {
             );
         }
 
-        assert_eq!(attrs(pty.slave.as_fd()).unwrap(), saved);
+        assert_restored(pty.slave.as_fd(), &saved);
     }
 
     #[test]
@@ -331,7 +345,7 @@ mod tests {
 
         assert!(fail(pty.slave.as_fd()).is_err());
 
-        assert_eq!(attrs(pty.slave.as_fd()).unwrap(), saved);
+        assert_restored(pty.slave.as_fd(), &saved);
     }
 
     #[test]
@@ -354,7 +368,7 @@ mod tests {
         let term = Terminal::new(pty.slave.as_fd(), true).unwrap();
         term.restore().unwrap();
 
-        assert_eq!(attrs(pty.slave.as_fd()).unwrap(), saved);
+        assert_restored(pty.slave.as_fd(), &saved);
         term.enter().unwrap();
 
         assert!(
@@ -365,7 +379,29 @@ mod tests {
         );
         drop(term);
 
-        assert_eq!(attrs(pty.slave.as_fd()).unwrap(), saved);
+        assert_restored(pty.slave.as_fd(), &saved);
+    }
+
+    #[tokio::test]
+    async fn restoring_canonical_mode_preserves_pending_input() {
+        let pty = pty();
+        let saved = attrs(pty.slave.as_fd()).unwrap();
+        {
+            let _term = Terminal::new(pty.slave.as_fd(), true).unwrap();
+            write(&pty.master, b"queued\n").unwrap();
+        }
+
+        assert_restored(pty.slave.as_fd(), &saved);
+
+        let mut input = Input::new(pty.slave.as_fd()).unwrap();
+        let mut buf = [0; 32];
+        let n = tokio::time::timeout(Duration::from_secs(3), input.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(&buf[..n], b"queued\n");
+        assert_restored(pty.slave.as_fd(), &saved);
     }
 
     #[test]
