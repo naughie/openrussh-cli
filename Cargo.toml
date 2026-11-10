@@ -1,0 +1,28 @@
+[package]
+name = "openrussh-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "ssh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+nix = { version = "0.31", features = ["fs", "net", "process", "signal", "term"] }
+openrussh-client = { version = "0.4", default-features = false, features = ["aws-lc-rs", "rsa", "flate2", "config-parser", "known-hosts", "local-stream-forwarding", "local-tcp-forwarding", "process"] }
+terminal_size = "0.4"
+tokio = { version = "1.54", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+rand = "0.10"
+tempfile = "3.27"
+tokio = { version = "1.54", features = ["process"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+strip = "symbols"

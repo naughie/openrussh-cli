@@ -1,0 +1,12 @@
+[package]
+name = "tester"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+libtest-mimic.workspace = true
+nix.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
