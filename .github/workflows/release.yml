@@ -62,9 +62,9 @@ jobs:
           submodules: recursive
       - name: Install Rust
         run: rustup update stable --no-self-update
-      - name: Run unit tests
+      - name: Run the unit tests
         run: cargo +stable test --locked
-      - name: Run OpenSSH integration tests
+      - name: Run the integration tests
         run: ./tests/x.sh
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
