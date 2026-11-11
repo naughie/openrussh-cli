@@ -1,6 +1,9 @@
-use openrussh_client::config::Host;
+use crate::config::algorithms::Policies;
+use crate::known_hosts::KnownHostsFile;
+
+use openrussh_client::config::{Chain, Host};
 use openrussh_client::connect::{Context, MakeHandler};
-use openrussh_client::known_hosts::{KnownHosts, KnownHostsHandler, MatchResult};
+use openrussh_client::known_hosts::{KnownHostsHandler, MatchResult};
 use openrussh_client::russh::Channel;
 use openrussh_client::russh::Preferred;
 use openrussh_client::russh::client::{ChannelOpenHandle, Config, Handler, Msg, Session};
@@ -8,48 +11,56 @@ use openrussh_client::russh::keys::{PublicKey, PublicKeyOrCertificate};
 
 use anyhow::{Context as _, Result, bail};
 
-use std::convert::Infallible;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) struct MyMakeHandler {
-    known_hosts: KnownHosts,
+pub(crate) struct MyMakeHandler<'a> {
+    known_hosts: KnownHostsFile,
     preferred: Preferred,
+    algorithms: Option<(&'a Chain, &'a Policies)>,
 }
 
-impl MyMakeHandler {
-    pub(crate) fn new(preferred: Preferred) -> Result<Self> {
-        use std::io::ErrorKind;
-
-        let known_hosts = match KnownHosts::parse_default_path() {
-            Ok(known_hosts) => known_hosts,
-            Err(e) if e.kind() == ErrorKind::NotFound => KnownHosts::parse(""),
-            Err(e) => return Err(e).context("Failed to read known_hosts"),
-        };
-
-        Ok(Self {
+impl<'a> MyMakeHandler<'a> {
+    pub(crate) fn new(preferred: Preferred, known_hosts: KnownHostsFile) -> Self {
+        Self {
             known_hosts,
             preferred,
-        })
+            algorithms: None,
+        }
+    }
+
+    pub(crate) fn with_algorithms(mut self, chain: &'a Chain, algorithms: &'a Policies) -> Self {
+        self.algorithms = Some((chain, algorithms));
+        self
     }
 }
 
-impl MakeHandler for MyMakeHandler {
+impl MakeHandler for MyMakeHandler<'_> {
     type Handler = MyHandler;
-    type Error = Infallible;
+    type Error = anyhow::Error;
 
     fn make_handler(&self, host: &Host) -> Result<Context<Self::Handler>, Self::Error> {
         let known_hosts = self.known_hosts.handler(&host.dest.name, host.dest.port);
+        let algorithms = self
+            .algorithms
+            .map(|(chain, policies)| policies.get(chain, host))
+            .transpose()?;
 
         let mut conf = Config {
             preferred: self.preferred.clone(),
             ..Default::default()
         };
-        known_hosts.update_preferred_config(&mut conf.preferred);
+        if !algorithms.is_some_and(|algorithms| algorithms.has_host_keys()) {
+            known_hosts.update_preferred_config(&mut conf.preferred);
+        }
+        if let Some(algorithms) = algorithms {
+            algorithms.apply(&mut conf.preferred);
+        }
 
         let handler = MyHandler {
             known_hosts,
+            save_path: self.known_hosts.save_path().clone(),
             accepted: None,
             host: host.dest.name.to_ascii_lowercase(),
             port: host.dest.port,
@@ -61,6 +72,7 @@ impl MakeHandler for MyMakeHandler {
 
 pub(crate) struct MyHandler {
     known_hosts: KnownHostsHandler,
+    save_path: Arc<Path>,
     accepted: Option<PublicKey>,
     host: String,
     port: u16,
@@ -99,9 +111,10 @@ impl Handler for MyHandler {
             MatchResult::NotFound => {
                 let host = self.host.clone();
                 let port = self.port;
+                let save_path = self.save_path.clone();
                 let key = key.public_key();
                 let accepted = tokio::task::spawn_blocking(move || {
-                    let confirmed = confirm_key(&host, port, &key)?;
+                    let confirmed = confirm_key(&save_path, &host, port, &key)?;
                     Result::<_, anyhow::Error>::Ok(confirmed.then_some(key))
                 })
                 .await
@@ -265,7 +278,7 @@ fn host_port(host: &str, port: u16) -> impl std::fmt::Display + '_ {
     HostPort(host, port)
 }
 
-fn confirm_key(host: &str, port: u16, key: &PublicKey) -> Result<bool> {
+fn confirm_key(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<bool> {
     use std::fs::OpenOptions;
     use std::io::BufReader;
 
@@ -279,7 +292,8 @@ fn confirm_key(host: &str, port: u16, key: &PublicKey) -> Result<bool> {
             return Ok(false);
         }
     }
-    save_key(host, port, key).context("Failed to save host key")?;
+    save_key_at(path, host, port, key)
+        .with_context(|| format!("Failed to save host key to {}", path.display()))?;
     eprintln!(
         "Warning: Permanently added '{}' ({}) to the list of known hosts.",
         host_port(host, port),
@@ -330,16 +344,6 @@ fn prompt_key<R: BufRead, W: Write>(
     }
 }
 
-fn save_key(host: &str, port: u16, key: &PublicKey) -> Result<()> {
-    let path = if let Some(mut home) = std::env::home_dir() {
-        home.push(".ssh/known_hosts");
-        home
-    } else {
-        "/etc/ssh/ssh_known_hosts".into()
-    };
-    save_key_at(&path, host, port, key)
-}
-
 fn save_key_at(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> {
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::{Read as _, Seek as _, SeekFrom};
@@ -378,6 +382,7 @@ fn save_key_at(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()
 mod tests {
     use super::*;
 
+    use openrussh_client::known_hosts::KnownHosts;
     use openrussh_client::russh::keys::PrivateKey;
 
     fn key() -> PrivateKey {
@@ -396,6 +401,7 @@ mod tests {
     fn handler(hosts: &str) -> MyHandler {
         MyHandler {
             known_hosts: KnownHosts::parse(hosts).handler("server.example", 22),
+            save_path: Path::new("/unused-known-hosts").into(),
             accepted: None,
             host: "server.example".to_owned(),
             port: 22,
@@ -474,13 +480,15 @@ mod tests {
 
         use std::borrow::Cow;
 
-        let maker = MyMakeHandler {
-            known_hosts: KnownHosts::parse(""),
-            preferred: Preferred {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selected_hosts");
+        let maker = MyMakeHandler::new(
+            Preferred {
                 cipher: Cow::Borrowed(&[cipher::AES_256_CTR]),
                 ..Default::default()
             },
-        };
+            KnownHostsFile::load(Some(&path)).unwrap(),
+        );
 
         let host = Host {
             dest: Dest {
@@ -497,6 +505,8 @@ mod tests {
         assert_eq!(handler.host, "server.example");
 
         assert_eq!(handler.port, 2222);
+
+        assert_eq!(handler.save_path.as_ref(), path);
 
         assert!(handler.accepted.is_none());
 

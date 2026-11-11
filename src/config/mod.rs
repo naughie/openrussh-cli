@@ -10,8 +10,13 @@ mod lua;
 mod openssh;
 mod toml;
 
+pub(crate) mod algorithms;
+use algorithms::Policies;
+
 pub(crate) struct Config {
     pub chain: Chain,
+    pub algorithms: Policies,
+    pub meta: Meta,
     pub session: Session,
     pub stdin_null: bool,
     pub escape_char: Option<u8>,
@@ -19,6 +24,28 @@ pub(crate) struct Config {
     pub compression: bool,
     pub ciphers: Option<String>,
     pub macs: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Meta {
+    pub known_hosts: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(super) struct Resolved {
+    pub chain: Chain,
+    pub algorithms: Policies,
+    pub meta: Meta,
+}
+
+impl From<Chain> for Resolved {
+    fn from(chain: Chain) -> Self {
+        Self {
+            chain,
+            algorithms: Policies::default(),
+            meta: Meta::default(),
+        }
+    }
 }
 
 pub(crate) struct Options {
@@ -84,7 +111,11 @@ pub(crate) enum ForwardTarget {
 
 impl Options {
     pub fn load(self) -> Result<Config> {
-        let mut chain = self.chain()?;
+        let Resolved {
+            mut chain,
+            algorithms,
+            meta,
+        } = self.resolve()?;
 
         if let Some(tty) = self.tty {
             chain.target.tty = tty;
@@ -92,6 +123,8 @@ impl Options {
 
         Ok(Config {
             chain,
+            algorithms,
+            meta,
             session: self.session,
             stdin_null: self.stdin_null,
             escape_char: self.escape_char,
@@ -102,7 +135,7 @@ impl Options {
         })
     }
 
-    fn chain(&self) -> Result<Chain> {
+    fn resolve(&self) -> Result<Resolved> {
         if let Some(path) = &self.config_file {
             if path == Path::new("none") {
                 return formats::defaults(self);
@@ -121,7 +154,7 @@ impl Options {
         self.default_config(&dir)
     }
 
-    fn default_config(&self, dir: &Path) -> Result<Chain> {
+    fn default_config(&self, dir: &Path) -> Result<Resolved> {
         use std::fs::File;
         use std::io::ErrorKind;
 
@@ -140,7 +173,7 @@ impl Options {
         formats::defaults(self)
     }
 
-    fn read_config(&self, mut f: std::fs::File, path: &Path) -> Result<Chain> {
+    fn read_config(&self, mut f: std::fs::File, path: &Path) -> Result<Resolved> {
         if path
             .extension()
             .is_some_and(|ext| ext == "toml" || ext == "lua")
@@ -243,6 +276,214 @@ mod tests {
     }
 
     #[test]
+    fn native_algorithms_and_meta_resolve_independently_for_each_hop() -> Result<()> {
+        use openrussh_client::russh::kex;
+        use openrussh_client::russh::keys::ssh_key::Algorithm;
+
+        let (_dir, options) = config("")?;
+        let toml = toml::ParsedConfig::parse(
+            r#"
+[default]
+host-name = 'same.example'
+user = 'same'
+identity-agent = '/sockets/agent'
+kex-algorithms = 'diffie-hellman-group14-sha256'
+host-key-algorithms = ['ssh-ed25519']
+[hosts.sample]
+kex-algorithms = ['curve25519-sha256']
+proxy-jump = 'jump'
+[hosts.jump]
+[meta]
+known-hosts = '~/.ssh/custom_known_hosts'
+"#,
+        )?;
+        let lua = lua::ParsedConfig::execute(
+            r#"
+return {
+    default = {
+        host_name = 'same.example', user = 'same', identity_agent = '/sockets/agent',
+        kex_algorithms = 'diffie-hellman-group14-sha256', host_key_algorithms = {'ssh-ed25519'},
+    },
+    hosts = {sample = {kex_algorithms = {'curve25519-sha256'}, proxy_jump = 'jump'}, jump = {}},
+    meta = {known_hosts = os.getenv('HOME') .. '/.ssh/custom_known_hosts'},
+}
+"#,
+        )?;
+        let expected_path = std::env::home_dir()
+            .unwrap()
+            .join(".ssh/custom_known_hosts");
+
+        for resolved in [toml.resolve(&options)?, lua.resolve(&options)?] {
+            let jump = &resolved.chain.bastions.as_deref().unwrap()[0];
+            assert_eq!(&resolved.chain.target, jump);
+            assert_eq!(
+                resolved.meta.known_hosts.as_deref(),
+                Some(expected_path.as_path())
+            );
+
+            for (host, expected) in [
+                (&resolved.chain.target, kex::CURVE25519),
+                (jump, kex::DH_G14_SHA256),
+            ] {
+                let mut preferred = Preferred::default();
+                resolved
+                    .algorithms
+                    .get(&resolved.chain, host)
+                    .unwrap()
+                    .apply(&mut preferred);
+
+                assert_eq!(preferred.kex[0], expected);
+                assert_eq!(preferred.key.as_ref(), &[Algorithm::Ed25519]);
+                assert!(preferred.host_key_certificates.is_empty());
+            }
+            assert!(
+                resolved
+                    .algorithms
+                    .get(&resolved.chain, &jump.clone())
+                    .is_err()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn known_hosts_does_not_widen_an_explicit_host_key_list() -> Result<()> {
+        use crate::handler::MyMakeHandler;
+        use crate::known_hosts::KnownHostsFile;
+        use openrussh_client::connect::MakeHandler as _;
+        use openrussh_client::russh::keys::ssh_key::HashAlg;
+        use openrussh_client::russh::keys::{Algorithm, PrivateKey};
+
+        let (dir, options) = config("")?;
+        let resolved = toml::ParsedConfig::parse(
+            "[default]\nhost-name = 'server.example'\nhost-key-algorithms = 'rsa-sha2-512'",
+        )?
+        .resolve(&options)?;
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let path = dir.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            format!("server.example {}\n", key.public_key().to_openssh()?),
+        )?;
+        let maker = MyMakeHandler::new(Preferred::default(), KnownHostsFile::load(Some(&path))?)
+            .with_algorithms(&resolved.chain, &resolved.algorithms);
+        let (_, client) = maker
+            .make_handler(&resolved.chain.target)
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            client.preferred.key.as_ref(),
+            &[Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512)
+            }]
+        );
+        assert!(client.preferred.host_key_certificates.is_empty());
+        assert!(maker.make_handler(&resolved.chain.target.clone()).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lua_inline_hops_keep_distinct_policies_for_identical_connections() -> Result<()> {
+        use openrussh_client::russh::kex;
+
+        let (_dir, options) = config("")?;
+        let resolved = lua::ParsedConfig::execute(
+            r#"
+return {
+    default = {host_name = 'same.example', user = 'same'},
+    hosts = {sample = {kex_algorithms = 'curve25519-sha256', proxy_jump = {
+        {host_name = 'same.example'},
+        {host_name = 'same.example', kex_algorithms = 'diffie-hellman-group14-sha256'},
+        {host_name = 'same.example'},
+        {host_name = 'same.example', kex_algorithms = 'diffie-hellman-group16-sha512'},
+        {host_name = 'same.example'},
+    }}},
+}
+"#,
+        )?
+        .resolve(&options)?;
+        let hops = resolved.chain.bastions.as_deref().unwrap();
+
+        assert!(hops.iter().all(|host| *host == resolved.chain.target));
+
+        for (host, expected) in [
+            (&resolved.chain.target, Some(kex::CURVE25519)),
+            (&hops[0], None),
+            (
+                &hops[1],
+                Some(kex::Name::try_from("diffie-hellman-group16-sha512").unwrap()),
+            ),
+            (&hops[2], None),
+            (&hops[3], Some(kex::DH_G14_SHA256)),
+            (&hops[4], None),
+        ] {
+            let mut preferred = Preferred::default();
+            let policy = resolved.algorithms.get(&resolved.chain, host).unwrap();
+            policy.apply(&mut preferred);
+            if let Some(expected) = expected {
+                assert_eq!(preferred.kex[0], expected);
+            } else {
+                assert!(policy.is_empty());
+                assert_eq!(preferred.kex.as_ref(), Preferred::default().kex.as_ref());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_and_algorithm_validation_do_not_extend_openssh() -> Result<()> {
+        let (_dir, options) = config("")?;
+        for source in [
+            "[meta]\nknown-hosts = 'relative'",
+            "[meta]\nknown-hosts = ''",
+            "[meta]\nknown-hosts = 1",
+            "[meta]\nlog-level = 'debug'",
+            "[default]\nknown-hosts = '/tmp/hosts'",
+            "[hosts.unused]\nkex-algorithms = 'unknown'",
+            "[hosts.unused]\nhost-key-algorithms = '-ssh-*'",
+            "[default]\nkex-algorithms = []",
+        ] {
+            assert!(
+                toml::ParsedConfig::parse(source)
+                    .and_then(|p| p.resolve(&options))
+                    .is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            "return {meta = {known_hosts = '~/hosts'}}",
+            "return {meta = {known_hosts = '$HOME/hosts'}}",
+            "return {meta = {known_hosts = ''}}",
+            "return {meta = {known_hosts = false}}",
+            "return {meta = {log_level = 'debug'}}",
+            "return {hosts = {unused = {meta = {known_hosts = '/tmp/hosts'}}}}",
+            "return {hosts = {unused = {proxy_jump = {host_name = 'jump', kex_algorithms = 'unknown'}}}}",
+        ] {
+            assert!(
+                lua::ParsedConfig::execute(source)
+                    .and_then(|p| p.resolve(&options))
+                    .is_err(),
+                "{source}"
+            );
+        }
+
+        let (_dir, options) = config(
+            "Host sample\n KexAlgorithms diffie-hellman-group1-sha1\n HostKeyAlgorithms rsa-sha2-512\n UserKnownHostsFile /ignored/hosts\n",
+        )?;
+        let resolved = options.resolve()?;
+
+        assert!(resolved.algorithms.target.is_empty());
+        assert!(resolved.algorithms.bastions.is_none());
+        assert!(resolved.meta.known_hosts.is_none());
+
+        Ok(())
+    }
+
+    #[test]
     fn readme_examples_resolve_documented_host_settings() -> Result<()> {
         fn example<'src>(readme: &'src str, fence: &str) -> Result<&'src str> {
             let (_, code) = readme.split_once(fence).context("Missing README example")?;
@@ -269,8 +510,8 @@ mod tests {
             ("my-host", "example.com", "alice", 2222, RequestTty::IfTty),
         ] {
             options.destination.host = alias.to_owned();
-            let toml = toml.resolve(&options)?;
-            let lua = lua.resolve(&options)?;
+            let toml = toml.resolve(&options)?.chain;
+            let lua = lua.resolve(&options)?.chain;
 
             assert_eq!(toml.target.dest.name, host);
             assert_eq!(toml.target.dest.user, user);
@@ -317,11 +558,11 @@ mod tests {
             ("unlisted", "default-user"),
         ] {
             options.destination.host = name.to_owned();
-            let expected = openssh.resolve(&options)?.target;
+            let expected = openssh.resolve(&options)?.chain.target;
 
             assert_eq!(expected.dest.user, user);
-            assert_eq!(toml.resolve(&options)?.target, expected);
-            assert_eq!(lua.resolve(&options)?.target, expected);
+            assert_eq!(toml.resolve(&options)?.chain.target, expected);
+            assert_eq!(lua.resolve(&options)?.chain.target, expected);
         }
 
         Ok(())
@@ -409,10 +650,16 @@ mod tests {
         let (dir, conf) = config("Host sample\n User openssh\n")?;
         let path = dir.path().join("config.toml");
 
-        assert_eq!(conf.default_config(dir.path())?.target.dest.user, "openssh");
+        assert_eq!(
+            conf.default_config(dir.path())?.chain.target.dest.user,
+            "openssh"
+        );
         std::fs::write(&path, "[default]\nuser = 'toml'\n")?;
 
-        assert_eq!(conf.default_config(dir.path())?.target.dest.user, "toml");
+        assert_eq!(
+            conf.default_config(dir.path())?.chain.target.dest.user,
+            "toml"
+        );
         std::fs::write(&path, "[broken")?;
 
         assert!(conf.default_config(dir.path()).is_err());
@@ -422,7 +669,10 @@ mod tests {
         assert!(conf.default_config(dir.path()).is_err());
         std::fs::remove_dir(&path)?;
 
-        assert_eq!(conf.default_config(dir.path())?.target.dest.user, "openssh");
+        assert_eq!(
+            conf.default_config(dir.path())?.chain.target.dest.user,
+            "openssh"
+        );
 
         Ok(())
     }
@@ -434,7 +684,7 @@ mod tests {
         conf.destination.user = Some("alice".to_owned());
         conf.destination.port = Some(2200);
 
-        let chain = conf.default_config(dir.path())?;
+        let chain = conf.default_config(dir.path())?.chain;
 
         assert_eq!(chain.target.dest.user, "alice");
         assert_eq!(chain.target.dest.port, 2200);
@@ -489,7 +739,7 @@ mod tests {
         )?;
         conf.identities = Some(vec!["/keys/cli".into()]);
 
-        let chain = conf.chain()?;
+        let chain = conf.resolve()?.chain;
 
         assert_eq!(chain.target.dest.user, "scoped");
 
@@ -501,7 +751,7 @@ mod tests {
         );
         conf.destination.host = "other".to_owned();
 
-        let chain = conf.chain()?;
+        let chain = conf.resolve()?.chain;
 
         assert_eq!(chain.target.dest.user, "default");
 
@@ -519,7 +769,7 @@ mod tests {
         )?;
         conf.proxy_jump = Some(vec!["second".to_owned()]);
 
-        let chain = conf.chain()?;
+        let chain = conf.resolve()?.chain;
         let bastions = chain.bastions.context("Missing jump host")?;
 
         assert_eq!(bastions.len(), 1);
@@ -539,7 +789,7 @@ mod tests {
         conf.destination.port = Some(2200);
         conf.identities = Some(vec!["/keys/not-created".into()]);
 
-        let chain = conf.chain()?;
+        let chain = conf.resolve()?.chain;
 
         assert_eq!(chain.target.dest.name, "sample");
 
@@ -558,12 +808,12 @@ mod tests {
     #[test]
     fn explicit_missing_and_malformed_config_errors_are_preserved() -> Result<()> {
         let (dir, mut conf) = config("Host sample\n Port invalid\n")?;
-        let e = conf.chain().unwrap_err();
+        let e = conf.resolve().unwrap_err();
 
         assert!(format!("{e:#}").contains("Could not read SSH config"));
         conf.config_file = Some(dir.path().join("missing"));
 
-        let e = conf.chain().unwrap_err();
+        let e = conf.resolve().unwrap_err();
 
         assert!(format!("{e:#}").contains("Could not open SSH config"));
 

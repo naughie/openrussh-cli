@@ -1,6 +1,7 @@
-use super::Options;
 use super::formats::{PathMode, Profiles};
+use super::{Options, Resolved};
 
+#[cfg(test)]
 use openrussh_client::config::Chain;
 
 use anyhow::Result;
@@ -17,14 +18,16 @@ impl<'src> ParsedConfig<'src> {
         Ok(Self { profiles })
     }
 
-    pub(super) fn resolve(&self, options: &Options) -> Result<Chain> {
+    pub(super) fn resolve(&self, options: &Options) -> Result<Resolved> {
         self.profiles.resolve(options, PathMode::Expand)
     }
 }
 
 #[cfg(test)]
 pub(super) fn query(text: &str, options: &Options) -> Result<Chain> {
-    ParsedConfig::parse(text)?.resolve(options)
+    ParsedConfig::parse(text)?
+        .resolve(options)
+        .map(|resolved| resolved.chain)
 }
 
 #[cfg(test)]

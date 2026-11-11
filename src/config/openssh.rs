@@ -1,6 +1,4 @@
-use super::Options;
-
-use openrussh_client::config::Chain;
+use super::{Options, Resolved};
 use openrussh_client::ssh2_config::{ParseRule, SshConfig};
 
 use anyhow::{Context as _, Result};
@@ -22,7 +20,7 @@ impl ParsedConfig {
         Ok(Self { config })
     }
 
-    pub(super) fn resolve(&self, options: &Options) -> Result<Chain> {
+    pub(super) fn resolve(&self, options: &Options) -> Result<Resolved> {
         use openrussh_client::config::Target;
 
         Target {
@@ -31,6 +29,7 @@ impl ParsedConfig {
             port: options.destination.port,
         }
         .query(&self.config)
+        .map(Resolved::from)
         .context("Could not resolve the SSH connection settings")
     }
 }

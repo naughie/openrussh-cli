@@ -1,6 +1,7 @@
-use super::Options;
 use super::formats::{PathMode, Profiles};
+use super::{Options, Resolved};
 
+#[cfg(test)]
 use openrussh_client::config::Chain;
 
 use mlua::serde::Deserializer;
@@ -27,14 +28,16 @@ impl ParsedConfig {
         Ok(Self { profiles })
     }
 
-    pub(super) fn resolve(&self, options: &Options) -> Result<Chain> {
+    pub(super) fn resolve(&self, options: &Options) -> Result<Resolved> {
         self.profiles.resolve(options, PathMode::Literal)
     }
 }
 
 #[cfg(test)]
 pub(super) fn query(text: &str, options: &Options) -> Result<Chain> {
-    ParsedConfig::execute(text)?.resolve(options)
+    ParsedConfig::execute(text)?
+        .resolve(options)
+        .map(|resolved| resolved.chain)
 }
 
 #[cfg(test)]

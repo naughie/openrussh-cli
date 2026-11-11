@@ -1,9 +1,9 @@
 # Configuration architecture
 
-Configuration has three distinct representations: inputs from the CLI,
-format-specific results from reading a file, and resolved application settings.
-They are concrete types with different responsibilities. The runtime consumes
-only the resolved representation.
+Configuration separates CLI inputs, format-specific parser results, resolved
+connection/setup settings, and the final application configuration. These are
+concrete types with different responsibilities. The runtime consumes the final
+configuration and initialized resources.
 
 The [configuration reference](configuration.md) defines observable loading and
 resolution rules. This document describes the types and processing boundaries
@@ -17,8 +17,11 @@ that implement them.
 | `config::toml::ParsedConfig<'src>` | The result of parsing a TOML document. | Native profiles that can borrow from the source text. |
 | `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles, independent of the Lua VM and source text. |
 | `config::openssh::ParsedConfig` | The result of parsing OpenSSH syntax with the CLI override prefix. | The dependency's `SshConfig`. |
-| `config::formats::Profiles<'src>` | Shared Serde representation of native defaults and named host records. | A defaults record and a map of exact host aliases to `HostFields`. |
-| `config::Config` | Format-independent, resolved application configuration for one invocation. | A connection `Chain`, session policy, stdin/escape policy, local forwards, and transport preferences. |
+| `config::formats::Profiles<'src>` | Shared Serde representation of native configuration. | Top-level setup metadata, a defaults record, and a map of exact host aliases to `HostFields`. |
+| `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, and resolved setup `Meta`. |
+| `config::Meta` | Application setup settings for the invocation. | An optional known-host database path. |
+| `config::algorithms::Policies` | Algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
+| `config::Config` | Final application configuration for one invocation. | The resolved chain, algorithms, and metadata plus CLI session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
 
 `Config` is a struct, not a configuration-provider trait or a union of file
 formats. It has no Serde implementation, source-text lifetime, Lua value, file
@@ -59,16 +62,17 @@ flowchart TD
     F --> H
     G --> H
     B --> H
-    H --> I[openrussh_client::config::Chain]
+    H --> I[config::Resolved: Chain, algorithms, Meta]
     I --> J[Apply final-host CLI PTY override]
     J --> K[config::Config]
-    K --> L[Connection, session, and forwarding runtime]
+    K --> L[Initialize known-host resource and handler factory]
+    L --> M[Connection, session, and forwarding runtime]
 ```
 
 `cli::parse()` produces `Options`; it does not open configuration files or
 establish a connection. `Options::load(self)` discovers one source, resolves its
-connection chain, applies the final-host CLI PTY override, and moves the
-remaining application settings into `Config`.
+connection/setup settings into `Resolved`, applies the final-host CLI PTY
+override, and moves the remaining application settings into `Config`.
 
 File selection is centralized in `Options`. Neither `Config` nor the runtime
 contains extension checks or fallback logic. Explicit `-F`, default-file
@@ -77,7 +81,7 @@ selected file retain the filename and underlying error; they do not trigger
 fallback to another format.
 
 Each format has an explicit construction step and a separate
-`resolve(&Options) -> Result<Chain>` step:
+`resolve(&Options) -> Result<Resolved>` step:
 
 - TOML: `ParsedConfig::parse(&str)` deserializes the text with `toml` and Serde.
 - Lua: `ParsedConfig::execute(&str)` evaluates a Lua 5.4 chunk and deserializes its
@@ -111,6 +115,19 @@ records bypass that lookup and require an effective `host_name` from themselves
 or defaults. Both use the same host-resolution and jump-traversal rules; see
 the configuration reference for ordering and inheritance details.
 
+The resolver compiles each effective native algorithm list into typed transport
+names. Per-host values override defaults; list modifiers use raw transport
+defaults rather than inherited policy lists. `Policies` follows the same target
+and reversed-bastion layout as the resolved `Chain`. The handler factory borrows
+both and identifies each actual `&Host` by reference identity, so two named or
+inline hosts with the same network destination can still have different
+policies. It neither clones hosts nor uses destination names as policy keys.
+
+`Meta` is invocation setup, outside the host/default schema. Native metadata
+paths resolve under the selected format's path mode. OpenSSH resolution and
+the no-file path produce default metadata and omit explicit algorithm policies;
+the OpenSSH adapter does not extract new directives for these features.
+
 `formats::paths` implements the native path policy. TOML selects `PathMode::Expand`;
 Lua selects `PathMode::Literal`. This choice belongs to the source adapter and
 does not survive into `Config`. Literal mode also disables implicit agent
@@ -137,6 +154,20 @@ application's handler using the dependency's known-host implementation.
 compression preferences into the dependency's `Preferred`. Unknown CLI cipher
 or MAC names fail before connection establishment. These are application
 settings, independent of the file format used for host settings.
+
+`config::algorithms` validates native names and compiles replacement, append,
+remove, and prepend operations. It stores KEX methods separately from protocol
+extension signals. Applying a policy preserves the default signals while
+replacing methods. Host-key policies distinguish certificates from plain keys
+and reject an order the transport cannot represent. An explicit host-key
+policy replaces both transport lists and bypasses known-host preference
+adjustments; omitted policy retains those adjustments.
+
+Connection setup uses `Meta` to load a `known_hosts::KnownHostsFile` before
+constructing the handler factory. This resource owns parsed trust data and the
+selected save path. Handlers receive the matching helper and save path rather
+than application metadata or configuration-file details. Accepted keys are
+persisted through the same selected path.
 
 ## Ownership and resource lifetime
 
@@ -165,16 +196,19 @@ resolved `Config`.
 ## Module layout and regression boundaries
 
 ```text
-src/config/
-    mod.rs             Options, Config, shared application types, file loading
-    toml.rs            TOML ParsedConfig
-    lua.rs             Lua ParsedConfig
-    openssh.rs         OpenSSH ParsedConfig and CLI override adapter
-    formats/
-        mod.rs         Native Profiles/HostFields and host/jump resolution
-        jumps.rs       Named/inline jump representations and Serde visitors
-        values.rs      Native Serde value representations and visitors
-        paths.rs       Expansion, literal paths, and agent selection
+src/
+    known_hosts.rs     Known-host setup resource and selected database path
+    config/
+        mod.rs         Options, Resolved, Config, Meta, and file loading
+        algorithms.rs  Typed per-host policies and algorithm-list operations
+        toml.rs        TOML ParsedConfig
+        lua.rs         Lua ParsedConfig
+        openssh.rs     OpenSSH ParsedConfig and CLI override adapter
+        formats/
+            mod.rs     Native profiles, metadata, and host/jump resolution
+            jumps.rs   Named/inline jump representations and Serde visitors
+            values.rs  Native Serde value representations and visitors
+            paths.rs   Expansion, literal paths, and agent selection
 ```
 
 Changes to one parser should stay within its adapter unless the shared native

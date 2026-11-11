@@ -1,4 +1,5 @@
-use super::Options;
+use super::algorithms::{self, Algorithms, Policies};
+use super::{Meta, Options, Resolved};
 
 use openrussh_client::config::{Auth, Chain, Dest, Host, RequestTty, Target};
 
@@ -28,6 +29,15 @@ pub(super) struct Profiles<'src> {
     defaults: HostFields<'src>,
     #[serde(borrow)]
     hosts: BTreeMap<Text<'src>, HostFields<'src>>,
+    #[serde(borrow)]
+    meta: MetaFields<'src>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+struct MetaFields<'src> {
+    #[serde(borrow, alias = "known_hosts")]
+    known_hosts: Option<Text<'src>>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -54,9 +64,13 @@ struct HostFields<'src> {
     request_tty: Option<RequestTty>,
     #[serde(borrow, alias = "proxy_jump")]
     proxy_jump: Option<Jumps<'src>>,
+    #[serde(borrow, alias = "kex_algorithms")]
+    kex_algorithms: Option<Strings<'src>>,
+    #[serde(borrow, alias = "host_key_algorithms")]
+    host_key_algorithms: Option<Strings<'src>>,
 }
 
-pub(super) fn defaults(conf: &Options) -> Result<Chain> {
+pub(super) fn defaults(conf: &Options) -> Result<Resolved> {
     Profiles::default().resolve(conf, PathMode::Expand)
 }
 
@@ -75,9 +89,9 @@ impl Profiles<'_> {
         Ok(())
     }
 
-    pub(super) fn resolve(&self, conf: &Options, paths: PathMode) -> Result<Chain> {
+    pub(super) fn resolve(&self, conf: &Options, paths: PathMode) -> Result<Resolved> {
         for host in std::iter::once(&self.defaults).chain(self.hosts.values()) {
-            host.validate_paths(paths)?;
+            host.validate(paths)?;
         }
 
         let doc = self;
@@ -86,31 +100,53 @@ impl Profiles<'_> {
             user: conf.destination.user.as_deref(),
             port: conf.destination.port,
         });
-        let target_host = resolve_host(target, doc, Some(conf), paths)?;
+        let (target_host, target_algorithms) = resolve_host(target, doc, Some(conf), paths)?;
         let mut pending = jumps(target, doc, Some(conf));
         let mut bastions: Option<Vec<Host>> = None;
+        let mut bastion_algorithms: Option<Vec<Algorithms>> = None;
 
         while let Some(first) = pending.next() {
             let chain = bastions.get_or_insert_with(Vec::new);
             chain.reserve(pending.size_hint().0 + 1);
 
             for jump in pending.rev() {
-                chain.push(resolve_host(jump, doc, None, paths)?);
+                push_host(jump, doc, paths, chain, &mut bastion_algorithms)?;
             }
 
-            chain.push(resolve_host(first, doc, None, paths)?);
+            push_host(first, doc, paths, chain, &mut bastion_algorithms)?;
             pending = jumps(first, doc, None);
         }
 
-        Ok(Chain {
-            target: target_host,
-            bastions: bastions.map(Vec::into_boxed_slice),
+        Ok(Resolved {
+            chain: Chain {
+                target: target_host,
+                bastions: bastions.map(Vec::into_boxed_slice),
+            },
+            algorithms: Policies {
+                target: target_algorithms,
+                bastions: bastion_algorithms.map(Vec::into_boxed_slice),
+            },
+            meta: Meta {
+                known_hosts: self
+                    .meta
+                    .known_hosts
+                    .as_ref()
+                    .map(|value| paths.path(Path::new(value.as_str()), "known_hosts"))
+                    .transpose()?,
+            },
         })
     }
 }
 
 impl HostFields<'_> {
-    fn validate_paths(&self, paths: PathMode) -> Result<()> {
+    fn validate(&self, paths: PathMode) -> Result<()> {
+        if let Some(names) = &self.kex_algorithms {
+            algorithms::validate_kex(algorithm_names(names))?;
+        }
+        if let Some(names) = &self.host_key_algorithms {
+            algorithms::validate_host_keys(algorithm_names(names))?;
+        }
+
         for path in self
             .identity_file
             .as_ref()
@@ -133,7 +169,7 @@ impl HostFields<'_> {
             .flat_map(Jumps::as_slice)
         {
             if let Jump::Host(host) = jump {
-                host.validate_paths(paths)?;
+                host.validate(paths)?;
             }
         }
 
@@ -163,12 +199,44 @@ impl<'a, 'src> HostRef<'a, 'src> {
     }
 }
 
+fn algorithm_names<'a>(value: &'a Strings<'_>) -> impl Iterator<Item = &'a str> + Clone {
+    let (string, array) = match value {
+        Strings::One(s) => (Some(s.as_str()), None),
+        Strings::Many(v) => (None, Some(v.as_slice())),
+    };
+
+    string
+        .into_iter()
+        .flat_map(|s| s.split(','))
+        .chain(array.into_iter().flatten().map(Text::as_str))
+}
+
+fn push_host<'a, 'src>(
+    target: HostRef<'a, 'src>,
+    doc: &'a Profiles<'src>,
+    paths: PathMode,
+    hosts: &mut Vec<Host>,
+    policies: &mut Option<Vec<Algorithms>>,
+) -> Result<()> {
+    let (host, algorithms) = resolve_host(target, doc, None, paths)?;
+    if !algorithms.is_empty() || policies.is_some() {
+        let policies = policies.get_or_insert_with(|| {
+            let mut values = Vec::with_capacity(hosts.capacity());
+            values.resize_with(hosts.len(), Algorithms::default);
+            values
+        });
+        policies.push(algorithms);
+    }
+    hosts.push(host);
+    Ok(())
+}
+
 fn resolve_host<'a, 'src>(
     target: HostRef<'a, 'src>,
     doc: &'a Profiles<'src>,
     cli: Option<&Options>,
     paths: PathMode,
-) -> Result<Host> {
+) -> Result<(Host, Algorithms)> {
     use anyhow::Context as _;
 
     let empty = HostFields::default();
@@ -249,17 +317,35 @@ fn resolve_host<'a, 'src>(
         .or(defaults.request_tty)
         .unwrap_or_default();
 
-    Ok(Host {
-        dest: Dest { name, user, port },
-        auth: Auth {
-            identities,
-            cert,
-            agent,
-            identities_only,
-            ..Auth::default()
+    let algorithms = Algorithms {
+        kex: host
+            .kex_algorithms
+            .as_ref()
+            .or(defaults.kex_algorithms.as_ref())
+            .map(|names| algorithms::kex(algorithm_names(names)))
+            .transpose()?,
+        host_keys: host
+            .host_key_algorithms
+            .as_ref()
+            .or(defaults.host_key_algorithms.as_ref())
+            .map(|names| algorithms::host_keys(algorithm_names(names)))
+            .transpose()?,
+    };
+
+    Ok((
+        Host {
+            dest: Dest { name, user, port },
+            auth: Auth {
+                identities,
+                cert,
+                agent,
+                identities_only,
+                ..Auth::default()
+            },
+            tty,
         },
-        tty,
-    })
+        algorithms,
+    ))
 }
 
 fn jumps<'t, 'src>(
@@ -493,7 +579,10 @@ certificate-file = "/keys/certificate"
         let mut conf = config("sample");
         conf.identities = Some(vec![path.clone()]);
 
-        assert_eq!(defaults(&conf)?.target.auth.identities, Some(vec![path]));
+        assert_eq!(
+            defaults(&conf)?.chain.target.auth.identities,
+            Some(vec![path])
+        );
 
         Ok(())
     }

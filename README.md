@@ -115,6 +115,8 @@ Unknown fields and invalid types are errors, including in unused hosts.
 | `identities-only` | `identities_only` | Boolean or boolean string | `false` |
 | `request-tty` | `request_tty` | Boolean or TTY-mode string | `"auto"` |
 | `proxy-jump` | `proxy_jump` | String or list; Lua also accepts inline jump-host tables | No jump hosts |
+| `kex-algorithms` | `kex_algorithms` | Ordered comma-separated string or array of algorithm names | Transport defaults |
+| `host-key-algorithms` | `host_key_algorithms` | Ordered comma-separated string or array of host-key algorithm names | Transport defaults with known-host preferences |
 
 Both native formats also accept `defaults` and the other format's field-name
 spelling. Host names are never case-folded.
@@ -131,6 +133,38 @@ It filters identities used for user authentication; it does not disable the agen
 - `false`, `"false"`, or `"no"`: do not request a PTY.
 - `"auto"`: request a PTY for a remote shell session.
 - `"force"`: request a PTY even when local stdin is not a terminal.
+
+### Algorithm preferences
+
+Native host and default tables can select key-exchange and server host-key
+algorithms:
+
+```toml
+[default]
+kex-algorithms = "curve25519-sha256,mlkem768x25519-sha256"
+
+[hosts.work]
+host-key-algorithms = ["ssh-ed25519", "rsa-sha2-512"]
+```
+
+Use `kex_algorithms` and `host_key_algorithms` in Lua. A host value replaces the
+default table's value. Prefix the first algorithm with `+` to append, `-` to
+remove, or `^` to prepend relative to the transport's built-in defaults;
+without a prefix, the list replaces those defaults. For example,
+`host_key_algorithms = { "^rsa-sha2-512", "ssh-ed25519" }` puts those keys first.
+Modifiers use the transport defaults, whose certificate list is empty.
+Unknown names in replacement, append, or prepend lists are errors; removal
+ignores names absent from the defaults. Wildcards, empty lists, and empty
+results are errors.
+
+Host-certificate names such as `ssh-ed25519-cert-v01@openssh.com` are supported.
+The transport requires all certificate algorithms before plain host-key
+algorithms; a list or modifier result that puts a certificate after a plain key
+is rejected. An explicit host-key list is used as supplied without known-host
+reordering or added algorithms/certificates. Omitting the setting preserves the
+known-host preference behavior. Each jump host has its own policy, including
+Lua inline hosts. KEX extension signals are managed by the client, not supplied
+as algorithm names. CLI `-C`, `-c`, and `-m` retain their existing behavior.
 
 ### Paths and authentication agents
 
@@ -149,6 +183,29 @@ Use Lua expressions such as `os.getenv("HOME") .. "/.ssh/id_ed25519"` or
 is not a path and is rejected. If neither the host nor the default table sets
 `identity_agent`, no authentication agent is used. Lua configuration never reads
 `SSH_AUTH_SOCK` implicitly.
+
+### Application setup
+
+The optional top-level `meta` table configures resources for the invocation,
+separately from host settings. Its only field is the known-host database path:
+
+```toml
+[meta]
+known-hosts = "~/.ssh/known_hosts"
+```
+
+```lua
+local home = assert(os.getenv("HOME"))
+return { meta = { known_hosts = home .. "/.ssh/known_hosts" } }
+```
+
+TOML expands tildes using the path rules above; Lua requires a literal absolute
+path or an expression producing one. This path has no environment-reference
+syntax. `meta` is not a host/default field, and unknown setup fields are errors.
+If omitted, the library's default known-host path is used. The selected file is
+used for checks and for saving accepted host keys across all jump hosts and the
+destination. A missing file starts with empty trust; other read failures stop
+setup.
 
 ### Defaults and overrides
 
@@ -212,10 +269,11 @@ Tilde expansion supports the current user; paths that cannot be expanded are
 omitted. `IdentityAgent` uses the same environment-reference syntax and
 `SSH_AUTH_SOCK` fallback as TOML, with the library's permissive path handling.
 
-Parsing another directive does not enable that feature. Forwarding and
-algorithm preferences use CLI options; `UserKnownHostsFile` does not change the
-default host-key database. Unsupported and unknown directives follow the
-library parser's rules.
+Parsing another directive does not enable that feature. OpenSSH-file
+`KexAlgorithms` and `HostKeyAlgorithms` remain ineffective; native fields above
+provide those settings. Forwarding, cipher, MAC, and compression preferences
+use CLI options. `UserKnownHostsFile` does not change the host-key database.
+Unsupported and unknown directives follow the library parser's rules.
 
 See the [configuration reference](docs/configuration.md) for complete field,
 validation, inheritance, and jump-chain rules.

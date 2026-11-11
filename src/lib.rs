@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod forwarding;
 mod handler;
+mod known_hosts;
 mod session;
 mod terminal;
 
@@ -23,10 +24,14 @@ pub async fn main_impl() {
 
 async fn run() -> Result<u8> {
     use crate::handler::MyMakeHandler;
+    use crate::known_hosts::KnownHostsFile;
     use crate::terminal::{Event, Signals};
 
     let conf = cli::parse()?.load()?;
-    let make_handler = MyMakeHandler::new(conf.preferred()?)?;
+    let preferred = conf.preferred()?;
+    let known_hosts = KnownHostsFile::load(conf.meta.known_hosts.as_deref())?;
+    let make_handler =
+        MyMakeHandler::new(preferred, known_hosts).with_algorithms(&conf.chain, &conf.algorithms);
 
     let mut signals = Signals::new()?;
 
@@ -49,6 +54,7 @@ async fn run() -> Result<u8> {
         }
     };
 
+    drop(make_handler);
     run_connected(conn, conf, &mut signals).await
 }
 

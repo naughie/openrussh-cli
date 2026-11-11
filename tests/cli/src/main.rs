@@ -567,6 +567,267 @@ return {
     });
 
     rt.register(
+        "native algorithm lists inherit defaults and replace host settings",
+        async || {
+            for (toml_kex, lua_kex, toml_keys, lua_keys) in [
+                (
+                    "'diffie-hellman-group1-sha1,curve25519-sha256'",
+                    "'diffie-hellman-group1-sha1,curve25519-sha256'",
+                    "'rsa-sha2-512,ssh-ed25519'",
+                    "'rsa-sha2-512,ssh-ed25519'",
+                ),
+                (
+                    "['diffie-hellman-group1-sha1', 'curve25519-sha256']",
+                    "{'diffie-hellman-group1-sha1', 'curve25519-sha256'}",
+                    "['rsa-sha2-512', 'ssh-ed25519']",
+                    "{'rsa-sha2-512', 'ssh-ed25519'}",
+                ),
+            ] {
+                for inherit in [true, false] {
+                    let (toml_default, toml_host, lua_default, lua_host) = if inherit {
+                        (
+                            format!("kex-algorithms = {toml_kex}\nhost-key-algorithms = {toml_keys}"),
+                            String::new(),
+                            format!("kex_algorithms = {lua_kex}, host_key_algorithms = {lua_keys},"),
+                            String::new(),
+                        )
+                    } else {
+                        (
+                            "kex-algorithms = 'diffie-hellman-group1-sha1'\nhost-key-algorithms = 'rsa-sha2-512'".to_owned(),
+                            format!("kex-algorithms = {toml_kex}\nhost-key-algorithms = {toml_keys}"),
+                            "kex_algorithms = 'diffie-hellman-group1-sha1', host_key_algorithms = 'rsa-sha2-512',".to_owned(),
+                            format!("kex_algorithms = {lua_kex}, host_key_algorithms = {lua_keys},"),
+                        )
+                    };
+                    let toml = t::Client::toml(&format!(
+                        "[default]\nhost-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+                         identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n\
+                         {toml_default}\n[hosts.target]\n{toml_host}\n",
+                    ))?;
+                    let lua = t::Client::lua(&format!(
+                        "return {{default = {{host_name = '127.0.0.1', user = 'bob', port = 2222, \
+                         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false, \
+                         {lua_default}}}, hosts = {{target = {{{lua_host}}}}}}}",
+                    ))?;
+
+                    for client in [&toml, &lua] {
+                        let output = client.run(&["target", "printf", "algorithms"], b"").await?;
+                        t::expect(&output, 0, b"algorithms", b"");
+                    }
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "native host algorithms restrict negotiation despite trusted keys",
+        async || {
+            for (toml_override, lua_override) in [
+                (
+                    "kex-algorithms = 'diffie-hellman-group1-sha1'",
+                    "kex_algorithms = 'diffie-hellman-group1-sha1'",
+                ),
+                (
+                    "host-key-algorithms = ['rsa-sha2-512']",
+                    "host_key_algorithms = {'rsa-sha2-512'}",
+                ),
+            ] {
+                let toml = t::Client::toml(&format!(
+                    "[default]\nhost-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+                     identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n\
+                     kex-algorithms = 'curve25519-sha256'\nhost-key-algorithms = 'ssh-ed25519'\n\
+                     [hosts.target]\n{toml_override}\n",
+                ))?;
+                let lua = t::Client::lua(&format!(
+                    "return {{default = {{host_name = '127.0.0.1', user = 'bob', port = 2222, \
+                     identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false, \
+                     kex_algorithms = 'curve25519-sha256', host_key_algorithms = 'ssh-ed25519'}}, \
+                     hosts = {{target = {{{lua_override}}}}}}}",
+                ))?;
+
+                for client in [&toml, &lua] {
+                    let output = client
+                        .run(&["target", "printf", "unreachable"], b"")
+                        .await?;
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+                    assert!(!output.stderr.is_empty());
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register("native algorithms apply to individual jump hosts", async || {
+        for (kex, keys, success) in [
+            ("curve25519-sha256", "ssh-ed25519", true),
+            ("diffie-hellman-group1-sha1", "ssh-ed25519", false),
+            ("curve25519-sha256", "rsa-sha2-512", false),
+        ] {
+            let toml = t::Client::toml(&format!(
+                "[default]\nhost-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+                 identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n\
+                 kex-algorithms = 'diffie-hellman-group1-sha1'\nhost-key-algorithms = 'rsa-sha2-512'\n\
+                 [hosts.target]\nproxy-jump = 'Jump'\nkex-algorithms = 'curve25519-sha256'\n\
+                 host-key-algorithms = 'ssh-ed25519'\n[hosts.Jump]\n\
+                 kex-algorithms = '{kex}'\nhost-key-algorithms = '{keys}'\n",
+            ))?;
+            let lua = t::Client::lua(&format!(
+                "return {{default = {{host_name = '127.0.0.1', user = 'bob', port = 2222, \
+                 identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false, \
+                 kex_algorithms = 'diffie-hellman-group1-sha1', host_key_algorithms = 'rsa-sha2-512'}}, \
+                 hosts = {{target = {{kex_algorithms = 'curve25519-sha256', host_key_algorithms = 'ssh-ed25519', \
+                 proxy_jump = {{host_name = '127.0.0.1', kex_algorithms = '{kex}', host_key_algorithms = '{keys}'}}}}}}}}",
+            ))?;
+
+            for client in [&toml, &lua] {
+                let output = client.run(&["target", "printf", "jumped"], b"").await?;
+                if success {
+                    t::expect(&output, 0, b"jumped", b"");
+                } else {
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    rt.register("OpenSSH transport directives remain ignored", async || {
+        let client = t::Client::new(
+            "KexAlgorithms diffie-hellman-group1-sha1\n\
+             HostKeyAlgorithms rsa-sha2-512\nUserKnownHostsFile /missing/known_hosts",
+        )?;
+        let output = client.run(&["target", "printf", "ignored"], b"").await?;
+        t::expect(&output, 0, b"ignored", b"");
+
+        Ok(())
+    });
+
+    rt.register(
+        "native known-hosts metadata selects the loaded database",
+        async || {
+            let dir = t::tempdir()?;
+            let selected = dir.path().join("known_hosts");
+            let original = std::fs::read("/home/alice/.ssh/known_hosts")?;
+            std::fs::write(&selected, &original)?;
+            let path = selected.to_str().unwrap();
+            let toml = t::Client::toml(&format!(
+                "[meta]\nknown-hosts = '{path}'\n[hosts.target]\n\
+             host-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+             identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n",
+            ))?;
+            let lua = t::Client::lua(&format!(
+                "return {{meta = {{known_hosts = '{path}'}}, hosts = {{target = {{\
+             host_name = '127.0.0.1', user = 'bob', port = 2222, \
+             identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false}}}}}}",
+            ))?;
+            let _hosts = t::KnownHosts::replace(b"")?;
+
+            for client in [&toml, &lua] {
+                let output = client.run(&["target", "printf", "selected"], b"").await?;
+                t::expect(&output, 0, b"selected", b"");
+            }
+            assert_eq!(std::fs::read(&selected)?, original);
+            assert!(std::fs::read("/home/alice/.ssh/known_hosts")?.is_empty());
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "native known-hosts metadata persists accepted keys",
+        async || {
+            let dir = t::tempdir()?;
+            let original = std::fs::read("/home/alice/.ssh/known_hosts")?;
+
+            for format in ["toml", "lua"] {
+                let selected = dir.path().join(format).join("known_hosts");
+                let path = selected.to_str().unwrap();
+                let client = if format == "toml" {
+                    t::Client::toml(&format!(
+                        "[meta]\nknown-hosts = '{path}'\n[hosts.target]\n\
+                     host-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+                     identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n",
+                    ))?
+                } else {
+                    t::Client::lua(&format!(
+                        "return {{meta = {{known_hosts = '{path}'}}, hosts = {{target = {{\
+                     host_name = '127.0.0.1', user = 'bob', port = 2222, \
+                     identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false}}}}}}",
+                    ))?
+                };
+
+                let mut pty = client.pty(&["target", "true"])?;
+                pty.read_until(b"(yes/no/[fingerprint])?").await?;
+                pty.write(b"no\n").await?;
+                pty.wait(255).await?;
+                assert!(!selected.exists());
+
+                let mut pty = client.pty(&["target", "true"])?;
+                pty.read_until(b"(yes/no/[fingerprint])?").await?;
+                pty.write(b"yes\n").await?;
+                pty.wait(0).await?;
+                assert!(!std::fs::read(&selected)?.is_empty());
+                assert_eq!(std::fs::read("/home/alice/.ssh/known_hosts")?, original);
+
+                let output = client.run(&["target", "printf", "remembered"], b"").await?;
+                t::expect(&output, 0, b"remembered", b"");
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "native known-hosts metadata uses format-specific path handling",
+        async || {
+            let toml = t::Client::toml(
+                "[meta]\nknown-hosts = '~/.ssh/known_hosts'\n[hosts.target]\n\
+                 host-name = '127.0.0.1'\nuser = 'bob'\nport = 2222\n\
+                 identity-file = '~/.ssh/id_ed25519'\nrequest-tty = false\n",
+            )?;
+            let lua = t::Client::lua(
+                "return {meta = {known_hosts = os.getenv('HOME') .. '/.ssh/known_hosts'}, \
+                 hosts = {target = {host_name = '127.0.0.1', user = 'bob', port = 2222, \
+                 identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false}}}",
+            )?;
+
+            for client in [&toml, &lua] {
+                let output = client.run(&["target", "printf", "expanded"], b"").await?;
+                t::expect(&output, 0, b"expanded", b"");
+            }
+
+            for path in ["relative/hosts", "../hosts", ""] {
+                let client = t::Client::toml(&format!("[meta]\nknown-hosts = '{path}'\n"))?;
+                let output = client.run(&["target", "true"], b"").await?;
+                assert_eq!(output.status.code(), Some(255));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("absolute"));
+            }
+
+            for path in [
+                "relative/hosts",
+                "../hosts",
+                "~/.ssh/known_hosts",
+                "$HOME/.ssh/known_hosts",
+                "",
+            ] {
+                let client =
+                    t::Client::lua(&format!("return {{meta = {{known_hosts = '{path}'}}}}",))?;
+                let output = client.run(&["target", "true"], b"").await?;
+                assert_eq!(output.status.code(), Some(255));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("absolute"));
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
         "native config paths must resolve to absolute paths",
         async || {
             for field in ["identity-file", "certificate-file", "identity-agent"] {

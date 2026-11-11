@@ -10,7 +10,8 @@ The Cargo package is `openrussh-cli`, the library crate is `openrussh_cli`, and 
 | --- | --- |
 | `cli` | Parse arguments, validate CLI syntax, and construct configuration inputs. |
 | `config` | Resolve format-specific configuration and CLI inputs into the application's format-independent configuration. |
-| `handler` | Integrate the library's known-host checks with local trust prompts and persistence. |
+| `known_hosts` | Load the selected trust database once and retain its save path as a setup resource. |
+| `handler` | Apply per-host transport policies and integrate the library's known-host checks with local trust prompts and persistence. |
 | `session` | Select the library session operation and pump channel input/output, escapes, and terminal events. |
 | `terminal` | Own Unix signal streams, terminal-mode guards, input flags, and asynchronous stdin reading. |
 | `forwarding` | Bind local listeners, supervise accepted-stream tasks, and release listener resources. |
@@ -19,6 +20,15 @@ The Cargo package is `openrussh-cli`, the library crate is `openrussh_cli`, and 
 `openrussh-client` owns SSH transport, negotiation, user authentication, jump connections, and supported channel operations. Use its `Connection` methods for shell, exec, and local forwarding. The application's direct-channel use for `-W` adapts standard streams to a library `Child`; it does not justify duplicating helpers that already accept the required resource.
 
 `MyMakeHandler` and `MyHandler` are the application integration types. The outer connection setup instantiates them; session, forwarding, and lifecycle code remains generic over the dependency's handler trait. Keep this boundary when introducing reusable operations. Application configuration is a concrete domain type, distinct from both parser output and `openrussh_client::config` intermediate types.
+
+Each format's `ParsedConfig` resolves to `config::Resolved`, containing the
+connection chain, typed per-host algorithm policies, and setup metadata.
+`Options::load` combines that result with CLI application settings into
+`Config`. Setup metadata remains outside host/default records and is used when
+initializing resources; handlers receive the known-host resource and its
+save path rather than `Meta`. Policy lookup uses resolved `Host` reference
+identity, preserving distinct policies even for hosts with identical network
+destinations.
 
 ## Dependencies and build contract
 
@@ -58,6 +68,13 @@ Errors at the application boundary use `anyhow` with short English operation/con
 ## Test architecture
 
 Unit tests live inside the individual implementation files. They cover application parsing, native configuration resolution, listener ownership, known-host persistence, escape state, input flags, terminal guards, and exit policy. They should exercise meaningful behavior and edge cases rather than repeat the implementation as assertions.
+
+Algorithm coverage should distinguish transport defaults from known-host
+preference adjustments, preserve explicit allowlists and KEX extension signals,
+and exercise named/inline jump policies independently. Known-host tests cover
+both reading and saving the selected database, including missing-file setup and
+existing locking/permission behavior. Native additions must retain the existing
+OpenSSH adapter behavior.
 
 The root Cargo project and `tests/` are separate workspaces. Consequently, `cargo test` at the repository root runs inline unit tests but does not run the executable integration suites. The `tests/` workspace contains six application suites and a shared `tester` support crate:
 

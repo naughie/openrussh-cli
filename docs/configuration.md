@@ -47,7 +47,7 @@ The directives that affect the resolved connection are:
 
 Recognized directives outside this effective set may be parsed or retained by `ssh2-config` without affecting the connection. The application does not implement their OpenSSH semantics. Completely unknown directives remain subject to the parser's errors and `IgnoreUnknown` behavior; `ALLOW_UNSUPPORTED_FIELDS` is not `ALLOW_UNKNOWN_FIELDS`.
 
-For example, `Compression`, `Ciphers`, `MACs`, and `LocalForward` in an OpenSSH file do not configure this client's transport preferences or local listeners. Their corresponding supported command-line options are application settings. `UserKnownHostsFile` does not change this client's host-key database; see [host-key verification](runtime.md).
+For example, `Compression`, `Ciphers`, `MACs`, and `LocalForward` in an OpenSSH file do not configure this client's transport preferences or local listeners. Their corresponding supported command-line options are application settings. `KexAlgorithms` and `HostKeyAlgorithms` also retain their existing parser behavior without affecting negotiation; the native fields below provide that configuration. `UserKnownHostsFile` does not change this client's host-key database; see [host-key verification](runtime.md).
 
 For scalar settings, the first value among matching host blocks wins. `IdentityFile` entries accumulate across matching blocks. CLI user, port, identity, and jump overrides are inserted before file settings; CLI identity entries therefore precede file entries. The final destination's CLI PTY override is applied after host resolution.
 
@@ -72,6 +72,7 @@ host records in jump settings. Their canonical spellings differ:
 
 | Concept | TOML | Lua |
 | --- | --- | --- |
+| Application setup | `[meta]` | `meta = { ... }` |
 | Default host settings | `[default]` | `default = { ... }` |
 | Named hosts | `[hosts.NAME]` or an inline entry in `[hosts]` | `hosts = { NAME = { ... } }` |
 | Multiword field names | `kebab-case` | `snake_case` |
@@ -100,12 +101,105 @@ The table gives canonical TOML names and their Lua equivalents. The fields are v
 | `identities-only` / `identities_only` | Boolean or accepted boolean string | Identity-filtering policy; defaults to `false`. |
 | `request-tty` / `request_tty` | Boolean or accepted TTY string | PTY allocation policy; defaults to `auto`. |
 | `proxy-jump` / `proxy_jump` | String or list; Lua also accepts inline host records | Ordered jump-host specifications; absent when omitted everywhere. See [jump settings](#jump-settings). |
+| `kex-algorithms` / `kex_algorithms` | Comma-separated string or array of algorithm-name strings | Ordered key-exchange preferences; transport defaults when omitted everywhere. |
+| `host-key-algorithms` / `host_key_algorithms` | Comma-separated string or array of algorithm-name strings | Ordered server host-key preferences; existing known-host preference behavior when omitted everywhere. |
 
 `port` is decoded as an unsigned 16-bit integer. The accepted numeric range is `0..=65535`; there is no additional nonzero-port validation. TOML integer notation, including separators and radix prefixes, is decoded by the TOML parser. String ports use decimal parsing. Negative integers, floating-point values, booleans, and out-of-range values are errors.
 
 An identity is used for SSH user authentication. Depending on the library's authentication mode, an identity file may hold a private key or identify a public key whose private-key operation is performed by an authentication agent. `certificate_file` is an SSH user certificate, not a TLS/X.509 certificate and not a server host-key trust file. `identities_only = true` restricts the identities selected by the library; it does not disable the authentication agent. Authentication itself remains delegated to `Connection::connect`.
 
 Omitting `identity_file` does not cause this client to add conventional private-key filenames automatically. An explicitly empty list remains distinguishable from an omitted list.
+
+### Algorithm preferences
+
+`kex_algorithms` selects key-exchange methods. `host_key_algorithms` selects
+server host-key signature algorithms and host-certificate algorithms; it does
+not select the client's user authentication identities. Each accepts an ordered
+comma-separated string or an array of names. For example, these express the
+same host-key preference:
+
+```toml
+[hosts.string-form]
+host-key-algorithms = "ssh-ed25519,rsa-sha2-512"
+
+[hosts.array-form]
+host-key-algorithms = ["ssh-ed25519", "rsa-sha2-512"]
+```
+
+The equivalent Lua value is
+`host_key_algorithms = { "ssh-ed25519", "rsa-sha2-512" }`. Prefix only the first
+name to choose a list operation:
+
+| Prefix | Operation |
+| --- | --- |
+| None | Replace the transport's default list. |
+| `+` | Append the supplied names to the default list. |
+| `-` | Remove the supplied names from the default list by exact name. |
+| `^` | Put the supplied names before the remaining default names. |
+
+For example, `kex-algorithms = "+ecdh-sha2-nistp256"` appends a method, while
+`host_key_algorithms = { "^rsa-sha2-512", "ssh-ed25519" }` puts those algorithms
+first. Modifiers use `russh::Preferred::default()` as their baseline, before any
+known-host preference adjustments. That baseline contains no host-certificate
+algorithms. A host's supplied value overrides the default table's entire value;
+its modifier does not operate on an inherited list.
+
+Replacement, append, and prepend names must be supported by the locked
+transport. Removal compares exact names and ignores names absent from the
+default list. Wildcard patterns, empty lists, empty entries, and operations
+leaving no algorithms are errors. KEX extension signals such as `ext-info-c`
+and the strict-KEX markers are preserved from the transport defaults by the
+application adapter and are not configurable algorithm names.
+
+Host-certificate names use their full SSH identifiers, for example
+`ssh-ed25519-cert-v01@openssh.com` or
+`rsa-sha2-512-cert-v01@openssh.com`. Certificate and plain-key choices are
+independent: a certificate-only list does not also enable the plain key.
+The transport advertises certificate algorithms before plain host-key
+algorithms. A replacement list or modifier result that places any certificate
+after a plain key is rejected because that order cannot be represented.
+
+When `host_key_algorithms` is supplied, its resulting list is the complete
+allowed preference list. Known-host data still verifies the server's identity,
+but does not reorder the list or add keys or certificates. When omitted in both
+host and defaults, the existing known-host preference behavior applies.
+Each named or inline jump host resolves its own algorithm settings from its
+record and defaults. CLI cipher, MAC, and compression options are unchanged.
+
+### Application setup metadata
+
+The optional top-level `meta` table supplies application setup for the entire
+invocation. It is separate from the host/default records and is not inherited
+through a jump chain. Its only supported field is `known-hosts` in TOML or
+`known_hosts` in Lua, with the same spelling aliases as other native fields.
+Unknown metadata fields and a `meta` field inside a host/default record are
+errors.
+
+```toml
+[meta]
+known-hosts = "~/.ssh/known_hosts"
+```
+
+```lua
+local home = assert(os.getenv("HOME"))
+return {
+    meta = { known_hosts = home .. "/.ssh/known_hosts" },
+}
+```
+
+The configured path must be absolute after TOML's tilde expansion. TOML supports
+the current-user `~user` form under the native path rules; it does not expand
+environment variables in this field. Lua treats the value as a literal path:
+use `os.getenv` and Lua expressions explicitly to construct an absolute path.
+Relative or empty values are errors. Neither form treats `SSH_AUTH_SOCK` or
+`$VARIABLE` as a known-host path selector.
+
+Omitting the path uses the dependency's default: `~/.ssh/known_hosts`, or
+`/etc/ssh/ssh_known_hosts` when no home directory is available. Setup loads the
+selected file once for all destination and jump-host checks. A missing file
+starts with empty trust without creating a file; other read errors fail setup.
+Accepted keys are saved to that same path. File locking and permission behavior
+are described in the [runtime reference](runtime.md#server-host-key-policy).
 
 ### Boolean and TTY values
 
@@ -122,7 +216,7 @@ Other strings, numbers, arrays, and tables are errors for these fields. An expli
 
 ### Path rules
 
-Native configuration paths must be absolute after the format's permitted expansion. This rule covers `identity_file`, `certificate_file`, and `identity_agent`.
+Native configuration paths must be absolute after the format's permitted expansion. This rule covers `identity_file`, `certificate_file`, `identity_agent`, and the top-level `meta.known_hosts` path.
 
 | Input | TOML | Lua |
 | --- | --- | --- |
@@ -191,6 +285,7 @@ The list fields have different merge rules:
 
 - `identity_file` accumulates in this order: CLI `-i` entries, host entries, then default entries. Order is preserved and entries are not deduplicated. An empty host list does not remove inherited default identities.
 - `proxy_jump` takes the first present list: CLI `-J`, host, then defaults. Lists do not concatenate. An empty native array removes an inherited jump list. CLI `-J none` also supplies an explicit empty list; matching `none` for this CLI option is case insensitive.
+- `kex_algorithms` and `host_key_algorithms` take the host value, then the default value. Lists do not concatenate across records. Their optional list modifiers operate on the transport's built-in defaults.
 
 For jump hosts, CLI identity/user/port overrides for the final destination are
 not propagated. Each jump alias gets its own host/default settings; an inline
@@ -347,12 +442,12 @@ return {
 
 ## Validation and configuration scope
 
-Loading separates syntax/type validation, source-specific path validation, host resolution, and connection/authentication. A file can be syntactically valid yet fail later because a username cannot be obtained, a path cannot be expanded, an algorithm name supplied on the CLI is unknown, a server cannot be reached, or an authentication resource cannot be used. A failure at any stage does not trigger fallback to another default config file.
+Loading separates syntax/type validation, source-specific path validation, host resolution, setup, and connection/authentication. A file can be syntactically valid yet fail later because a username cannot be obtained, a path cannot be expanded, a configured algorithm name is unknown, the known-host database cannot be read, a server cannot be reached, or an authentication resource cannot be used. A failure at any stage does not trigger fallback to another default config file.
 
-Errors while opening or loading a selected file include its path in the application's error context. Parser and Lua error details are retained. Native path errors identify the semantic field using `identity_file`, `certificate_file`, or `identity_agent`, independently of its spelling in the source.
+Errors while opening or loading a selected file include its path in the application's error context. Parser and Lua error details are retained. Native path errors identify the semantic field using `identity_file`, `certificate_file`, `identity_agent`, or `known_hosts`, independently of its spelling in the source.
 
-Native files configure only the host fields listed above. They do not configure the remote command, stdin policy, escape character, local listeners, stdio forwarding, compression preference, cipher list, or MAC list. Those remain application/CLI settings. Native `Include`, subsystem requests, remote forwarding, dynamic forwarding, agent forwarding, and X11 forwarding are not added by the schema.
+Native files configure the host fields and application setup metadata listed above. They do not configure the remote command, stdin policy, escape character, local listeners, stdio forwarding, compression preference, cipher list, or MAC list. Those remain application/CLI settings. Native `Include`, subsystem requests, remote forwarding, dynamic forwarding, agent forwarding, and X11 forwarding are not added by the schema.
 
 All three formats preserve the library's `Auth::includes_none = true` default, so user authentication first attempts the SSH `none` method. The configuration formats do not expose a setting for changing that default.
 
-Server host-key verification is a separate concern from user authentication. All three formats use the application's host-key handler and the default `known_hosts` path. Authentication identity and user-certificate settings must not be used as substitutes for server host-key verification.
+Server host-key verification is a separate concern from user authentication. All three formats use the application's host-key handler. Native `meta.known_hosts` selects its database; otherwise the default path applies. Authentication identity and user-certificate settings must not be used as substitutes for server host-key verification.

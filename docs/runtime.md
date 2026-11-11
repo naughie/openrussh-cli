@@ -46,7 +46,7 @@ An SSH `exec` request carries a command string, rather than an operating-system 
 ssh my-host sh -c 'printf "%s\n" "$HOME"; printf "%s\n" done'
 ```
 
-User authentication keys, server host keys, key-exchange algorithms, ciphers, and message authentication codes have distinct roles. The handler's host-key check authenticates the server; it does not select or verify the client's user authentication identity. Cipher and MAC preferences modify the dependency's transport configuration, while known-host information may adjust server host-key algorithm preferences.
+User authentication keys, server host keys, key-exchange algorithms, ciphers, and message authentication codes have distinct roles. The handler's host-key check authenticates the server; it does not select or verify the client's user authentication identity. Cipher and MAC preferences modify the dependency's transport configuration. Native configuration can supply independent key-exchange and host-key policies for the destination and every jump host. An explicit host-key policy replaces both plain-key and certificate lists without known-host preference adjustments; when omitted, known-host information may adjust those preferences. Host-key verification still applies in either case. The application preserves the transport's default KEX extension signals when applying configured methods.
 
 ## Standard streams and exit status
 
@@ -119,10 +119,17 @@ Each listener accepts streams and starts a task for each accepted connection. TC
 
 ## Server host-key policy
 
-The application loads known-host data through `KnownHosts::parse_default_path()`. A missing file starts with an empty set; other file-read failures propagate. Entry parsing follows the dependency, which ignores malformed entries. The known-host path follows the dependency's default-path behavior, and application handling does not honor `UserKnownHostsFile` as an override.
+Connection setup loads a `KnownHostsFile` resource using the native top-level
+`meta.known_hosts` path, or the dependency's default path when omitted. The
+default is `~/.ssh/known_hosts`, with `/etc/ssh/ssh_known_hosts` as the no-home
+fallback. This one resource supplies trust checks for the destination and every
+jump host. A missing file starts with an empty set without creating a file;
+other file-read failures propagate with the selected path. Entry parsing
+follows the dependency, which ignores malformed entries. OpenSSH
+`UserKnownHostsFile` remains ineffective.
 
 The handler delegates known-host matching and host-certificate validation to `KnownHosts`. `Found` accepts the key; `NotFound` starts a trust prompt. Key mismatch, revocation, certificate principal mismatch, critical certificate options, and the dependency's `CertNotVerified` result fail without prompting. The dependency checks host-certificate type, principals, revocation, and CA trust. Its current policy falls back to ordinary public-key matching if a certificate from a trusted CA fails signature or validity-period validation; the application preserves that result.
 
 The prompt opens `/dev/tty`, independently of redirected stdin/stdout. It displays the public-key algorithm and SHA-256 fingerprint and accepts `yes` or the complete displayed fingerprint; `no` or terminal EOF rejects it. Other answers repeat the prompt. Without an accessible controlling terminal, confirmation fails.
 
-Acceptance appends an unhashed host-key entry and caches that accepted key for the handler instance. A later different key is not covered by the cached acceptance. Hostnames are normalized to lowercase; the known-host token is the hostname for port `22` and `[hostname]:port` otherwise. The save path is `~/.ssh/known_hosts`, with `/etc/ssh/ssh_known_hosts` as the no-home fallback. Newly created parent directories use mode `0700` and newly created files use mode `0600`; existing permissions are retained. Appends take a file lock and preserve existing content, inserting a missing final newline. Save errors fail the connection rather than silently discarding the user's acceptance.
+Acceptance appends an unhashed host-key entry to the same selected file and caches that accepted key for the handler instance. A later different key is not covered by the cached acceptance. Hostnames are normalized to lowercase; the known-host token is the hostname for port `22` and `[hostname]:port` otherwise. Handlers receive the resource's selected save path, so prompting does not fall back to another database. Newly created parent directories use mode `0700` and newly created files use mode `0600`; existing permissions are retained. Appends take a file lock and preserve existing content, inserting a missing final newline. Save errors fail the connection rather than silently discarding the user's acceptance.
