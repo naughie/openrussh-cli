@@ -23,7 +23,17 @@ pub fn runtime() -> Runtime {
 }
 
 pub struct Client {
-    conf: NamedTempFile,
+    conf: Option<NamedTempFile>,
+}
+
+fn fixture_home() -> Result<std::path::PathBuf> {
+    let home = std::env::home_dir().context("Find fixture home")?;
+    ensure!(
+        home == std::path::Path::new("/home/alice"),
+        "Run tests through tests/x.sh"
+    );
+
+    Ok(home)
 }
 
 impl Client {
@@ -34,23 +44,50 @@ impl Client {
     pub fn settings(settings: &str) -> Result<Self> {
         use std::io::Write as _;
 
-        let home = std::env::home_dir().context("Find fixture home")?;
-        ensure!(
-            home == std::path::Path::new("/home/alice"),
-            "Run tests through tests/x.sh"
-        );
+        let home = fixture_home()?;
 
         let mut conf = NamedTempFile::new()?;
         writeln!(conf, "Host target\n RequestTTY no\n{settings}")?;
         conf.write_all(&std::fs::read(home.join(".ssh/config"))?)?;
         conf.flush()?;
 
-        Ok(Self { conf })
+        Ok(Self { conf: Some(conf) })
+    }
+
+    pub fn toml(text: &str) -> Result<Self> {
+        Self::file(text, ".toml")
+    }
+
+    pub fn lua(text: &str) -> Result<Self> {
+        Self::file(text, ".lua")
+    }
+
+    fn file(text: &str, suffix: &str) -> Result<Self> {
+        use std::io::Write as _;
+
+        fixture_home()?;
+
+        let mut conf = tempfile::Builder::new().suffix(suffix).tempfile()?;
+        conf.write_all(text.as_bytes())?;
+        conf.flush()?;
+
+        Ok(Self { conf: Some(conf) })
+    }
+
+    pub fn default_config() -> Result<Self> {
+        fixture_home()?;
+
+        Ok(Self { conf: None })
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new("/opt/tests/ssh");
-        cmd.arg("-F").arg(self.conf.path()).args(args);
+
+        if let Some(conf) = &self.conf {
+            cmd.arg("-F").arg(conf.path());
+        }
+
+        cmd.args(args);
         cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

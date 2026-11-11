@@ -25,24 +25,25 @@ async fn run() -> Result<u8> {
     use crate::handler::MyMakeHandler;
     use crate::terminal::{Event, Signals};
 
-    let conf = cli::parse()?;
-    let chain = conf.chain()?;
+    let conf = cli::parse()?.load()?;
     let make_handler = MyMakeHandler::new(conf.preferred()?)?;
 
     let mut signals = Signals::new()?;
 
-    let conn = Connection::connect(&chain, &make_handler);
-    tokio::pin!(conn);
-    let (shutdown, events) = signals.split();
+    let conn = {
+        let conn = Connection::connect(&conf.chain, &make_handler);
+        tokio::pin!(conn);
+        let (shutdown, events) = signals.split();
 
-    let conn = loop {
-        tokio::select! {
-            res = &mut conn => break res.map_err(|e| anyhow::anyhow!("{e}"))?,
-            _ = shutdown.recv() => return Ok(255),
-            event = events.recv() => {
-                match event {
-                    Event::Suspend => terminal::suspend()?,
-                    Event::Resize | Event::Continue => {}
+        loop {
+            tokio::select! {
+                res = &mut conn => break res.map_err(|e| anyhow::anyhow!("{e}"))?,
+                _ = shutdown.recv() => return Ok(255),
+                event = events.recv() => {
+                    match event {
+                        Event::Suspend => terminal::suspend()?,
+                        Event::Resize | Event::Continue => {}
+                    }
                 }
             }
         }

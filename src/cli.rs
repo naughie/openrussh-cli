@@ -1,5 +1,5 @@
 use crate::config::{
-    BindHost, Config, Destination, ForwardTarget, LocalBind, LocalForward, Session,
+    BindHost, Destination, ForwardTarget, LocalBind, LocalForward, Options, Session,
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -17,7 +17,7 @@ struct Args {
         short = 'F',
         value_name = "CONFIG",
         overrides_with = "config",
-        help = "Read an alternate SSH config file (none to skip)"
+        help = "Read a Lua (.lua), TOML (.toml), or OpenSSH config file (none to skip)"
     )]
     config: Option<PathBuf>,
 
@@ -126,14 +126,14 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-pub(crate) fn parse() -> Result<Config> {
+pub(crate) fn parse() -> Result<Options> {
     use clap::Parser as _;
 
-    Args::parse().into_config()
+    Args::parse().into_options()
 }
 
 impl Args {
-    fn into_config(self) -> Result<Config> {
+    fn into_options(self) -> Result<Options> {
         use openrussh_client::config::RequestTty;
 
         let args = self;
@@ -193,7 +193,7 @@ impl Args {
             }
         });
 
-        Ok(Config {
+        Ok(Options {
             destination,
             config_file: args.config,
             identities: args.identities,
@@ -383,10 +383,10 @@ mod tests {
 
     use openrussh_client::config::RequestTty;
 
-    fn parse(args: &[&str]) -> Result<Config> {
+    fn parse(args: &[&str]) -> Result<Options> {
         use clap::Parser as _;
 
-        Args::try_parse_from(std::iter::once("ssh").chain(args.iter().copied()))?.into_config()
+        Args::try_parse_from(std::iter::once("ssh").chain(args.iter().copied()))?.into_options()
     }
 
     #[test]
