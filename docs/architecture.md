@@ -33,9 +33,16 @@ the OpenSSH parser and its merging rules.
 `Profiles` is deliberately a native source representation, not the universal
 configuration model. It retains omitted fields, string/list alternatives,
 unexpanded paths, defaults, and all named hosts. Sharing this representation
-keeps TOML and Lua's host semantics consistent without imposing their schema on
-OpenSSH. Its private `HostFields` records describe supplied fields rather than a
-fully resolved SSH host.
+keeps TOML and Lua's common host semantics consistent without imposing their
+schema on OpenSSH. Its private `HostFields` records describe supplied fields
+rather than a fully resolved SSH host.
+
+`formats::jumps` represents a jump setting as `Jumps::One` or `Jumps::Many`.
+Each `Jump` is either `Name(Text)` or `Host(Box<HostFields>)`. Boxing the inline
+record permits nested `proxy_jump` without copying the host-field schema.
+This shared representation supports Lua's named, inline, and mixed jump forms;
+the TOML adapter calls `require_named_jumps()` after deserialization to preserve
+its string-only jump syntax.
 
 ## Loading pipeline
 
@@ -89,15 +96,20 @@ adapter.
 Native deserialization handles field names, aliases, unknown fields, scalar
 types, and string/list shapes. `formats::values` supplies the small Serde
 visitors for borrowed/owned text, strings or arrays, boolean strings, PTY modes,
-and integer/string ports. It does not implement a TOML or Lua syntax parser.
+and integer/string ports. `formats::jumps` distinguishes scalar names, inline
+host records, and sequences, including an outer empty sequence used to clear
+jumps. Neither module implements a TOML or Lua syntax parser.
 
 Native resolution uses the requested alias for an exact host lookup. It merges
 the selected host with defaults and CLI overrides, resolves paths and the
 authentication-agent socket, and constructs the dependency's `Host`, `Auth`,
 and `Chain` values directly. The dependency's configuration types are the
 connection API boundary, not intermediates for translating between file
-formats. Jump-host traversal uses the same native rules; see the configuration
-reference for ordering and inheritance details.
+formats. A borrowed `HostRef` selects either a named `Target` or an inline
+`HostFields` record. Named targets perform the exact alias lookup; inline
+records bypass that lookup and require an effective `host_name` from themselves
+or defaults. Both use the same host-resolution and jump-traversal rules; see
+the configuration reference for ordering and inheritance details.
 
 `formats::paths` implements the native path policy. TOML selects `PathMode::Expand`;
 Lua selects `PathMode::Literal`. This choice belongs to the source adapter and
@@ -106,10 +118,10 @@ environment lookup: an omitted Lua `identity_agent` resolves to no agent unless
 the defaults record supplies an explicit value. Environment reads must occur in
 Lua itself, including for default values.
 
-Literal relative paths are rejected in every native profile. TOML expands
-selected tilde paths and agent environment references, then checks that the
-results are absolute. This preserves lazy environment resolution instead of
-expanding every unused host's settings eagerly.
+Literal relative paths are rejected in every native profile, including nested
+inline jump records. TOML expands selected tilde paths and agent environment
+references, then checks that the results are absolute. This preserves lazy
+environment resolution instead of expanding every unused host's settings eagerly.
 
 OpenSSH resolution calls the dependency's `Target::query` on its `SshConfig`.
 It retains the dependency's path, authentication-default, host-matching, and
@@ -160,6 +172,7 @@ src/config/
     openssh.rs         OpenSSH ParsedConfig and CLI override adapter
     formats/
         mod.rs         Native Profiles/HostFields and host/jump resolution
+        jumps.rs       Named/inline jump representations and Serde visitors
         values.rs      Native Serde value representations and visitors
         paths.rs       Expansion, literal paths, and agent selection
 ```

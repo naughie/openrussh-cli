@@ -2,7 +2,7 @@ use super::Options;
 
 use openrussh_client::config::{Auth, Chain, Dest, Host, RequestTty, Target};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,9 @@ mod values;
 use values::{Strings, Text};
 
 mod paths;
+
+mod jumps;
+use jumps::{Jump, Jumps};
 
 #[derive(Clone, Copy)]
 pub(super) enum PathMode {
@@ -50,7 +53,7 @@ struct HostFields<'src> {
     #[serde(alias = "request_tty", deserialize_with = "values::deserialize_tty")]
     request_tty: Option<RequestTty>,
     #[serde(borrow, alias = "proxy_jump")]
-    proxy_jump: Option<Strings<'src>>,
+    proxy_jump: Option<Jumps<'src>>,
 }
 
 pub(super) fn defaults(conf: &Options) -> Result<Chain> {
@@ -58,30 +61,31 @@ pub(super) fn defaults(conf: &Options) -> Result<Chain> {
 }
 
 impl Profiles<'_> {
+    pub(super) fn require_named_jumps(&self) -> Result<()> {
+        for host in std::iter::once(&self.defaults).chain(self.hosts.values()) {
+            ensure!(
+                host.proxy_jump.as_ref().is_none_or(|jumps| jumps
+                    .as_slice()
+                    .iter()
+                    .all(|j| matches!(j, Jump::Name(_)))),
+                "TOML proxy-jump must be a string or an array of strings"
+            );
+        }
+
+        Ok(())
+    }
+
     pub(super) fn resolve(&self, conf: &Options, paths: PathMode) -> Result<Chain> {
         for host in std::iter::once(&self.defaults).chain(self.hosts.values()) {
-            for path in host
-                .identity_file
-                .as_ref()
-                .into_iter()
-                .flat_map(Strings::as_slice)
-            {
-                paths.validate(Path::new(path.as_str()), "identity_file")?;
-            }
-            if let Some(path) = &host.certificate_file {
-                paths.validate(Path::new(path.as_str()), "certificate_file")?;
-            }
-            if let Some(value) = &host.identity_agent {
-                paths.validate_agent(value.as_str())?;
-            }
+            host.validate_paths(paths)?;
         }
 
         let doc = self;
-        let target = Target {
+        let target = HostRef::Named(Target {
             host: &conf.destination.host,
             user: conf.destination.user.as_deref(),
             port: conf.destination.port,
-        };
+        });
         let target_host = resolve_host(target, doc, Some(conf), paths)?;
         let mut pending = jumps(target, doc, Some(conf));
         let mut bastions: Option<Vec<Host>> = None;
@@ -91,13 +95,11 @@ impl Profiles<'_> {
             chain.reserve(pending.size_hint().0 + 1);
 
             for jump in pending.rev() {
-                let target = Target::parse(jump);
-                chain.push(resolve_host(target, doc, None, paths)?);
+                chain.push(resolve_host(jump, doc, None, paths)?);
             }
 
-            let target = Target::parse(first);
-            chain.push(resolve_host(target, doc, None, paths)?);
-            pending = jumps(target, doc, None);
+            chain.push(resolve_host(first, doc, None, paths)?);
+            pending = jumps(first, doc, None);
         }
 
         Ok(Chain {
@@ -107,21 +109,80 @@ impl Profiles<'_> {
     }
 }
 
-fn resolve_host(
-    target: Target<'_>,
-    doc: &Profiles<'_>,
+impl HostFields<'_> {
+    fn validate_paths(&self, paths: PathMode) -> Result<()> {
+        for path in self
+            .identity_file
+            .as_ref()
+            .into_iter()
+            .flat_map(Strings::as_slice)
+        {
+            paths.validate(Path::new(path.as_str()), "identity_file")?;
+        }
+        if let Some(path) = &self.certificate_file {
+            paths.validate(Path::new(path.as_str()), "certificate_file")?;
+        }
+        if let Some(value) = &self.identity_agent {
+            paths.validate_agent(value.as_str())?;
+        }
+
+        for jump in self
+            .proxy_jump
+            .as_ref()
+            .into_iter()
+            .flat_map(Jumps::as_slice)
+        {
+            if let Jump::Host(host) = jump {
+                host.validate_paths(paths)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HostRef<'a, 'src> {
+    Named(Target<'a>),
+    Inline(&'a HostFields<'src>),
+}
+
+impl<'a, 'src> HostRef<'a, 'src> {
+    fn fields(self, doc: &'a Profiles<'src>) -> Option<&'a HostFields<'src>> {
+        match self {
+            Self::Named(target) => doc.hosts.get(target.host),
+            Self::Inline(host) => Some(host),
+        }
+    }
+
+    fn fallback(self) -> Option<Target<'a>> {
+        match self {
+            Self::Named(target) => Some(target),
+            Self::Inline(_) => None,
+        }
+    }
+}
+
+fn resolve_host<'a, 'src>(
+    target: HostRef<'a, 'src>,
+    doc: &'a Profiles<'src>,
     cli: Option<&Options>,
     paths: PathMode,
 ) -> Result<Host> {
+    use anyhow::Context as _;
+
     let empty = HostFields::default();
-    let host = doc.hosts.get(target.host).unwrap_or(&empty);
+    let host = target.fields(doc).unwrap_or(&empty);
     let defaults = &doc.defaults;
+    let fallback = target.fallback();
 
     let name = host
         .host_name
         .as_ref()
         .or(defaults.host_name.as_ref())
-        .map_or(target.host, Text::as_str)
+        .map(Text::as_str)
+        .or_else(|| fallback.map(|t| t.host))
+        .context("Inline proxy_jump host requires host_name")?
         .to_owned();
     let user = if let Some(user) = cli
         .and_then(|c| c.destination.user.as_deref())
@@ -131,7 +192,7 @@ fn resolve_host(
                 .or(defaults.user.as_ref())
                 .map(Text::as_str)
         })
-        .or(target.user)
+        .or_else(|| fallback.and_then(|t| t.user))
     {
         user.to_owned()
     } else {
@@ -141,7 +202,7 @@ fn resolve_host(
         .and_then(|c| c.destination.port)
         .or(host.port)
         .or(defaults.port)
-        .or(target.port)
+        .or_else(|| fallback.and_then(|t| t.port))
         .unwrap_or(22);
 
     let cli_ids = cli.and_then(|c| c.identities.as_deref());
@@ -202,31 +263,37 @@ fn resolve_host(
 }
 
 fn jumps<'t, 'src>(
-    target: Target<'_>,
+    target: HostRef<'t, 'src>,
     doc: &'t Profiles<'src>,
     cli: Option<&'t Options>,
-) -> impl DoubleEndedIterator<Item = &'t str> {
+) -> impl DoubleEndedIterator<Item = HostRef<'t, 'src>> {
     let args = cli.and_then(|c| c.proxy_jump.as_deref());
     let selected = if args.is_some() {
         None
     } else {
-        doc.hosts
-            .get(target.host)
+        target
+            .fields(doc)
             .and_then(|h| h.proxy_jump.as_ref())
             .or(doc.defaults.proxy_jump.as_ref())
     };
 
-    let (string, array) = match selected {
-        Some(Strings::One(s)) => (Some(s.as_str()), None),
-        Some(Strings::Many(v)) => (None, Some(v.as_slice())),
-        None => (None, None),
+    let (string, array, inline) = match selected {
+        Some(Jumps::One(Jump::Name(s))) => (Some(s.as_str()), None, None),
+        Some(Jumps::One(Jump::Host(host))) => (None, None, Some(host.as_ref())),
+        Some(Jumps::Many(v)) => (None, Some(v.as_slice()), None),
+        None => (None, None, None),
     };
 
     args.into_iter()
         .flatten()
         .map(String::as_str)
         .chain(string.into_iter().flat_map(|s| s.split(',')))
-        .chain(array.into_iter().flatten().map(Text::as_str))
+        .map(|s| HostRef::Named(Target::parse(s)))
+        .chain(array.into_iter().flatten().map(|jump| match jump {
+            Jump::Name(s) => HostRef::Named(Target::parse(s.as_str())),
+            Jump::Host(host) => HostRef::Inline(host),
+        }))
+        .chain(inline.into_iter().map(HostRef::Inline))
 }
 
 #[cfg(test)]

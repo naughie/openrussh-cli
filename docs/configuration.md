@@ -67,7 +67,8 @@ Host github
 
 ## Native formats: TOML and Lua
 
-TOML and Lua describe the same host settings. Their canonical spellings differ:
+TOML and Lua describe the same host fields. Lua additionally supports inline
+host records in jump settings. Their canonical spellings differ:
 
 | Concept | TOML | Lua |
 | --- | --- | --- |
@@ -86,7 +87,7 @@ The table gives canonical TOML names and their Lua equivalents. The fields are v
 
 | TOML / Lua | Accepted values | Meaning and omitted value |
 | --- | --- | --- |
-| `host-name` / `host_name` | String | Network destination name; falls back to the requested host alias. |
+| `host-name` / `host_name` | String | Network destination name; falls back to the requested alias for named hosts. A Lua inline jump requires this field from its own record or defaults. |
 | `user` | String | SSH account name; falls back to the operating-system username obtained through `whoami`. |
 | `port` | Integer or decimal string | TCP destination port; defaults to `22`. |
 | `identity-file` / `identity_file` | Path string or array of path strings | Ordered authentication identities; no list is configured when omitted everywhere. |
@@ -94,7 +95,7 @@ The table gives canonical TOML names and their Lua equivalents. The fields are v
 | `identity-agent` / `identity_agent` | String, with format-specific rules below | Authentication-agent Unix-domain socket; TOML falls back to `SSH_AUTH_SOCK`, while Lua has no implicit agent. |
 | `identities-only` / `identities_only` | Boolean or accepted boolean string | Identity-filtering policy; defaults to `false`. |
 | `request-tty` / `request_tty` | Boolean or accepted TTY string | PTY allocation policy; defaults to `auto`. |
-| `proxy-jump` / `proxy_jump` | Comma-separated string or array of strings | Ordered jump-host specifications; absent when omitted everywhere. |
+| `proxy-jump` / `proxy_jump` | String or list; Lua also accepts inline host records | Ordered jump-host specifications; absent when omitted everywhere. See [jump settings](#jump-settings). |
 
 `port` is decoded as an unsigned 16-bit integer. The accepted numeric range is `0..=65535`; there is no additional nonzero-port validation. TOML integer notation, including separators and radix prefixes, is decoded by the TOML parser. String ports use decimal parsing. Negative integers, floating-point values, booleans, and out-of-range values are errors.
 
@@ -147,7 +148,12 @@ The client does not expand `~`, `$VARIABLE`, or a bare environment-variable name
 
 The rule is syntactic absoluteness, not filesystem canonicalization. The loader does not require the referenced file or socket to exist, resolve symbolic links, inspect key formats, or verify permissions. Such failures occur when the connection/authentication implementation uses the resource.
 
-Literal relative paths are rejected in every native defaults/host record, including hosts not selected for this invocation. Expansion results that are used by the selected connection or its jump hosts must also be absolute. CLI `-i` values retain the library-compatible CLI path behavior and are not subject to native-file absolute-path validation; relative CLI paths remain possible.
+Literal relative paths are rejected in every native defaults/host record,
+including hosts not selected for this invocation and recursively nested Lua
+inline jumps. Expansion results that are used by the selected connection or its
+jump hosts must also be absolute. CLI `-i` values retain the library-compatible
+CLI path behavior and are not subject to native-file absolute-path validation;
+relative CLI paths remain possible.
 
 ### Agent environment resolution
 
@@ -182,13 +188,69 @@ The list fields have different merge rules:
 - `identity_file` accumulates in this order: CLI `-i` entries, host entries, then default entries. Order is preserved and entries are not deduplicated. An empty host list does not remove inherited default identities.
 - `proxy_jump` takes the first present list: CLI `-J`, host, then defaults. Lists do not concatenate. An empty native array removes an inherited jump list. CLI `-J none` also supplies an explicit empty list; matching `none` for this CLI option is case insensitive.
 
-For jump hosts, CLI identity/user/port overrides for the final destination are not propagated. Each jump alias gets its own host/default settings. A user or port embedded in a jump string is a fallback below that jump host's configured/default user or port, matching the library's resolution precedence.
+For jump hosts, CLI identity/user/port overrides for the final destination are
+not propagated. Each jump alias gets its own host/default settings; an inline
+Lua host uses its own record and defaults. A user or port embedded in a jump
+string is a fallback below that jump host's configured/default user or port,
+matching the library's resolution precedence. CLI `-J` replaces the final
+destination's configured jump list, including any inline Lua records in it.
+
+### Jump settings
+
+TOML `proxy-jump` accepts a string or an array of strings. Lua `proxy_jump`
+accepts an alias string, an inline host record, or a sequence of either:
+
+```text
+Jump       = string | Host
+proxy_jump = Jump | sequence of Jump
+```
+
+Here `Host` is a native host record with the fields listed above, including
+another `proxy_jump`. It has no `name` or `alias` field. The following Lua forms
+are supported:
+
+```lua
+proxy_jump = "outer,inner"
+proxy_jump = { "outer", "inner" }
+proxy_jump = { host_name = "bastion.example.com", user = "jump-user" }
+proxy_jump = {
+    { host_name = "bastion.example.com", identity_file = "/keys/bastion" },
+    "inner",
+}
+```
+
+Each inline host inherits the defaults record using the same scalar,
+identity-list, and jump-list rules as a named host. Its effective `host_name`
+must come from the inline record or defaults; if neither supplies one,
+resolution fails. Unlike a jump string, an inline `host_name` is a literal
+network destination: it is not parsed for a user or port and is not looked up in
+`hosts`. For example, `{ host_name = "gateway" }` connects to the network name
+`gateway` even if `hosts.gateway` exists. Set `user` and `port` explicitly in the
+inline record when needed.
+
+The outer value `proxy_jump = {}` is an empty list and clears inherited jumps.
+Inside a sequence, an empty record such as `proxy_jump = { {} }` is one inline
+host; it still requires `host_name` from defaults. Use a record containing
+`proxy_jump = {}` to clear a jump host's inherited ancestors.
+
+Inline jump records are a Lua feature. TOML rejects them even when expressed
+with TOML inline-table syntax, and OpenSSH `ProxyJump` retains its string syntax.
+Named host records in TOML may still use inline-table syntax.
 
 ### Jump-chain traversal
 
-A native string value is split on commas without trimming individual elements. An array supplies the elements directly; each array entry is one jump specification and is not split again. Each specification is parsed by the library's `Target::parse`, which is a separate parser from the application's destination parser.
+A scalar native string value is split on commas without trimming individual
+elements. A list supplies its elements directly; a string entry is one jump
+specification and is not split again. Each resulting string is parsed by the
+library's `Target::parse`, which is a separate parser from the application's
+destination parser. Lua inline records bypass this string parser.
 
-For `proxy_jump = ["a", "b", "c"]`, connection establishment proceeds through `a`, then `b`, then `c`, then the destination. Resolution recursively follows only `a`'s own `proxy_jump`; settings on `b` and `c` do not add further ancestors. The resolved library `Chain` stores its bastions in the reverse order used to establish connections.
+For TOML `proxy-jump = ["a", "b", "c"]` or Lua
+`proxy_jump = { "a", "b", "c" }`, connection establishment proceeds through
+`a`, then `b`, then `c`, then the destination. Resolution recursively follows
+only the first entry's own `proxy_jump`; settings on later entries do not add
+further ancestors. This also applies to inline Lua entries. The resolved library
+`Chain` stores its bastions in the reverse order used to establish connections.
 
 For example, if the destination names `["a", "b"]` and `a` itself names `["outer"]`, the connection route is:
 
@@ -198,11 +260,35 @@ local client -> outer -> a -> b -> destination
 
 Unlike CLI `-J none`, the native file value `proxy_jump = "none"` names a literal host called `none`; it does not clear the list. Use an empty array instead. The current resolver has no cycle detection for recursively inherited first-entry jumps. Configuration must describe an acyclic route; a cycle can prevent resolution from completing.
 
+The same nested route can be expressed with inline Lua hosts:
+
+```lua
+proxy_jump = {
+    {
+        host_name = "a.example.com",
+        proxy_jump = { host_name = "outer.example.com", proxy_jump = {} },
+    },
+    { host_name = "b.example.com" },
+}
+```
+
+This establishes `outer.example.com`, then `a.example.com`, then
+`b.example.com`, then the destination. The explicit empty list on `outer`
+prevents inheritance of default ancestors.
+
 ### Lua execution and table shapes
 
 Lua configuration is a synchronous Lua 5.4 chunk evaluated once for a load. It must return a table. Local variables, functions, table construction, and environment reads can compute the result. The client does not keep the Lua VM running for the SSH session and does not use `mlua`'s async feature.
 
-The returned table is deserialized through Serde. Ordered lists use contiguous Lua sequence tables. An empty table is accepted as an empty list where a list is expected, and as an empty record/map where a record/map is expected. Mixed map/sequence lists, invalid element types, non-table root results, and unsupported fields are errors. Syntax and execution errors retain the selected configuration file's error context.
+The returned table is deserialized through Serde. Ordered lists use contiguous
+Lua sequence tables. An empty table is accepted as an empty list where a list is
+expected, and as an empty record/map where a record/map is expected. For
+`proxy_jump`, a field-name table represents one inline host, a sequence table
+represents a list, and the outer empty table represents an empty list. A
+sequence may mix string entries and inline host records, but a single table
+cannot mix field-name keys with sequence entries. Invalid element types,
+non-table root results, and unsupported fields are errors. Syntax and execution
+errors retain the selected configuration file's error context.
 
 ### Examples
 

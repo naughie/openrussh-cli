@@ -95,8 +95,8 @@ return {
 
 ## TOML and Lua
 
-TOML uses `[default]` and `[hosts.NAME]`, with kebab-case field names. Inline
-host tables are also accepted. Lua returns a table with `default` and `hosts`,
+TOML uses `[default]` and `[hosts.NAME]`, with kebab-case field names. Named hosts
+can also use TOML inline-table syntax. Lua returns a table with `default` and `hosts`,
 using snake_case field names. Lua is evaluated synchronously once per load and
 may use local variables, functions, and standard libraries.
 
@@ -114,7 +114,7 @@ Unknown fields and invalid types are errors, including in unused hosts.
 | `identity-agent` | `identity_agent` | Authentication-agent socket path; see below | TOML: `SSH_AUTH_SOCK`; Lua: none |
 | `identities-only` | `identities_only` | Boolean or boolean string | `false` |
 | `request-tty` | `request_tty` | Boolean or TTY-mode string | `"auto"` |
-| `proxy-jump` | `proxy_jump` | Comma-separated string or array of strings | No jump hosts |
+| `proxy-jump` | `proxy_jump` | String or list; Lua also accepts inline jump-host tables | No jump hosts |
 
 For compatibility, both native formats also accept `default`/`defaults` and the
 other format's field-name spelling. Host names are never case-folded.
@@ -163,7 +163,26 @@ remove inherited files. `certificate-file` specifies one certificate.
 `-J` replaces the final host's jump list. Otherwise a host's `proxy-jump` replaces
 the default list. Use `[]` in TOML, `{}` in Lua, or `-J none` to clear jumps.
 The native string `"none"` is a literal host name. Jump-host aliases use the same
-exact matching and defaults as the destination. Avoid cyclic jump definitions.
+exact matching and defaults as the destination.
+
+### Lua jump hosts
+
+Lua `proxy_jump` accepts a string, an inline host table, or a sequence containing
+either:
+
+```lua
+proxy_jump = {
+    { host_name = "bastion1.example.com", user = "me" },
+    { host_name = "bastion2.example.com" },
+    "bastion3",
+}
+```
+
+Inline hosts inherit defaults and accept the same fields as named hosts,
+including nested `proxy_jump`. Their `host_name` is a literal network destination
+and must be supplied by the table or defaults. String jumps use host aliases.
+Only the first jump's nested `proxy_jump` adds ancestors. Inline jump tables are
+Lua-only. Avoid cyclic jump definitions.
 
 ## OpenSSH format
 
@@ -197,3 +216,6 @@ Parsing another directive does not enable that feature. Forwarding and
 algorithm preferences use CLI options; `UserKnownHostsFile` does not change the
 default host-key database. Unsupported and unknown directives follow the
 library parser's rules.
+
+See the [configuration reference](docs/configuration.md) for complete field,
+validation, inheritance, and jump-chain rules.

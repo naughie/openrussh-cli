@@ -6,6 +6,12 @@ use std::borrow::{Borrow, Cow};
 #[serde(transparent)]
 pub(super) struct Text<'src>(#[serde(borrow)] Cow<'src, str>);
 
+impl<'src> From<Cow<'src, str>> for Text<'src> {
+    fn from(value: Cow<'src, str>) -> Self {
+        Self(value)
+    }
+}
+
 impl Text<'_> {
     pub(super) fn as_str(&self) -> &str {
         &self.0

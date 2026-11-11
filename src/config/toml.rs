@@ -11,9 +11,10 @@ pub(super) struct ParsedConfig<'src> {
 
 impl<'src> ParsedConfig<'src> {
     pub(super) fn parse(text: &'src str) -> Result<Self> {
-        Ok(Self {
-            profiles: ::toml::from_str(text)?,
-        })
+        let profiles: Profiles<'src> = ::toml::from_str(text)?;
+        profiles.require_named_jumps()?;
+
+        Ok(Self { profiles })
     }
 
     pub(super) fn resolve(&self, options: &Options) -> Result<Chain> {
@@ -24,4 +25,21 @@ impl<'src> ParsedConfig<'src> {
 #[cfg(test)]
 pub(super) fn query(text: &str, options: &Options) -> Result<Chain> {
     ParsedConfig::parse(text)?.resolve(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_rejects_inline_jumps_in_defaults_and_unused_hosts() {
+        for source in [
+            "[default]\nproxy-jump = {host-name = 'jump'}",
+            "[hosts.unused]\nproxy-jump = [{host-name = 'jump'}]",
+            "[hosts.unused]\nproxy-jump = ['alias', {host-name = 'jump'}]",
+            "[hosts.unused]\nproxy-jump = [[]]",
+        ] {
+            assert!(ParsedConfig::parse(source).is_err(), "{source}");
+        }
+    }
 }

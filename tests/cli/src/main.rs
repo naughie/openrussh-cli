@@ -328,6 +328,154 @@ return {{
     );
 
     rt.register(
+        "Lua inline jumps inherit defaults and bypass alias lookup",
+        async || {
+            for jump in ["{host_name = '127.0.0.1'}", "{user = 'bob'}"] {
+                let client = t::Client::lua(&format!(
+                    r#"
+return {{
+    defaults = {{
+        host_name = '127.0.0.1', user = 'bob', port = 2222,
+        identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+    }},
+    hosts = {{
+        target = {{proxy_jump = {jump}}},
+        ['127.0.0.1'] = {{host_name = 'invalid.invalid', port = 1}},
+    }},
+}}
+"#,
+                ))?;
+                let output = client.run(&["target", "printf", "inline"], b"").await?;
+                t::expect(&output, 0, b"inline", b"");
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "Lua inline and named jump chains traverse only the first entry",
+        async || {
+            for (jumps, success) in [
+                (
+                    "{{host_name = '127.0.0.1'}, {host_name = '127.0.0.1'}}",
+                    true,
+                ),
+                (
+                    "{{host_name = '127.0.0.1', proxy_jump = {host_name = '127.0.0.1'}}, 'Later'}",
+                    true,
+                ),
+                (
+                    "{'First', {host_name = '127.0.0.1', proxy_jump = 'Invalid'}}",
+                    true,
+                ),
+                (
+                    "{{host_name = '127.0.0.1', proxy_jump = 'Invalid'}, 'Later'}",
+                    false,
+                ),
+                ("{'BrokenFirst', {host_name = '127.0.0.1'}}", false),
+            ] {
+                let client = t::Client::lua(&format!(
+                    r#"
+return {{
+    defaults = {{
+        host_name = '127.0.0.1', user = 'bob', port = 2222,
+        identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+    }},
+    hosts = {{
+        target = {{proxy_jump = {jumps}}},
+        First = {{proxy_jump = {{host_name = '127.0.0.1'}}}},
+        BrokenFirst = {{proxy_jump = 'Invalid'}},
+        Later = {{proxy_jump = 'Invalid'}},
+        Invalid = {{port = 1}},
+    }},
+}}
+"#,
+                ))?;
+                let output = client.run(&["target", "printf", "chained"], b"").await?;
+
+                if success {
+                    t::expect(&output, 0, b"chained", b"");
+                } else {
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "Lua inline jumps use their own connection settings",
+        async || {
+            for (user, port, identity, success) in [
+                ("bob", 2222, "/home/alice/.ssh/id_ed25519", true),
+                ("wrong", 2222, "/home/alice/.ssh/id_ed25519", false),
+                ("bob", 1, "/home/alice/.ssh/id_ed25519", false),
+                ("bob", 2222, "/missing/identity", false),
+            ] {
+                let client = t::Client::lua(&format!(
+                    r#"
+return {{
+    defaults = {{user = 'wrong', port = 1, request_tty = false}},
+    hosts = {{
+        target = {{
+            host_name = '127.0.0.1', user = 'bob', port = 2222,
+            identity_file = '/home/alice/.ssh/id_ed25519',
+            proxy_jump = {{
+                host_name = '127.0.0.1', user = '{user}', port = {port},
+                identity_file = '{identity}',
+            }},
+        }},
+    }},
+}}
+"#,
+                ))?;
+                let output = client
+                    .run(&["target", "printf", "independent"], b"")
+                    .await?;
+
+                if success {
+                    t::expect(&output, 0, b"independent", b"");
+                } else {
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register("-J overrides Lua inline jump chains", async || {
+        let client = t::Client::lua(
+            r#"
+return {
+    defaults = {
+        host_name = '127.0.0.1', user = 'bob', port = 2222,
+        identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+    },
+    hosts = {
+        target = {proxy_jump = {{host_name = '127.0.0.1', port = 1}, 'Invalid'}},
+        Jump = {},
+        Invalid = {port = 1},
+    },
+}
+"#,
+        )?;
+
+        for jump in ["none", "Jump"] {
+            let output = client
+                .run(&["-J", jump, "target", "printf", "overridden"], b"")
+                .await?;
+            t::expect(&output, 0, b"overridden", b"");
+        }
+
+        Ok(())
+    });
+
+    rt.register(
         "Lua requires explicit agent environment access",
         async || {
             use std::path::Path;
@@ -355,7 +503,10 @@ return {
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
     },
-    hosts = { target = {}, Jump = {} },
+    hosts = {
+        target = {}, Jump = {},
+        Inline = {proxy_jump = {host_name = '127.0.0.1'}},
+    },
 }
 "#,
             )?;
@@ -366,6 +517,7 @@ return {
                 for args in [
                     &["target", "printf", "local-key"][..],
                     &["-J", "Jump", "target", "printf", "local-key"][..],
+                    &["Inline", "printf", "local-key"][..],
                 ] {
                     let output = run(&client, args, socket).await?;
                     t::expect(&output, 0, b"local-key", b"");
@@ -452,6 +604,62 @@ return {
             Ok(())
         },
     );
+
+    rt.register("invalid Lua inline jumps report the selected file", async || {
+        for (jump, expected) in [
+            ("true", "jump"),
+            ("{true}", "jump"),
+            ("{host_name = true}", "string"),
+            ("{host_name = '127.0.0.1', port = false}", "port"),
+            (
+                "{host_name = '127.0.0.1', proxy_jump = {{host_name = '127.0.0.1', unexpected = true}}}",
+                "unknown field",
+            ),
+            ("{user = 'bob'}", "requires host_name"),
+        ] {
+            let client = t::Client::lua(&format!(
+                "return {{hosts = {{target = {{host_name = '127.0.0.1', proxy_jump = {jump}}}}}}}",
+            ))?;
+            let output = client.run(&["target", "true"], b"").await?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(output.status.code(), Some(255));
+            assert!(stderr.contains(".lua"), "{stderr}");
+            assert!(stderr.contains(expected), "{stderr}");
+        }
+
+        for field in ["identity_file", "certificate_file", "identity_agent"] {
+            for path in ["relative/key", "../key", "~/.ssh/key", ""] {
+                let client = t::Client::lua(&format!(
+                    r#"
+return {{
+    hosts = {{
+        target = {{
+            host_name = '127.0.0.1', user = 'bob', port = 2222,
+            identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+        }},
+        Unselected = {{
+            proxy_jump = {{
+                host_name = '127.0.0.1',
+                proxy_jump = {{{{host_name = '127.0.0.1', {field} = '{path}'}}}},
+            }},
+        }},
+    }},
+}}
+"#,
+                ))?;
+                let output = client.run(&["-J", "none", "target", "true"], b"").await?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                assert_eq!(output.status.code(), Some(255));
+                assert!(stderr.contains(".lua"), "{stderr}");
+                assert!(stderr.contains("absolute"), "{stderr}");
+                assert!(stderr.contains(field), "{stderr}");
+            }
+        }
+
+        Ok(())
+    });
 
     rt.register("invalid Lua configs report the selected file", async || {
         for text in [
