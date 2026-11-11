@@ -225,7 +225,7 @@ local function target()
     }}
 end
 return {{
-    defaults = {{
+    default = {{
         host_name = 'invalid.invalid',
         user = 'wrong',
         port = 1,
@@ -300,7 +300,7 @@ return {
                     r#"
 local home = os.getenv('HOME')
 return {{
-    defaults = {{
+    default = {{
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = home .. '/.ssh/id_ed25519', request_tty = false,
     }},
@@ -334,7 +334,7 @@ return {{
                 let client = t::Client::lua(&format!(
                     r#"
 return {{
-    defaults = {{
+    default = {{
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
     }},
@@ -378,7 +378,7 @@ return {{
                 let client = t::Client::lua(&format!(
                     r#"
 return {{
-    defaults = {{
+    default = {{
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
     }},
@@ -418,7 +418,7 @@ return {{
                 let client = t::Client::lua(&format!(
                     r#"
 return {{
-    defaults = {{user = 'wrong', port = 1, request_tty = false}},
+    default = {{user = 'wrong', port = 1, request_tty = false}},
     hosts = {{
         target = {{
             host_name = '127.0.0.1', user = 'bob', port = 2222,
@@ -452,7 +452,7 @@ return {{
         let client = t::Client::lua(
             r#"
 return {
-    defaults = {
+    default = {
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
     },
@@ -499,7 +499,7 @@ return {
             let client = t::Client::lua(
                 r#"
 return {
-    defaults = {
+    default = {
         host_name = '127.0.0.1', user = 'bob', port = 2222,
         identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
     },

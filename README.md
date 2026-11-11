@@ -116,8 +116,8 @@ Unknown fields and invalid types are errors, including in unused hosts.
 | `request-tty` | `request_tty` | Boolean or TTY-mode string | `"auto"` |
 | `proxy-jump` | `proxy_jump` | String or list; Lua also accepts inline jump-host tables | No jump hosts |
 
-For compatibility, both native formats also accept `default`/`defaults` and the
-other format's field-name spelling. Host names are never case-folded.
+Both native formats also accept `defaults` and the other format's field-name
+spelling. Host names are never case-folded.
 
 ### Boolean and TTY values
 

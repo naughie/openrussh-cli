@@ -100,7 +100,7 @@ mod tests {
 
         let source = r#"
 return {
-    defaults = {
+    default = {
         user = 'default-user', port = 2222, identity_file = '/keys/default',
         certificate_file = '/keys/default-cert', identity_agent = '/sockets/default',
         identities_only = true, request_tty = 'yes',
@@ -152,7 +152,7 @@ return {
     fn inline_hosts_inherit_defaults_and_empty_entries_are_records() -> Result<()> {
         for jump in ["{user = 'me'}", "{{}}"] {
             let source = format!(
-                "return {{defaults = {{host_name = 'default.example', user = 'me', port = 2200, identity_file = '/keys/default'}}, hosts = {{target = {{host_name = 'target.example', proxy_jump = {jump}}}}}}}"
+                "return {{default = {{host_name = 'default.example', user = 'me', port = 2200, identity_file = '/keys/default'}}, hosts = {{target = {{host_name = 'target.example', proxy_jump = {jump}}}}}}}"
             );
             let chain = query(&source, &options("target"))?;
             let jump = &chain.bastions.as_deref().unwrap()[0];
@@ -252,7 +252,7 @@ local home = assert(os.getenv("HOME"))
 local prefix = home .. "/.ssh/"
 local function identity(name) return prefix .. name end
 return {
-    defaults = {
+    default = {
         user = "default", identities_only = "yes", identity_agent = home .. "/agent.sock",
         identity_file = identity("default"), request_tty = "yes",
     },
@@ -316,7 +316,7 @@ port = 2200
         assert!(empty.bastions.is_none());
 
         let chain = query(
-            "return {defaults = {proxy_jump = 'jump'}, hosts = {sample = {proxy_jump = {}, identity_file = {}}}}",
+            "return {default = {proxy_jump = 'jump'}, hosts = {sample = {proxy_jump = {}, identity_file = {}}}}",
             &conf,
         )?;
 
@@ -370,7 +370,7 @@ port = 2200
         let conf = options("sample");
         for source in [
             "return {}",
-            "return {defaults = {identity_agent = nil}, hosts = {sample = {}}}",
+            "return {default = {identity_agent = nil}, hosts = {sample = {}}}",
             "return {hosts = {sample = {proxy_jump = 'jump'}, jump = {}}}",
         ] {
             let chain = query(source, &conf)?;
@@ -382,7 +382,7 @@ port = 2200
         }
 
         let explicit = query(
-            "return {defaults = {identity_agent = os.getenv('SSH_AUTH_SOCK')}, hosts = {sample = {proxy_jump = 'jump'}}}",
+            "return {default = {identity_agent = os.getenv('SSH_AUTH_SOCK')}, hosts = {sample = {proxy_jump = 'jump'}}}",
             &conf,
         );
         let agent = std::env::var_os("SSH_AUTH_SOCK");
@@ -401,7 +401,7 @@ port = 2200
         }
 
         let chain = query(
-            "return {defaults = {identity_agent = '/sockets/explicit.sock'}, hosts = {sample = {proxy_jump = 'jump'}}}",
+            "return {default = {identity_agent = '/sockets/explicit.sock'}, hosts = {sample = {proxy_jump = 'jump'}}}",
             &conf,
         )?;
         let expected = Some(Path::new("/sockets/explicit.sock"));
@@ -446,7 +446,7 @@ port = 2200
         for (value, expected) in [("auto", ForShell), ("force", Always)] {
             assert_eq!(
                 query(
-                    &format!("return {{defaults = {{request_tty = '{value}'}}}}"),
+                    &format!("return {{default = {{request_tty = '{value}'}}}}"),
                     &options("sample")
                 )?
                 .target
@@ -466,11 +466,11 @@ port = 2200
             "return 22",
             "return 'text'",
             "return function() end",
-            "return {defaults = {identities_only = 1}}",
-            "return {defaults = {port = 65536}}",
-            "return {defaults = {port = 22.5}}",
-            "return {defaults = {identity_file = {1}}}",
-            "return {defaults = {identity_file = {'key', extra = 'ignored'}}}",
+            "return {default = {identities_only = 1}}",
+            "return {default = {port = 65536}}",
+            "return {default = {port = 22.5}}",
+            "return {default = {identity_file = {1}}}",
+            "return {default = {identity_file = {'key', extra = 'ignored'}}}",
             "return {hosts = {unused = {include = 'other'}}}",
         ] {
             assert!(query(text, &options("sample")).is_err(), "{text}");

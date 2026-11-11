@@ -306,7 +306,7 @@ mod tests {
         )?;
         let lua = {
             let source = String::from(
-                "return {defaults = {user = 'default-user', identity_agent = '/sockets/agent.sock'}, hosts = {first = {user = 'first-user'}, second = {user = 'second-user'}}}",
+                "return {default = {user = 'default-user', identity_agent = '/sockets/agent.sock'}, hosts = {first = {user = 'first-user'}, second = {user = 'second-user'}}}",
             );
             lua::ParsedConfig::execute(&source)?
         };

@@ -77,7 +77,11 @@ host records in jump settings. Their canonical spellings differ:
 | Multiword field names | `kebab-case` | `snake_case` |
 | Ordered list | TOML array | Lua sequence table |
 
-Both `default` and `defaults` are accepted root names. The current schemas also accept both kebab-case and snake_case spellings for the listed multiword fields in either format. These are spelling aliases for one field, not independent settings; supplying both aliases for the same field is an error. Unknown sections and fields are errors, including `Include`/`include`.
+Both `default` and `defaults` are accepted root names. The current schemas also
+accept both kebab-case and snake_case spellings for the listed multiword fields
+in either format. These are spelling aliases for one field, not independent
+settings; supplying both aliases for the same field is an error. Unknown
+sections and fields are errors, including `Include`/`include`.
 
 Default and host tables are optional. Every native host key is an exact, case-sensitive lookup key. A key such as `"dev-*"`, `"server?"`, or `"!private"` is literal; it has no wildcard or negation meaning. Matching uses the requested alias before `host_name` replaces the network destination. The same rule applies when looking up jump-host aliases.
 
