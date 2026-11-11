@@ -26,13 +26,59 @@ ssh [OPTIONS] DESTINATION [COMMAND [ARGUMENT ...]]
 | `-C` | Prefer compression. |
 | `-c CIPHERS` | Set an ordered, comma-separated cipher preference list. |
 | `-m MACS` | Set an ordered, comma-separated message authentication code preference list. |
+| `-v` | Enable logging with the native `meta.log_level` filter. |
 | `-V`, `-h`, `--help` | Print the version or usage. |
 
 Repeated scalar options use the last occurrence. `-t` and `-T` follow command-line order: a later `-T` cancels earlier `-t` occurrences, and a later `-t` cancels `-T`. More than one active `-t` forces allocation. `-N` and `-W` select distinct session modes, conflict with each other and a remote command, and disable the remote PTY.
 
 Omitting `COMMAND` starts a remote shell. A command supplies a program and an ordered argument list. Tokens following the program are its arguments, including tokens beginning with `-`. CLI connection settings take precedence over file settings; details of file selection, host matching, defaults, and list merging belong to the configuration reference.
 
-The CLI does not expose arbitrary `-o` settings, verbose `-v` logging, subsystem requests, remote forwarding (`-R`), dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), or X11 forwarding (`-X`). Parsing a directive in an OpenSSH configuration file does not itself add an application feature or extend the dependency's implementation.
+The CLI does not expose arbitrary `-o` settings, subsystem requests, remote forwarding (`-R`), dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), or X11 forwarding (`-X`). Parsing a directive in an OpenSSH configuration file does not itself add an application feature or extend the dependency's implementation.
+
+## Logging
+
+Client log diagnostics use `tracing` and go to stderr. Native configuration
+selects their filter through top-level `meta.log-level` in TOML or
+`meta.log_level` in Lua. Both spellings are accepted in either native format.
+The value uses `tracing_subscriber::EnvFilter` syntax, similar to `RUST_LOG`:
+combine an optional global level with target or module prefix directives,
+as in `"debug,russh=info"`. A bare target enables trace for that prefix.
+Target-only filters disable unmatched targets; include a global level for a
+fallback. The exact string `"none"` disables logs; use `off` in combined
+filters. An empty string defaults to `"error"`. The `RUST_LOG` environment
+variable is not read.
+
+| Configured filter | Without `-v` | With `-v` |
+| --- | --- | --- |
+| Omitted or Lua `nil` | Errors | Errors, warnings, informational messages, and debug messages |
+| `"none"` or `"off"` | No log diagnostics | No log diagnostics |
+| `"error"` | Errors | Errors |
+| `"warn"` | Errors | Errors and warnings |
+| `"info"` | Errors | Errors, warnings, and informational messages |
+| `"debug"` | Errors | Errors, warnings, informational messages, and debug messages |
+| `"trace"` | Errors | All levels, including trace messages |
+| `"debug,russh=info"` | Errors | Debug generally; info and above for `russh` |
+| `"error,russh=off"` | Errors except from `russh` | Errors except from `russh` |
+
+Without `-v`, an error-only limit is applied in addition to the configured
+filter; target-specific disabling still suppresses matching errors. Repeating
+`-v` does not increase the level. Invalid directives and non-string values are
+configuration errors. OpenSSH `LogLevel` does not select this native
+application setting.
+Logs follow the OpenSSH client style: errors start with `ssh: `, debug messages
+start with `debug1: `, trace messages start with `debug2: `, and warnings and
+informational messages have no level prefix. They contain no timestamps, ANSI
+colors, or Rust module targets, and use CRLF line endings so messages remain
+readable in a raw terminal.
+
+Log filtering does not change remote stdout/stderr, host-key confirmation on
+`/dev/tty`, or interactive escape help. Server authentication banners are
+informational log messages and follow the same filter. Once native
+configuration and its log directives are parsed successfully, that filter also
+governs validation and resolution errors. Failures reading, executing, or
+deserializing a configuration, including invalid log directives, use the
+default error level. Clap handles help, version, and CLI argument errors
+separately.
 
 ## Connection, authentication, and commands
 
@@ -58,7 +104,7 @@ Local input EOF sends SSH channel EOF after forwarding an unfinished escape pref
 | --- | --- |
 | Remote command or shell reports `exit-status` | The dependency's Unix status conversion retains the low eight bits. |
 | Channel closes without `exit-status` | `0`, following the current dependency's initial status. |
-| Local runtime/configuration/connection error | `255`, with `ssh: ...` on stderr. |
+| Local runtime/configuration/connection error | `255`, with `ssh: ...` on stderr unless client logging is disabled. |
 | Interactive disconnect escape | `255`. |
 | Connection closes during `-N` | `255`. |
 
@@ -113,7 +159,7 @@ An unspecified TCP bind address means loopback, or all interfaces with `-g`. An 
 
 All requested local listeners are bound before accepting connections. If a later specification fails, earlier bindings are dropped. A Unix-domain listener never removes an existing path to make room. Its cleanup guard records the created socket's device and inode and removes the path only if that same filesystem object is still present, preserving replacements and symlinks.
 
-Each listener accepts streams and starts a task for each accepted connection. TCP-to-TCP forwarding uses `Connection::forward_local_tcp()` and supplies the local peer address as the originator. Unix-to-Unix forwarding uses `Connection::forward_local_uds()`. Both wait for the library forwarding handle. Failure of one accepted stream is reported on stderr and leaves the listener running; listener failure or a task panic ends the forwarding operation. Ending the session shuts down listener and stream tasks and releases bindings.
+Each listener accepts streams and starts a task for each accepted connection. TCP-to-TCP forwarding uses `Connection::forward_local_tcp()` and supplies the local peer address as the originator. Unix-to-Unix forwarding uses `Connection::forward_local_uds()`. Both wait for the library forwarding handle. Failure of one accepted stream is logged as an error and leaves the listener running; listener failure or a task panic ends the forwarding operation. Ending the session shuts down listener and stream tasks and releases bindings.
 
 `-W HOST:PORT` has no local listener. It opens an SSH `direct-tcpip` channel with originator `127.0.0.1:0`, wraps that channel in the dependency's `Child`, and uses the standard-stream pump. This lower-level channel opening is necessary because the dependency's local forwarding helpers take a network stream. It does not add a subsystem or a second forwarding implementation.
 

@@ -154,6 +154,7 @@ async fn bind(forwards: &[LocalForward]) -> Result<Vec<(Listener, &ForwardTarget
                     },
                     &conf.target,
                 ));
+                tracing::debug!("Local forwarding listening on {}.", path.display());
             }
         }
     }
@@ -186,7 +187,13 @@ fn bind_tcp<'conf>(
         };
 
         match bind() {
-            Ok(listener) => listeners.push((Listener::Tcp(listener), target)),
+            Ok(listener) => {
+                tracing::debug!(
+                    "Local forwarding listening on {}.",
+                    listener.local_addr().unwrap_or(addr)
+                );
+                listeners.push((Listener::Tcp(listener), target));
+            }
             Err(e) => error = Some(e),
         }
     }
@@ -215,13 +222,14 @@ where
             res = tasks.join_next(), if !tasks.is_empty() => {
                 match res {
                     Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(e))) => eprintln!("ssh: local forward: {e:#}"),
+                    Some(Ok(Err(e))) => tracing::error!("local forward: {e:#}"),
                     Some(Err(e)) => return Err(e).context("local forwarding task failed"),
                     None => {}
                 }
             }
             res = accept(&listener) => {
                 let incoming = res?;
+                tracing::debug!("Local forwarding connection accepted.");
                 let conn = Arc::clone(conn);
                 let target = target.clone();
                 tasks.spawn(async move { forward(&conn, incoming, &target).await });

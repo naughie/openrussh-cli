@@ -16,6 +16,7 @@ pub(crate) async fn run<H: Handler>(
     events: &mut Events,
 ) -> Result<u8> {
     if matches!(session, Session::None) {
+        tracing::debug!("Entering forwarding-only session.");
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
 
         loop {
@@ -47,8 +48,12 @@ pub(crate) async fn run<H: Handler>(
 
     let forwarding = matches!(session, Session::Forward { .. });
     let mut child = match session {
-        Session::Shell => conn.shell().await?,
+        Session::Shell => {
+            tracing::debug!("Requesting shell.");
+            conn.shell().await?
+        }
         Session::Exec { prog, args } => {
+            tracing::debug!("Sending command: {prog}");
             let mut cmd = Command::new().prog(&prog);
 
             for arg in args.iter().flatten() {
@@ -58,6 +63,7 @@ pub(crate) async fn run<H: Handler>(
             conn.exec(cmd.complete(false)).await?
         }
         Session::Forward { host, port } => {
+            tracing::debug!("Opening stdio forwarding to {host} port {port}.");
             let channel = conn
                 .handle()
                 .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
@@ -72,6 +78,7 @@ pub(crate) async fn run<H: Handler>(
 
     let interactive = tty && !forwarding;
     let term = Terminal::new(fd, interactive && !stdin_null)?;
+    tracing::debug!("Entering interactive session.");
     {
         let (writer, reader) = child.channel();
         let input = if stdin_null {

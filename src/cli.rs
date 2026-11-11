@@ -14,6 +14,13 @@ use std::path::PathBuf;
 )]
 struct Args {
     #[arg(
+        short = 'v',
+        overrides_with = "verbose",
+        help = "Enable verbose logging at the configured log level"
+    )]
+    verbose: bool,
+
+    #[arg(
         short = 'F',
         value_name = "CONFIG",
         overrides_with = "config",
@@ -199,6 +206,7 @@ impl Args {
             identities: args.identities,
             proxy_jump,
             tty,
+            verbose: args.verbose,
             session,
             stdin_null: args.stdin_null,
             escape_char: parse_escape(args.escape.as_deref().unwrap_or("~"))?,
@@ -485,8 +493,27 @@ mod tests {
         assert_eq!(conf.escape_char, Some(b'~'));
 
         assert!(!conf.stdin_null);
+        assert!(!conf.verbose);
 
         assert!(conf.local_forwards.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_flag_preserves_remote_command_arguments() -> Result<()> {
+        for flags in ["-v", "-vv", "-vvv"] {
+            let conf = parse(&[flags, "server", "printf", "-v"])?;
+
+            assert!(conf.verbose);
+            assert_eq!(
+                conf.session,
+                Session::Exec {
+                    prog: "printf".to_owned(),
+                    args: Some(vec!["-v".to_owned()]),
+                }
+            );
+        }
 
         Ok(())
     }
@@ -625,7 +652,7 @@ mod tests {
 
     #[test]
     fn unsupported_options_are_rejected() {
-        for option in ["-o", "-v", "-s", "-R", "-D", "-A", "-X"] {
+        for option in ["-o", "-s", "-R", "-D", "-A", "-X"] {
             assert!(parse(&[option, "server"]).is_err(), "{option}");
         }
     }

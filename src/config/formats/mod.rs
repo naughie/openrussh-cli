@@ -1,5 +1,5 @@
 use super::algorithms::{self, Algorithms, Policies};
-use super::{Meta, Options, Resolved};
+use super::{LoadError, LogLevel, Meta, Options, Resolved};
 
 use openrussh_client::config::{Auth, Chain, Dest, Host, RequestTty, Target};
 
@@ -38,6 +38,8 @@ pub(super) struct Profiles<'src> {
 struct MetaFields<'src> {
     #[serde(borrow, alias = "known_hosts")]
     known_hosts: Option<Text<'src>>,
+    #[serde(alias = "log_level")]
+    log_level: Option<LogLevel>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -75,6 +77,10 @@ pub(super) fn defaults(conf: &Options) -> Result<Resolved> {
 }
 
 impl Profiles<'_> {
+    pub(super) fn log_level(&self) -> Option<LogLevel> {
+        self.meta.log_level.clone()
+    }
+
     pub(super) fn require_named_jumps(&self) -> Result<()> {
         for host in std::iter::once(&self.defaults).chain(self.hosts.values()) {
             ensure!(
@@ -90,6 +96,16 @@ impl Profiles<'_> {
     }
 
     pub(super) fn resolve(&self, conf: &Options, paths: PathMode) -> Result<Resolved> {
+        self.resolve_inner(conf, paths).map_err(|error| {
+            LoadError {
+                log_level: self.meta.log_level.clone(),
+                error,
+            }
+            .into()
+        })
+    }
+
+    fn resolve_inner(&self, conf: &Options, paths: PathMode) -> Result<Resolved> {
         for host in std::iter::once(&self.defaults).chain(self.hosts.values()) {
             host.validate(paths)?;
         }
@@ -127,6 +143,7 @@ impl Profiles<'_> {
                 bastions: bastion_algorithms.map(Vec::into_boxed_slice),
             },
             meta: Meta {
+                log_level: self.meta.log_level.clone(),
                 known_hosts: self
                     .meta
                     .known_hosts
@@ -400,6 +417,7 @@ mod tests {
             identities: None,
             proxy_jump: None,
             tty: None,
+            verbose: false,
             session: Session::Shell,
             stdin_null: false,
             escape_char: Some(b'~'),

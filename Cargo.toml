@@ -19,6 +19,8 @@ terminal_size = "0.4"
 whoami = "2.1"
 toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
 tokio = { version = "1.54", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "tracing-log"] }
 
 [dev-dependencies]
 rand = "0.10"

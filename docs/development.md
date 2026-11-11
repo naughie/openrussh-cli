@@ -10,6 +10,7 @@ The Cargo package is `openrussh-cli`, the library crate is `openrussh_cli`, and 
 | --- | --- |
 | `cli` | Parse arguments, validate CLI syntax, and construct configuration inputs. |
 | `config` | Resolve format-specific configuration and CLI inputs into the application's format-independent configuration. |
+| `logging` | Initialize tracing, apply native filter directives and the CLI verbosity limit, and format client diagnostics for stderr. |
 | `known_hosts` | Load the selected trust database once and retain its save path as a setup resource. |
 | `handler` | Apply per-host transport policies and integrate the library's known-host checks with local trust prompts and persistence. |
 | `session` | Select the library session operation and pump channel input/output, escapes, and terminal events. |
@@ -35,6 +36,14 @@ destinations.
 The project uses Rust edition 2024 and major/minor dependency requirements in manifests. The lockfile records the resolved dependency versions; the current SSH implementation is `openrussh-client` 0.4.6. Its enabled features select AWS-LC cryptography, RSA support, compression, the OpenSSH config parser, known hosts, process operations, and local TCP/Unix-domain forwarding. Disabling an unused feature is preferable to retaining an unnecessary implementation dependency.
 
 `mlua` enables `vendored`, `lua54`, `serde`, and `error-send`, with default features disabled. Lua 5.4 is built from bundled source and linked into the executable, so release users do not install Lua separately. Configuration is evaluated synchronously once; the Lua async feature is deliberately absent. `error-send` allows errors to cross the application's error boundary without making the Lua state an asynchronous shared service. Serde performs native configuration deserialization, with `toml` handling TOML syntax. Do not introduce a manual TOML or Lua configuration parser.
+
+Client diagnostics use `tracing` with `tracing-subscriber` for initialization
+and formatting, including its bridge for dependency `log` records. Keep the
+effective filter controlled by the CLI verbosity flag and native metadata.
+Use `tracing_subscriber::EnvFilter` for directive parsing and matching, without
+reading `RUST_LOG` from the environment. Retain the OpenSSH-style stderr format
+described in the [runtime reference](runtime.md#logging). Remote channel output and terminal
+interaction are separate from log diagnostics.
 
 Source builds require a Unix-like system, Rust/Cargo, and a C toolchain with a compiler and linker for the vendored Lua and AWS-LC dependencies. The configured non-FIPS AWS-LC build does not require CMake on the supported platforms. The code relies on Unix file descriptors, termios, signals, and Unix-domain sockets. Vendored cryptographic dependencies must remain compatible with static linking for musl builds.
 
@@ -80,7 +89,7 @@ The root Cargo project and `tests/` are separate workspaces. Consequently, `carg
 
 | Suite | Application behavior |
 | --- | --- |
-| `cli` | CLI overrides, configuration selection/matching, native value types, and path rules. |
+| `cli` | CLI overrides, configuration selection/matching, native value types, path rules, and verbose logging policy. |
 | `stdio` | Shell/exec input, literal arguments, stdout/stderr, exit status, EOF, and full-duplex output. |
 | `terminal` | PTY policy, resize, escapes, suspension, and terminal restoration. |
 | `signals` | Termination and suspension across session modes and host-key confirmation. |

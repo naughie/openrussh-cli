@@ -6,10 +6,10 @@ fn main() {
         let output = client.run(&["--help"], b"").await?;
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: ssh"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("-v"));
 
         for args in [
             &["-o", "BatchMode=yes", "target"][..],
-            &["-v", "target", "true"][..],
             &["-s", "target", "sftp"][..],
         ] {
             let output = client.run(args, b"").await?;
@@ -27,6 +27,241 @@ fn main() {
                 String::from_utf8_lossy(&output.stderr)
                     .contains("Invalid local forwarding specification")
             );
+        }
+
+        Ok(())
+    });
+
+    rt.register("logging defaults follow verbose mode", async || {
+        let openssh = t::Client::new("")?;
+        let [toml, lua] = logging_clients(None)?;
+
+        for client in [&openssh, &toml, &lua] {
+            let output = client.run(&["target", "printf", "default"], b"").await?;
+            t::expect(&output, 0, b"default", b"");
+
+            let output = client
+                .run(&["-v", "target", "printf", "default"], b"")
+                .await?;
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(output.stdout, b"default");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("debug1: Connecting to "), "{stderr}");
+            assert!(
+                stderr.contains("debug1: Entering interactive session."),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("debug2: "), "{stderr}");
+
+            let output = client.run(&["-p", "1", "target", "true"], b"").await?;
+            assert_eq!(output.status.code(), Some(255));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.starts_with("ssh: "), "{stderr}");
+            assert!(!stderr.contains("debug1: "), "{stderr}");
+
+            let output = client
+                .run(&["-v", "-p", "1", "target", "true"], b"")
+                .await?;
+            assert_eq!(output.status.code(), Some(255));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("debug1: Connecting to "), "{stderr}");
+            assert!(
+                stderr.lines().any(|line| line.starts_with("ssh: ")),
+                "{stderr}"
+            );
+        }
+
+        Ok(())
+    });
+
+    rt.register("native log levels require verbose mode", async || {
+        for level in ["none", "error", "warn", "info", "debug"] {
+            for client in logging_clients(Some(level))? {
+                let output = client.run(&["target", "printf", "quiet"], b"").await?;
+                t::expect(&output, 0, b"quiet", b"");
+
+                let output = client
+                    .run(&["-v", "target", "printf", "verbose"], b"")
+                    .await?;
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{level}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"verbose");
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains('\x1b'), "{level}: {stderr}");
+                assert!(!stderr.contains("openrussh_cli::"), "{level}: {stderr}");
+
+                match level {
+                    "info" => {
+                        assert!(!stderr.is_empty());
+                        assert!(!stderr.contains("debug1: "), "{stderr}");
+                    }
+                    "debug" => assert!(stderr.contains("debug1: "), "{stderr}"),
+                    _ => assert!(stderr.is_empty(), "{level}: {stderr}"),
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    rt.register(
+        "native log filters select application and dependency targets",
+        async || {
+            for filter in ["debug", "debug,russh=info", "error,openrussh_cli=debug"] {
+                for client in logging_clients(Some(filter))? {
+                    let output = client
+                        .run(&["-v", "target", "printf", "filtered"], b"")
+                        .await?;
+                    assert_eq!(
+                        output.status.code(),
+                        Some(0),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(output.stdout, b"filtered");
+
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        stderr.contains("debug1: Connecting to "),
+                        "{filter}: {stderr}"
+                    );
+                    assert!(
+                        stderr.contains("debug1: Entering interactive session."),
+                        "{filter}: {stderr}"
+                    );
+                    // russh emits this for every handshake, before key exchange.
+                    assert_eq!(
+                        stderr.contains("ssh id = "),
+                        filter == "debug",
+                        "{filter}: {stderr}"
+                    );
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "non-verbose mode caps target filters at errors",
+        async || {
+            for filter in [
+                "debug,russh=info",
+                "error,openrussh_cli=debug",
+                "trace,russh=trace,openrussh_cli=trace",
+            ] {
+                for client in logging_clients(Some(filter))? {
+                    let output = client.run(&["target", "printf", "quiet"], b"").await?;
+                    t::expect(&output, 0, b"quiet", b"");
+
+                    let output = client.run(&["-p", "1", "target", "true"], b"").await?;
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(!stderr.is_empty());
+                    assert!(
+                        stderr.lines().all(|line| line.starts_with("ssh: ")),
+                        "{filter}: {stderr}"
+                    );
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "none suppresses connection errors in both modes",
+        async || {
+            for level in ["none", "error", "warn", "info", "debug"] {
+                for client in logging_clients(Some(level))? {
+                    for verbose in [false, true] {
+                        let args = if verbose {
+                            &["-v", "-p", "1", "target", "true"][..]
+                        } else {
+                            &["-p", "1", "target", "true"][..]
+                        };
+                        let output = client.run(args, b"").await?;
+                        assert_eq!(output.status.code(), Some(255));
+                        assert!(output.stdout.is_empty());
+
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if level == "none" {
+                            assert!(stderr.is_empty(), "{stderr}");
+                        } else {
+                            assert!(
+                                stderr.lines().any(|line| line.starts_with("ssh: ")),
+                                "{level}: {stderr}"
+                            );
+                            if !verbose || level != "debug" {
+                                assert!(!stderr.contains("debug1: "), "{level}: {stderr}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register("native log levels apply to resolution errors", async || {
+        for level in ["none", "error"] {
+            let toml = t::Client::toml(&format!(
+                "[meta]\nlog-level = '{level}'\nknown-hosts = 'relative/hosts'\n"
+            ))?;
+            let lua = t::Client::lua(&format!(
+                "return {{meta = {{log_level = '{level}', known_hosts = 'relative/hosts'}}}}"
+            ))?;
+
+            for (client, extension) in [(&toml, ".toml"), (&lua, ".lua")] {
+                for args in [&["target", "true"][..], &["-v", "target", "true"][..]] {
+                    let output = client.run(args, b"").await?;
+                    assert_eq!(output.status.code(), Some(255));
+                    assert!(output.stdout.is_empty());
+
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if level == "none" {
+                        assert!(stderr.is_empty(), "{stderr}");
+                    } else {
+                        assert!(stderr.starts_with("ssh: "), "{stderr}");
+                        assert!(stderr.contains(extension), "{stderr}");
+                        assert!(
+                            stderr.contains("known_hosts must be an absolute path"),
+                            "{stderr}"
+                        );
+                        assert!(stderr.contains("relative/hosts"), "{stderr}");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    rt.register("none preserves remote output and exit status", async || {
+        for client in logging_clients(Some("none"))? {
+            let output = client
+                .run(
+                    &[
+                        "-v",
+                        "target",
+                        "sh",
+                        "-c",
+                        "printf stdout; printf stderr >&2; exit 7",
+                    ],
+                    b"",
+                )
+                .await?;
+            t::expect(&output, 7, b"stdout", b"stderr");
         }
 
         Ok(())
@@ -1037,6 +1272,24 @@ return {
     });
 
     rt.run();
+}
+
+fn logging_clients(level: Option<&str>) -> t::Result<[t::Client; 2]> {
+    let toml_meta = level.map_or_else(String::new, |level| format!("log-level = '{level}'"));
+    let lua_level = level.map_or_else(|| "nil".to_owned(), |level| format!("'{level}'"));
+
+    Ok([
+        t::Client::toml(&format!(
+            "[meta]\n{toml_meta}\n[hosts.target]\nhost-name = '127.0.0.1'\n\
+             user = 'bob'\nport = 2222\nidentity-file = '~/.ssh/id_ed25519'\n\
+             request-tty = false\n"
+        ))?,
+        t::Client::lua(&format!(
+            "return {{meta = {{log_level = {lua_level}}}, hosts = {{target = {{\
+             host_name = '127.0.0.1', user = 'bob', port = 2222, \
+             identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false}}}}}}"
+        ))?,
+    ])
 }
 
 struct FixtureConfig {

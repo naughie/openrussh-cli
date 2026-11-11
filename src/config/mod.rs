@@ -17,6 +17,7 @@ pub(crate) struct Config {
     pub chain: Chain,
     pub algorithms: Policies,
     pub meta: Meta,
+    pub verbose: bool,
     pub session: Session,
     pub stdin_null: bool,
     pub escape_char: Option<u8>,
@@ -29,6 +30,48 @@ pub(crate) struct Config {
 #[derive(Debug, Default)]
 pub(crate) struct Meta {
     pub known_hosts: Option<PathBuf>,
+    pub log_level: Option<LogLevel>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LogLevel {
+    None,
+    Filter(Box<tracing_subscriber::EnvFilter>),
+}
+
+impl<'de> serde::Deserialize<'de> for LogLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+
+        let value = String::deserialize(deserializer)?;
+        if value == "none" {
+            return Ok(Self::None);
+        }
+
+        EnvFilter::builder()
+            .with_default_directive(LevelFilter::ERROR.into())
+            .parse(value)
+            .map(|filter| Self::Filter(Box::new(filter)))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LoadError {
+    pub log_level: Option<LogLevel>,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
 }
 
 #[derive(Debug)]
@@ -54,6 +97,7 @@ pub(crate) struct Options {
     pub identities: Option<Vec<PathBuf>>,
     pub proxy_jump: Option<Vec<String>>,
     pub tty: Option<RequestTty>,
+    pub verbose: bool,
     pub session: Session,
     pub stdin_null: bool,
     pub escape_char: Option<u8>,
@@ -125,6 +169,7 @@ impl Options {
             chain,
             algorithms,
             meta,
+            verbose: self.verbose,
             session: self.session,
             stdin_null: self.stdin_null,
             escape_char: self.escape_char,
@@ -264,6 +309,7 @@ mod tests {
                 identities: None,
                 proxy_jump: None,
                 tty: None,
+                verbose: false,
                 session: Session::Shell,
                 stdin_null: false,
                 escape_char: Some(b'~'),
@@ -273,6 +319,167 @@ mod tests {
                 macs: None,
             },
         ))
+    }
+
+    #[test]
+    fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()> {
+        fn check(level: Option<LogLevel>, expected: Option<&str>) {
+            match (level, expected) {
+                (Some(LogLevel::None), None) => {}
+                (Some(LogLevel::Filter(filter)), Some(expected)) => {
+                    assert_eq!(filter.to_string(), expected);
+                }
+                (actual, expected) => {
+                    panic!("Unexpected log filter: {actual:?}, expected {expected:?}")
+                }
+            }
+        }
+
+        let (_dir, options) = config("")?;
+
+        for (name, expected) in [
+            ("none", None),
+            ("error", Some("error")),
+            ("warn", Some("warn")),
+            ("info", Some("info")),
+            ("debug", Some("debug")),
+            ("trace", Some("trace")),
+            ("off", Some("off")),
+            ("ERROR", Some("error")),
+            ("", Some("error")),
+            ("debug,russh=info", Some("russh=info,debug")),
+            ("info,russh::client=debug", Some("russh::client=debug,info")),
+            ("debug,russh=off", Some("russh=off,debug")),
+            ("russh", Some("russh=trace")),
+            ("russh::client=info", Some("russh::client=info")),
+        ] {
+            for field in ["log-level", "log_level"] {
+                let source = format!("[meta]\n{field} = '{name}'");
+                let resolved = toml::ParsedConfig::parse(&source)?.resolve(&options)?;
+                check(resolved.meta.log_level, expected);
+
+                let source = format!("return {{meta = {{['{field}'] = '{name}'}}}}");
+                let resolved = lua::ParsedConfig::execute(&source)?.resolve(&options)?;
+                check(resolved.meta.log_level, expected);
+            }
+        }
+
+        for source in ["", "[meta]"] {
+            assert!(
+                toml::ParsedConfig::parse(source)?
+                    .resolve(&options)?
+                    .meta
+                    .log_level
+                    .is_none()
+            );
+        }
+        for source in ["return {}", "return {meta = {log_level = nil}}"] {
+            assert!(
+                lua::ParsedConfig::execute(source)?
+                    .resolve(&options)?
+                    .meta
+                    .log_level
+                    .is_none()
+            );
+        }
+
+        assert!(options.resolve()?.meta.log_level.is_none());
+        assert!(formats::defaults(&options)?.meta.log_level.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_log_levels_reject_invalid_values_and_host_fields() -> Result<()> {
+        for value in [
+            "'russh=verbose'",
+            "'debug,russh=nope'",
+            "'russh=info=debug'",
+            "1",
+            "false",
+            "[]",
+            "{}",
+        ] {
+            let source = format!("[meta]\nlog-level = {value}");
+            assert!(toml::ParsedConfig::parse(&source).is_err(), "{source}");
+        }
+        for value in [
+            "'russh=verbose'",
+            "'debug,russh=nope'",
+            "'russh=info=debug'",
+            "1",
+            "false",
+            "{}",
+        ] {
+            let source = format!("return {{meta = {{log_level = {value}}}}}");
+            assert!(lua::ParsedConfig::execute(&source).is_err(), "{source}");
+        }
+        for table in ["default", "hosts.sample"] {
+            let source = format!("[{table}]\nlog-level = 'debug'");
+            assert!(toml::ParsedConfig::parse(&source).is_err(), "{source}");
+        }
+        for source in [
+            "return {default = {log_level = 'debug'}}",
+            "return {hosts = {sample = {log_level = 'debug'}}}",
+        ] {
+            assert!(lua::ParsedConfig::execute(source).is_err(), "{source}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_resolution_errors_retain_log_level_filename_and_cause() -> Result<()> {
+        for (extension, source, cause) in [
+            (
+                "toml",
+                "[meta]\nlog-level = 'none'\nknown-hosts = 'relative'",
+                "known_hosts must be an absolute path: relative",
+            ),
+            (
+                "toml",
+                "[meta]\nlog-level = 'none'\n[hosts.sample]\nkex-algorithms = 'unknown'",
+                "Unknown key-exchange algorithm: unknown",
+            ),
+            (
+                "toml",
+                "[meta]\nlog-level = 'none'\n[hosts.sample]\nproxy-jump = {host-name = 'jump'}",
+                "TOML proxy-jump must be a string or an array of strings",
+            ),
+            (
+                "lua",
+                "return {meta = {log_level = 'none', known_hosts = 'relative'}}",
+                "known_hosts must be an absolute path: relative",
+            ),
+            (
+                "lua",
+                "return {meta = {log_level = 'none'}, hosts = {sample = {identity_file = 'relative'}}}",
+                "identity_file must be an absolute path: relative",
+            ),
+        ] {
+            let (dir, mut options) = config(source)?;
+            let path = dir.path().join(format!("config.{extension}"));
+            std::fs::rename(options.config_file.as_ref().unwrap(), &path)?;
+            options.config_file = Some(path.clone());
+
+            let error = options
+                .load()
+                .err()
+                .context("Expected resolution failure")?;
+            assert!(matches!(
+                error
+                    .downcast_ref::<LoadError>()
+                    .context("Missing log level on resolution error")?
+                    .log_level,
+                Some(LogLevel::None)
+            ));
+            assert_eq!(
+                format!("{error:#}"),
+                format!("Could not read SSH config {}: {cause}", path.display())
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -441,7 +648,7 @@ return {
             "[meta]\nknown-hosts = 'relative'",
             "[meta]\nknown-hosts = ''",
             "[meta]\nknown-hosts = 1",
-            "[meta]\nlog-level = 'debug'",
+            "[meta]\nlog-level = 'russh=invalid'",
             "[default]\nknown-hosts = '/tmp/hosts'",
             "[hosts.unused]\nkex-algorithms = 'unknown'",
             "[hosts.unused]\nhost-key-algorithms = '-ssh-*'",
@@ -459,7 +666,7 @@ return {
             "return {meta = {known_hosts = '$HOME/hosts'}}",
             "return {meta = {known_hosts = ''}}",
             "return {meta = {known_hosts = false}}",
-            "return {meta = {log_level = 'debug'}}",
+            "return {meta = {log_level = 'russh=invalid'}}",
             "return {hosts = {unused = {meta = {known_hosts = '/tmp/hosts'}}}}",
             "return {hosts = {unused = {proxy_jump = {host_name = 'jump', kex_algorithms = 'unknown'}}}}",
         ] {
@@ -586,6 +793,7 @@ return {
             options.identities = Some(vec!["cli-key".into()]);
             options.proxy_jump = Some(vec!["jump".to_owned()]);
             options.tty = Some(RequestTty::Never);
+            options.verbose = true;
             options.session = Session::Exec {
                 prog: "printf".to_owned(),
                 args: Some(vec!["hello".to_owned()]),
@@ -606,6 +814,8 @@ return {
 
         assert_eq!(openssh.chain.target, toml.chain.target);
         assert_eq!(openssh.chain.bastions, toml.chain.bastions);
+        assert!(openssh.verbose);
+        assert!(toml.verbose);
         assert_eq!(openssh.session, toml.session);
         assert_eq!(openssh.stdin_null, toml.stdin_null);
         assert_eq!(openssh.escape_char, toml.escape_char);

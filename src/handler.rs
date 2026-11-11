@@ -41,6 +41,7 @@ impl MakeHandler for MyMakeHandler<'_> {
     type Error = anyhow::Error;
 
     fn make_handler(&self, host: &Host) -> Result<Context<Self::Handler>, Self::Error> {
+        tracing::debug!("Connecting to {} port {}.", host.dest.name, host.dest.port);
         let known_hosts = self.known_hosts.handler(&host.dest.name, host.dest.port);
         let algorithms = self
             .algorithms
@@ -82,15 +83,24 @@ impl Handler for MyHandler {
     type Error = anyhow::Error;
 
     async fn auth_banner(&mut self, banner: &str, _session: &mut Session) -> Result<()> {
-        use std::io::Write as _;
-
-        std::io::stderr().lock().write_all(banner.as_bytes())?;
+        tracing::info!("{}", banner.trim_end_matches(['\r', '\n']));
 
         Ok(())
     }
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
         let mut matched = self.known_hosts.check_server_key(key);
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            use openrussh_client::russh::keys::ssh_key::HashAlg;
+
+            let key = key.public_key();
+            tracing::debug!(
+                "Server host key: {} {}",
+                key.algorithm(),
+                key.fingerprint(HashAlg::Sha256)
+            );
+        }
 
         if matched == MatchResult::NotFound
             && let Some(accepted) = &self.accepted
@@ -107,7 +117,13 @@ impl Handler for MyHandler {
         }
 
         match matched {
-            MatchResult::Found => Ok(true),
+            MatchResult::Found => {
+                tracing::debug!(
+                    "Host '{}' is known and matches the server host key.",
+                    host_port(&self.host, self.port)
+                );
+                Ok(true)
+            }
             MatchResult::NotFound => {
                 let host = self.host.clone();
                 let port = self.port;
@@ -294,7 +310,7 @@ fn confirm_key(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<bo
     }
     save_key_at(path, host, port, key)
         .with_context(|| format!("Failed to save host key to {}", path.display()))?;
-    eprintln!(
+    tracing::warn!(
         "Warning: Permanently added '{}' ({}) to the list of known hosts.",
         host_port(host, port),
         key.algorithm()

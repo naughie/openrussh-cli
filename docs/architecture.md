@@ -13,15 +13,15 @@ that implement them.
 
 | Type | Meaning | Representation |
 | --- | --- | --- |
-| `config::Options` | CLI-derived inputs, overrides, and file-selection policy before loading. | Destination alias, optional user/port and overrides, selected file, session and forwarding options. |
+| `config::Options` | CLI-derived inputs, overrides, and file-selection policy before loading. | Destination alias, optional user/port and overrides, selected file, verbosity, session and forwarding options. |
 | `config::toml::ParsedConfig<'src>` | The result of parsing a TOML document. | Native profiles that can borrow from the source text. |
 | `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles, independent of the Lua VM and source text. |
 | `config::openssh::ParsedConfig` | The result of parsing OpenSSH syntax with the CLI override prefix. | The dependency's `SshConfig`. |
 | `config::formats::Profiles<'src>` | Shared Serde representation of native configuration. | Top-level setup metadata, a defaults record, and a map of exact host aliases to `HostFields`. |
 | `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, and resolved setup `Meta`. |
-| `config::Meta` | Application setup settings for the invocation. | An optional known-host database path. |
+| `config::Meta` | Application setup settings for the invocation. | An optional known-host database path and log filter. |
 | `config::algorithms::Policies` | Algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
-| `config::Config` | Final application configuration for one invocation. | The resolved chain, algorithms, and metadata plus CLI session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
+| `config::Config` | Final application configuration for one invocation. | The resolved chain, algorithms, and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
 
 `Config` is a struct, not a configuration-provider trait or a union of file
 formats. It has no Serde implementation, source-text lifetime, Lua value, file
@@ -65,7 +65,7 @@ flowchart TD
     H --> I[config::Resolved: Chain, algorithms, Meta]
     I --> J[Apply final-host CLI PTY override]
     J --> K[config::Config]
-    K --> L[Initialize known-host resource and handler factory]
+    K --> L[Configure logging, known-host resource, and handler factory]
     L --> M[Connection, session, and forwarding runtime]
 ```
 
@@ -124,9 +124,14 @@ inline hosts with the same network destination can still have different
 policies. It neither clones hosts nor uses destination names as policy keys.
 
 `Meta` is invocation setup, outside the host/default schema. Native metadata
-paths resolve under the selected format's path mode. OpenSSH resolution and
-the no-file path produce default metadata and omit explicit algorithm policies;
-the OpenSSH adapter does not extract new directives for these features.
+paths resolve under the selected format's path mode. Its optional log directives
+are parsed with `tracing_subscriber::EnvFilter` and combined with the CLI
+verbosity flag when configuring the tracing subscriber. An omitted filter means
+error-only logging without `-v` and debug logging with `-v`; an explicit empty
+string means error-only logging in either mode. Non-verbose mode additionally
+caps any filter at errors. OpenSSH resolution and the no-file path produce
+default metadata and omit explicit algorithm policies; the OpenSSH adapter does
+not extract new directives for these features.
 
 `formats::paths` implements the native path policy. TOML selects `PathMode::Expand`;
 Lua selects `PathMode::Literal`. This choice belongs to the source adapter and
@@ -197,6 +202,7 @@ resolved `Config`.
 
 ```text
 src/
+    logging.rs         Tracing initialization, level policy, and stderr format
     known_hosts.rs     Known-host setup resource and selected database path
     config/
         mod.rs         Options, Resolved, Config, Meta, and file loading

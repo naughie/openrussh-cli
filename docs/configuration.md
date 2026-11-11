@@ -170,20 +170,24 @@ record and defaults. CLI cipher, MAC, and compression options are unchanged.
 
 The optional top-level `meta` table supplies application setup for the entire
 invocation. It is separate from the host/default records and is not inherited
-through a jump chain. Its only supported field is `known-hosts` in TOML or
-`known_hosts` in Lua, with the same spelling aliases as other native fields.
-Unknown metadata fields and a `meta` field inside a host/default record are
-errors.
+through a jump chain. Its supported fields are `known-hosts` and `log-level`
+in TOML, or `known_hosts` and `log_level` in Lua, with the same spelling aliases
+as other native fields. Unknown metadata fields and a `meta` field inside a
+host/default record are errors.
 
 ```toml
 [meta]
 known-hosts = "~/.ssh/known_hosts"
+log-level = "debug,russh=info"
 ```
 
 ```lua
 local home = assert(os.getenv("HOME"))
 return {
-    meta = { known_hosts = home .. "/.ssh/known_hosts" },
+    meta = {
+        known_hosts = home .. "/.ssh/known_hosts",
+        log_level = "debug,russh=info",
+    },
 }
 ```
 
@@ -200,6 +204,31 @@ selected file once for all destination and jump-host checks. A missing file
 starts with empty trust without creating a file; other read errors fail setup.
 Accepted keys are saved to that same path. File locking and permission behavior
 are described in the [runtime reference](runtime.md#server-host-key-policy).
+
+`log-level` accepts a string using `tracing_subscriber::EnvFilter` directives,
+similar to `RUST_LOG`. A directive can supply a global level or select a target
+or module prefix, and commas combine directives. For example,
+`"debug,russh=info"` sets a global debug level and limits matching `russh` targets
+to info. The levels are `off`, `error`, `warn`, `info`, `debug`, and `trace`.
+A bare target, such as `"russh"`, enables trace for that target prefix. With
+only target directives, unmatched targets are disabled; `"error,russh=info"`
+keeps error logging elsewhere. Invalid directives and non-string values are
+errors. The exact string `"none"` disables all client log diagnostics. Use
+`off` inside combined filters, such as `"off,russh=info"`.
+
+Omitting the field or assigning `nil` in Lua defaults to `"error"` without
+CLI `-v` and `"debug"` with `-v`. An explicit empty string remains equivalent
+to `"error"` in either mode. TOML has no `nil` value. With CLI `-v`, explicit
+directives determine which messages are logged. Without `-v`, those directives
+still apply, with an additional error-only limit. For example,
+`"debug,russh=info"` cannot enable
+debug or info output without `-v`, while `"error,russh=off"` suppresses matching
+`russh` errors in either mode. Repeating `-v` does not change the filter. This
+setting does not read the `RUST_LOG` environment variable.
+
+Log filtering does not suppress remote stdout/stderr, host-key questions, or
+interactive escape help. See [runtime logging](runtime.md#logging) for output
+formatting. OpenSSH-file `LogLevel` does not configure this setting.
 
 ### Boolean and TTY values
 

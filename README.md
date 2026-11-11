@@ -187,16 +187,23 @@ is not a path and is rejected. If neither the host nor the default table sets
 ### Application setup
 
 The optional top-level `meta` table configures resources for the invocation,
-separately from host settings. Its only field is the known-host database path:
+separately from host settings. It supports a known-host database path and a
+client log level:
 
 ```toml
 [meta]
 known-hosts = "~/.ssh/known_hosts"
+log-level = "debug,russh=info"
 ```
 
 ```lua
 local home = assert(os.getenv("HOME"))
-return { meta = { known_hosts = home .. "/.ssh/known_hosts" } }
+return {
+    meta = {
+        known_hosts = home .. "/.ssh/known_hosts",
+        log_level = "debug,russh=info",
+    },
+}
 ```
 
 TOML expands tildes using the path rules above; Lua requires a literal absolute
@@ -206,6 +213,25 @@ If omitted, the library's default known-host path is used. The selected file is
 used for checks and for saving accepted host keys across all jump hosts and the
 destination. A missing file starts with empty trust; other read failures stop
 setup.
+
+Use `ssh -v my-host` to log with the configured filter. `log-level` in TOML and
+`log_level` in Lua accept a `RUST_LOG`-style directive string: a global level,
+target or module prefixes with levels, or a comma-separated combination.
+For example, `"debug,russh=info"` enables debug messages generally while limiting
+`russh` messages to info. Levels are `off`, `error`, `warn`, `info`, `debug`, and
+`trace`; the special value `"none"` also disables all client log diagnostics.
+Omitting the setting, or using Lua `nil`, means `"error"` without `-v` and
+`"debug"` with `-v`. An explicit empty string means `"error"` in either mode.
+Without `-v`, the configured filter still applies, with output capped at errors;
+`"error,russh=off"` therefore suppresses even errors from `russh`.
+Repeated `-v` flags do not raise the level. The setting comes from configuration;
+the `RUST_LOG` environment variable is not read. Invalid directives and
+non-string values are errors.
+
+Logs go to stderr in OpenSSH client style, with `ssh: ` for errors,
+`debug1: ` for debug messages, and `debug2: ` for trace messages. Remote output
+and interactive prompts are unaffected. OpenSSH-file `LogLevel` does not
+configure this setting.
 
 ### Defaults and overrides
 

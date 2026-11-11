@@ -56,6 +56,7 @@ mod tests {
             identities: None,
             proxy_jump: None,
             tty: None,
+            verbose: false,
             session: Session::Shell,
             stdin_null: false,
             escape_char: Some(b'~'),

@@ -23,6 +23,7 @@ impl KnownHostsFile {
                 "/etc/ssh/ssh_known_hosts".into()
             }
         });
+        tracing::debug!("Loading known hosts from {}.", path.display());
         let loaded = match selected {
             Some(path) => KnownHosts::parse_path(path),
             None => KnownHosts::parse_default_path(),

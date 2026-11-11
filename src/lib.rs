@@ -3,6 +3,7 @@ mod config;
 mod forwarding;
 mod handler;
 mod known_hosts;
+mod logging;
 mod session;
 mod terminal;
 
@@ -12,22 +13,38 @@ use openrussh_client::russh::client::Handler;
 use anyhow::Result;
 
 pub async fn main_impl() {
-    let status = match run().await {
+    let conf = cli::parse().and_then(config::Options::load);
+    let (verbose, level) = conf
+        .as_ref()
+        .map(|conf| (conf.verbose, conf.meta.log_level.as_ref()))
+        .unwrap_or_else(|e| {
+            (
+                false,
+                e.downcast_ref::<config::LoadError>()
+                    .and_then(|e| e.log_level.as_ref()),
+            )
+        });
+    logging::init(verbose, level);
+
+    let result = match conf {
+        Ok(conf) => run(conf).await,
+        Err(e) => Err(e),
+    };
+    let status = match result {
         Ok(status) => status,
         Err(e) => {
-            eprintln!("ssh: {e:#}");
+            tracing::error!("{e:#}");
             255
         }
     };
     std::process::exit(i32::from(status));
 }
 
-async fn run() -> Result<u8> {
+async fn run(conf: config::Config) -> Result<u8> {
     use crate::handler::MyMakeHandler;
     use crate::known_hosts::KnownHostsFile;
     use crate::terminal::{Event, Signals};
 
-    let conf = cli::parse()?.load()?;
     let preferred = conf.preferred()?;
     let known_hosts = KnownHostsFile::load(conf.meta.known_hosts.as_deref())?;
     let make_handler =
@@ -53,6 +70,13 @@ async fn run() -> Result<u8> {
             }
         }
     };
+
+    tracing::info!(
+        "Authenticated to {} (port {}) as '{}'.",
+        conf.chain.target.dest.name,
+        conf.chain.target.dest.port,
+        conf.chain.target.dest.user
+    );
 
     drop(make_handler);
     run_connected(conn, conf, &mut signals).await
@@ -146,6 +170,7 @@ where
                 disconnect?;
             }
 
+            tracing::debug!("Exit status {status}");
             Ok(status)
         }
         Err(e) => Err(e),

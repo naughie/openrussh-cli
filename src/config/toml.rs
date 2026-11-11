@@ -1,5 +1,5 @@
 use super::formats::{PathMode, Profiles};
-use super::{Options, Resolved};
+use super::{LoadError, Options, Resolved};
 
 #[cfg(test)]
 use openrussh_client::config::Chain;
@@ -13,7 +13,10 @@ pub(super) struct ParsedConfig<'src> {
 impl<'src> ParsedConfig<'src> {
     pub(super) fn parse(text: &'src str) -> Result<Self> {
         let profiles: Profiles<'src> = ::toml::from_str(text)?;
-        profiles.require_named_jumps()?;
+        profiles.require_named_jumps().map_err(|error| LoadError {
+            log_level: profiles.log_level(),
+            error,
+        })?;
 
         Ok(Self { profiles })
     }
