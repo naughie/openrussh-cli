@@ -8,17 +8,26 @@ use mlua::serde::Deserializer;
 use mlua::{DeserializeOptions, Lua, Value};
 use serde::Deserialize as _;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+
+use std::path::Path;
+
+mod cli;
 
 pub(super) struct ParsedConfig {
     profiles: Profiles<'static>,
 }
 
 impl ParsedConfig {
-    pub(super) fn execute(text: &str) -> Result<Self> {
+    pub(super) fn execute(text: &str, path: &Path) -> Result<Self> {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("Could not canonicalize Lua config {}", path.display()))?;
         let profiles = {
             let lua = Lua::new();
-            let value = lua.load(text).set_name("config.lua").eval::<Value>()?;
+            let name = format!("@{}", path.display());
+            cli::preload(&lua, path)?;
+            let value = lua.load(text).set_name(name).eval::<Value>()?;
             let options = DeserializeOptions::new()
                 .encode_empty_tables_as_array(true)
                 .detect_mixed_tables(true);
@@ -34,8 +43,14 @@ impl ParsedConfig {
 }
 
 #[cfg(test)]
+pub(super) fn execute(text: &str) -> Result<ParsedConfig> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+    ParsedConfig::execute(text, &path)
+}
+
+#[cfg(test)]
 pub(super) fn query(text: &str, options: &Options) -> Result<Chain> {
-    ParsedConfig::execute(text)?
+    execute(text)?
         .resolve(options)
         .map(|resolved| resolved.chain)
 }
@@ -65,6 +80,58 @@ mod tests {
             ciphers: None,
             macs: None,
         }
+    }
+
+    #[test]
+    fn source_paths_are_canonical_and_outlive_the_lua_state() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real)?;
+        let path = real.join("config.lua");
+        let source = String::from(
+            "local cli = require('cli'); return {hosts = {sample = {host_name = cli.__file__, user = cli.__dir__}}}",
+        );
+        std::fs::write(&path, &source)?;
+        symlink(&path, dir.path().join("alias.lua"))?;
+        let canonical = path.canonicalize()?;
+        let parsed = ParsedConfig::execute(&source, &real.join("../alias.lua"))?;
+        drop(source);
+        let host = parsed.resolve(&options("sample"))?.chain.target;
+
+        assert_eq!(host.dest.name, canonical.to_str().unwrap());
+        assert_eq!(
+            host.dest.user,
+            canonical.parent().unwrap().to_str().unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn source_path_failures_and_lua_errors_identify_the_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("actual-config.lua");
+        let error = match ParsedConfig::execute("error('must not execute')", &path) {
+            Ok(_) => panic!("missing configuration path should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("canonicalize"));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+
+        std::fs::write(&path, "error('configuration failed')")?;
+        let error = match ParsedConfig::execute("error('configuration failed')", &path) {
+            Ok(_) => panic!("Lua execution should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(path.canonicalize()?.to_str().unwrap())
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -484,7 +551,7 @@ port = 2200
     #[test]
     fn lua_syntax_and_runtime_errors_are_reported() {
         for (text, expected) in [
-            ("return {", "config.lua"),
+            ("return {", "mod.rs"),
             ("error('configuration failed')", "configuration failed"),
         ] {
             let error = query(text, &options("sample")).unwrap_err();

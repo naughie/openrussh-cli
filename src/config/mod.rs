@@ -234,7 +234,7 @@ impl Options {
             };
 
             let res = if path.extension().is_some_and(|ext| ext == "lua") {
-                lua::ParsedConfig::execute(&text).and_then(|parsed| parsed.resolve(self))
+                lua::ParsedConfig::execute(&text, path).and_then(|parsed| parsed.resolve(self))
             } else {
                 toml::ParsedConfig::parse(&text).and_then(|parsed| parsed.resolve(self))
             };
@@ -359,7 +359,7 @@ mod tests {
                 check(resolved.meta.log_level, expected);
 
                 let source = format!("return {{meta = {{['{field}'] = '{name}'}}}}");
-                let resolved = lua::ParsedConfig::execute(&source)?.resolve(&options)?;
+                let resolved = lua::execute(&source)?.resolve(&options)?;
                 check(resolved.meta.log_level, expected);
             }
         }
@@ -375,7 +375,7 @@ mod tests {
         }
         for source in ["return {}", "return {meta = {log_level = nil}}"] {
             assert!(
-                lua::ParsedConfig::execute(source)?
+                lua::execute(source)?
                     .resolve(&options)?
                     .meta
                     .log_level
@@ -412,7 +412,7 @@ mod tests {
             "{}",
         ] {
             let source = format!("return {{meta = {{log_level = {value}}}}}");
-            assert!(lua::ParsedConfig::execute(&source).is_err(), "{source}");
+            assert!(lua::execute(&source).is_err(), "{source}");
         }
         for table in ["default", "hosts.sample"] {
             let source = format!("[{table}]\nlog-level = 'debug'");
@@ -422,7 +422,7 @@ mod tests {
             "return {default = {log_level = 'debug'}}",
             "return {hosts = {sample = {log_level = 'debug'}}}",
         ] {
-            assert!(lua::ParsedConfig::execute(source).is_err(), "{source}");
+            assert!(lua::execute(source).is_err(), "{source}");
         }
 
         Ok(())
@@ -504,7 +504,7 @@ proxy-jump = 'jump'
 known-hosts = '~/.ssh/custom_known_hosts'
 "#,
         )?;
-        let lua = lua::ParsedConfig::execute(
+        let lua = lua::execute(
             r#"
 return {
     default = {
@@ -597,7 +597,7 @@ return {
         use openrussh_client::russh::kex;
 
         let (_dir, options) = config("")?;
-        let resolved = lua::ParsedConfig::execute(
+        let resolved = lua::execute(
             r#"
 return {
     default = {host_name = 'same.example', user = 'same'},
@@ -671,7 +671,7 @@ return {
             "return {hosts = {unused = {proxy_jump = {host_name = 'jump', kex_algorithms = 'unknown'}}}}",
         ] {
             assert!(
-                lua::ParsedConfig::execute(source)
+                lua::execute(source)
                     .and_then(|p| p.resolve(&options))
                     .is_err(),
                 "{source}"
@@ -705,7 +705,7 @@ return {
         let toml = toml::ParsedConfig::parse(example(readme, "```toml\n")?)?;
         let lua = {
             let source = example(readme, "```lua\n")?.to_owned();
-            lua::ParsedConfig::execute(&source)?
+            lua::execute(&source)?
         };
         let (_dir, mut options) = config("")?;
         let identity = std::env::home_dir()
@@ -756,7 +756,7 @@ return {
             let source = String::from(
                 "return {default = {user = 'default-user', identity_agent = '/sockets/agent.sock'}, hosts = {first = {user = 'first-user'}, second = {user = 'second-user'}}}",
             );
-            lua::ParsedConfig::execute(&source)?
+            lua::execute(&source)?
         };
 
         for (name, user) in [

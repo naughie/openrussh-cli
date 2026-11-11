@@ -74,7 +74,12 @@ request-tty = "yes"
 `~/.ssh/config.lua`:
 
 ```lua
-local home = assert(os.getenv("HOME"))
+local cli = require("cli")
+
+local home = cli.home_dir()
+if not home then
+    return {}
+end
 
 return {
     default = {
@@ -120,6 +125,28 @@ Unknown fields and invalid types are errors, including in unused hosts.
 
 Both native formats also accept `defaults` and the other format's field-name
 spelling. Host names are never case-folded.
+
+### Lua helpers
+
+Lua configuration can load the built-in `cli` module with
+`local cli = require("cli")`:
+
+| Member | Value |
+| --- | --- |
+| `cli.user_name()` | Current OS username, or `nil` if unavailable. |
+| `cli.home_dir()` | Current user's home directory, or `nil` if unavailable. |
+| `cli.host_name()` | Local machine hostname, or `nil` if unavailable. |
+| `cli.__file__` | Absolute, canonical path of the selected Lua configuration file. |
+| `cli.__dir__` | Directory containing that canonical file. |
+
+The functions look up each value only when called and do not cache results.
+Lookup failures return `nil`. Requiring the module performs none of those
+lookups. Lua caches the module normally in `package.loaded`.
+
+File metadata resolves relative components and symbolic links in the selected
+path; a canonicalization failure stops configuration loading. It can locate a
+resource beside the configuration, for example
+`known_hosts = cli.__dir__ .. "/known_hosts"` inside `meta`.
 
 ### Boolean and TTY values
 
@@ -178,7 +205,8 @@ variable's value. The result must be absolute. An unset variable, or the special
 agent value `"none"`, falls back to `SSH_AUTH_SOCK`.
 
 Lua does not expand tildes or environment-variable references in path strings.
-Use Lua expressions such as `os.getenv("HOME") .. "/.ssh/id_ed25519"` or
+Use Lua expressions such as `assert(cli.home_dir()) .. "/.ssh/id_ed25519"`
+after `local cli = require("cli")`, or
 `identity_agent = os.getenv("SSH_AUTH_SOCK")`. A configured `"none"` agent value
 is not a path and is rejected. If neither the host nor the default table sets
 `identity_agent`, no authentication agent is used. Lua configuration never reads
@@ -197,7 +225,8 @@ log-level = "debug,russh=info"
 ```
 
 ```lua
-local home = assert(os.getenv("HOME"))
+local cli = require("cli")
+local home = assert(cli.home_dir())
 return {
     meta = {
         known_hosts = home .. "/.ssh/known_hosts",

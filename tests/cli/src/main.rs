@@ -488,6 +488,109 @@ return {{
         Ok(())
     });
 
+    rt.register(
+        "Lua cli module exposes local user information",
+        async || {
+            let client = t::Client::lua(
+                r#"
+local cli = require('cli')
+assert(require('cli') == cli)
+assert(type(cli.user_name) == 'function')
+assert(type(cli.home_dir) == 'function')
+assert(type(cli.host_name) == 'function')
+assert(cli.user_name() == 'alice')
+local home = cli.home_dir()
+assert(home == '/home/alice')
+local hostname = cli.host_name()
+assert(type(hostname) == 'string' and hostname ~= '')
+local hostname_file = assert(io.open('/proc/sys/kernel/hostname', 'r'))
+assert(hostname == hostname_file:read('*l'))
+hostname_file:close()
+return {
+    hosts = {
+        target = {
+            host_name = '127.0.0.1', user = 'bob', port = 2222,
+            identity_file = home .. '/.ssh/id_ed25519', request_tty = false,
+        },
+    },
+}
+"#,
+            )?;
+            let output = client.run(&["target", "printf", "local"], b"").await?;
+            t::expect(&output, 0, b"local", b"");
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "Lua cli paths locate the actual config and adjacent files",
+        async || {
+            use std::os::unix::fs::symlink;
+            use std::path::Path;
+            use std::process::Stdio;
+            use t::tokio::time::{Duration, timeout};
+
+            let dir = t::tempdir()?;
+            let actual = dir.path().join("actual");
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(actual.join("nested"))?;
+            std::fs::create_dir(&work)?;
+            let actual = actual.canonicalize()?;
+            let config = actual.join("config.lua");
+            let link = dir.path().join("link.lua");
+            std::fs::write(
+                &config,
+                format!(
+                    r#"
+local cli = require('cli')
+assert(cli.__file__ == '{file}')
+assert(cli.__dir__ == '{dir}')
+return {{
+    meta = {{known_hosts = cli.__dir__ .. '/known_hosts'}},
+    hosts = {{
+        target = {{
+            host_name = '127.0.0.1', user = 'bob', port = 2222,
+            identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+        }},
+    }},
+}}
+"#,
+                    file = config.to_str().unwrap(),
+                    dir = actual.to_str().unwrap(),
+                ),
+            )?;
+            symlink(&config, &link)?;
+            let known_hosts = std::fs::read("/home/alice/.ssh/known_hosts")?;
+            std::fs::write(actual.join("known_hosts"), &known_hosts)?;
+            let _hosts = t::KnownHosts::replace(b"")?;
+            let client = t::Client::default_config()?;
+
+            for path in [
+                config.as_path(),
+                link.as_path(),
+                Path::new("../link.lua"),
+                Path::new("../actual/nested/../config.lua"),
+            ] {
+                let output = timeout(
+                    Duration::from_secs(15),
+                    client
+                        .command(&["-F", path.to_str().unwrap(), "target", "printf", "adjacent"])
+                        .current_dir(&work)
+                        .stdin(Stdio::null())
+                        .output(),
+                )
+                .await??;
+                t::expect(&output, 0, b"adjacent", b"");
+            }
+
+            assert_eq!(std::fs::read(actual.join("known_hosts"))?, known_hosts);
+            assert!(std::fs::read("/home/alice/.ssh/known_hosts")?.is_empty());
+
+            Ok(())
+        },
+    );
+
     rt.register("CLI options override Lua settings", async || {
         let client = t::Client::lua(
             r#"

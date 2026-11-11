@@ -84,8 +84,9 @@ Each format has an explicit construction step and a separate
 `resolve(&Options) -> Result<Resolved>` step:
 
 - TOML: `ParsedConfig::parse(&str)` deserializes the text with `toml` and Serde.
-- Lua: `ParsedConfig::execute(&str)` evaluates a Lua 5.4 chunk and deserializes its
-  returned value with `mlua`'s Serde deserializer.
+- Lua: `ParsedConfig::execute(&str, &Path)` receives the source text and selected
+  file path, evaluates a Lua 5.4 chunk, and deserializes its returned value with
+  `mlua`'s Serde deserializer.
 - OpenSSH: `ParsedConfig::parse(File, &Options)` seeds CLI overrides, then invokes
   the dependency's parser with `ALLOW_UNSUPPORTED_FIELDS`.
 
@@ -94,6 +95,22 @@ with the same override settings; changing those settings requires reparsing.
 The prefix preserves the library's existing matching, `Include` scope, and
 first-value/identity-list merging behavior. It is confined to the OpenSSH
 adapter.
+
+The Lua adapter canonicalizes the selected file path before execution. The
+absolute path supplies the chunk's debug name and the built-in `cli` module's
+`__file__`; its parent supplies `__dir__`. Relative components and symbolic
+links therefore resolve consistently in metadata and Lua errors. A
+canonicalization failure retains the selected filename in the load error.
+
+The adapter registers a `package.preload["cli"]` provider for Lua's normal
+`require` and `package.loaded` behavior. Its `user_name`, `home_dir`, and `host_name`
+functions call `whoami::username`, `std::env::home_dir`, and `gethostname(2)`
+through `nix`, respectively. Registration and requiring the module do not
+perform those OS lookups. Each function call obtains a fresh value and returns
+Lua `nil` on lookup failure. Lua strings preserve native Unix bytes for paths
+and the hostname; deserializing them into native configuration strings retains the
+existing UTF-8 requirements. The module does not read `SSH_AUTH_SOCK` or supply
+implicit authentication-agent settings.
 
 ## Resolution and validation boundaries
 
@@ -208,8 +225,10 @@ src/
         mod.rs         Options, Resolved, Config, Meta, and file loading
         algorithms.rs  Typed per-host policies and algorithm-list operations
         toml.rs        TOML ParsedConfig
-        lua.rs         Lua ParsedConfig
         openssh.rs     OpenSSH ParsedConfig and CLI override adapter
+        lua/
+            mod.rs     Lua ParsedConfig and source-path handling
+            cli.rs     Built-in Lua cli module
         formats/
             mod.rs     Native profiles, metadata, and host/jump resolution
             jumps.rs   Named/inline jump representations and Serde visitors

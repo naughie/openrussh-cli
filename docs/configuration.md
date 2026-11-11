@@ -26,6 +26,12 @@ The first file that can be opened is selected. Only a `NotFound` error permits t
 
 TOML and Lua source files are read as UTF-8. File descriptors are closed after reading or parsing; they are not held for the SSH session.
 
+For Lua, the selected source path is canonicalized to an absolute path,
+resolving relative components and symbolic links. This path supplies the
+`cli` module's file metadata and Lua's chunk name in error messages. A failure
+to canonicalize the source stops loading with the selected filename in the
+error context.
+
 ## OpenSSH format
 
 OpenSSH files are parsed and queried through the library's `ssh2-config` integration using `ParseRule::ALLOW_UNSUPPORTED_FIELDS`. Host matching, negation, matching-block order, `Include`, parsing rules, and include scope follow that implementation. Native TOML/Lua validation rules do not apply to OpenSSH files.
@@ -182,7 +188,8 @@ log-level = "debug,russh=info"
 ```
 
 ```lua
-local home = assert(os.getenv("HOME"))
+local cli = require("cli")
+local home = assert(cli.home_dir())
 return {
     meta = {
         known_hosts = home .. "/.ssh/known_hosts",
@@ -194,7 +201,7 @@ return {
 The configured path must be absolute after TOML's tilde expansion. TOML supports
 the current-user `~user` form under the native path rules; it does not expand
 environment variables in this field. Lua treats the value as a literal path:
-use `os.getenv` and Lua expressions explicitly to construct an absolute path.
+use `cli.home_dir()` or Lua expressions explicitly to construct an absolute path.
 Relative or empty values are errors. Neither form treats `SSH_AUTH_SOCK` or
 `$VARIABLE` as a known-host path selector.
 
@@ -260,7 +267,8 @@ TOML tilde expansion applies only to the first path component. It does not look 
 Lua must construct expanded values itself, for example:
 
 ```lua
-local home = assert(os.getenv("HOME"))
+local cli = require("cli")
+local home = assert(cli.home_dir())
 return {
     hosts = {
         work = {
@@ -418,6 +426,51 @@ cannot mix field-name keys with sequence entries. Invalid element types,
 non-table root results, and unsupported fields are errors. Syntax and execution
 errors retain the selected configuration file's error context.
 
+### Lua `cli` module
+
+`local cli = require("cli")` loads a built-in module supplied by the client.
+It has five members:
+
+| Member | Type | Meaning |
+| --- | --- | --- |
+| `user_name()` | String or `nil` | Current OS username, obtained through `whoami::username`. |
+| `home_dir()` | String or `nil` | Current user's home directory, obtained through `std::env::home_dir`. |
+| `host_name()` | String or `nil` | Local machine hostname, obtained through `gethostname(2)`. |
+| `__file__` | String | Absolute, canonical path of the selected Lua configuration file. |
+| `__dir__` | String | Parent directory of `__file__`. |
+
+The three functions perform their OS lookup on each call; module registration
+and `require("cli")` do not perform those lookups. Results are not cached.
+Lookup failure returns `nil`. Use `assert` when the configuration requires a
+value, or supply a Lua fallback. The username is the local OS user, and the
+hostname identifies the local machine; neither is the destination's SSH
+account or network name.
+
+File metadata is available as soon as the module is required. It describes the
+actual selected file, including a file selected through `-F`, after resolving
+relative components and symbolic links. The metadata and Lua error chunk names
+therefore use the same canonical source path. The module follows Lua's normal
+`package.loaded` caching behavior within this configuration execution; cached
+module access does not cache the functions' return values.
+
+Lua strings preserve native Unix bytes for the file metadata, home directory,
+and hostname. Using such a value as a configuration string remains subject to
+the normal UTF-8 requirements during deserialization. Diagnostic chunk names
+use a display representation for non-UTF-8 paths.
+
+For example, place the known-host database beside the configuration file:
+
+```lua
+local cli = require("cli")
+return {
+    meta = { known_hosts = cli.__dir__ .. "/known_hosts" },
+}
+```
+
+The module does not implicitly select an authentication agent. Use
+`identity_agent = os.getenv("SSH_AUTH_SOCK")` when the configuration should
+read that environment variable.
+
 ### Examples
 
 TOML:
@@ -443,7 +496,8 @@ identity-file = ["~/.ssh/work_ed25519", "~/.ssh/work_rsa"]
 Lua:
 
 ```lua
-local home = assert(os.getenv("HOME"))
+local cli = require("cli")
+local home = assert(cli.home_dir())
 return {
     default = {
         identities_only = true,
