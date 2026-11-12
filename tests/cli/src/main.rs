@@ -538,6 +538,69 @@ return {
     );
 
     rt.register(
+        "Lua cli debug returns formatted strings for explicit printing",
+        async || {
+            let client = t::Client::lua(
+                r#"
+local cli = require('cli')
+local value = {outer = {answer = 42}}
+assert(select('#', cli.debug(value)) == 1)
+local formatted = cli.debug(value)
+assert(type(formatted) == 'string')
+assert(formatted == '{\n  outer = {\n    answer = 42,\n  },\n}')
+print(formatted)
+print(cli.debug(value, 4))
+print(cli.debug(value, 0))
+print(cli.debug(value, nil))
+print(cli.debug(nil))
+print(cli.debug('line\n"quoted"'))
+print(cli.debug(true))
+return {
+    meta = {log_level = 'none'},
+    hosts = {
+        target = {
+            host_name = '127.0.0.1', user = 'bob', port = 2222,
+            identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+        },
+    },
+}
+"#,
+            )?;
+            let output = client.run(&["target", "printf", "remote"], b"").await?;
+            let expected = concat!(
+                "{\n  outer = {\n    answer = 42,\n  },\n}\n",
+                "{\n    outer = {\n        answer = 42,\n    },\n}\n",
+                "{\nouter = {\nanswer = 42,\n},\n}\n",
+                "{\n  outer = {\n    answer = 42,\n  },\n}\n",
+                "nil\n",
+                "\"line\\n\\\"quoted\\\"\"\n",
+                "true\n",
+                "remote",
+            );
+            t::expect(&output, 0, expected.as_bytes(), b"");
+
+            Ok(())
+        },
+    );
+
+    rt.register("Lua cli debug rejects invalid indentation", async || {
+        for indent in ["-1", "1.5", "true", "'bad'"] {
+            let client = t::Client::lua(&format!(
+                "require('cli').debug({{}}, {indent}); return {{}}",
+            ))?;
+            let output = client.run(&["target", "true"], b"").await?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(output.status.code(), Some(255));
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains(".lua"), "{indent}: {stderr}");
+            assert!(stderr.contains("indent"), "{indent}: {stderr}");
+        }
+
+        Ok(())
+    });
+
+    rt.register(
         "Lua cli paths locate the actual config, modules, and adjacent files",
         async || {
             use std::os::unix::fs::symlink;

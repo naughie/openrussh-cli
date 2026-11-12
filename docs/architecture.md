@@ -122,6 +122,11 @@ and the hostname; deserializing them into native configuration strings retains t
 existing UTF-8 requirements. The module does not read `SSH_AUTH_SOCK` or supply
 implicit authentication-agent settings.
 
+The module's `debug(v, indent)` helper uses `mlua`'s pretty debug formatting for
+arbitrary values, including nested tables and cyclic references, and adjusts
+the indentation width (default 2 spaces). It returns a Lua string without printing
+or appending a newline; callers choose how to display or use the result.
+
 ## Resolution and validation boundaries
 
 Native deserialization handles field names, aliases, unknown fields, scalar

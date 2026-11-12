@@ -136,6 +136,7 @@ Lua configuration can load the built-in `cli` module with
 | `cli.user_name()` | Current OS username, or `nil` if unavailable. |
 | `cli.home_dir()` | Current user's home directory, or `nil` if unavailable. |
 | `cli.host_name()` | Local machine hostname, or `nil` if unavailable. |
+| `cli.debug(v, indent)` | Return a pretty-formatted string for any Lua value; indentation defaults to 2 spaces per level. |
 | `cli.__file__` | Absolute, canonical path of the selected Lua configuration file. |
 | `cli.__dir__` | Directory containing that canonical file. |
 | `cli.__root__` | Parent of `__dir__` when the canonical filename is `init.lua`; otherwise `__dir__`. |
@@ -147,9 +148,14 @@ Lua configuration can load the built-in `cli` module with
 constants. The platform values come from Rust's `std::env::consts::OS`, `ARCH`,
 and `FAMILY`, respectively.
 
-The functions look up each value only when called and do not cache results.
-Lookup failures return `nil`. Requiring the module performs none of those
+The three lookup functions obtain fresh values on each call. Lookup failures
+return `nil`. Requiring the module performs none of those
 lookups. Lua caches the module normally in `package.loaded`.
+
+Use `print(cli.debug({ host = "example.com", ports = { 22, 2222 } }, 4))` to
+inspect a value with four-space indentation. `cli.debug` returns the formatted
+string without printing or appending a newline. Omit `indent` or pass `nil` for the default;
+zero is also accepted.
 
 File metadata resolves relative components and symbolic links in the selected
 path; a canonicalization failure stops configuration loading. It can locate a

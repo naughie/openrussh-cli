@@ -22,7 +22,7 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
     constants.set("arch", std::env::consts::ARCH)?;
     constants.set("os_family", std::env::consts::FAMILY)?;
 
-    let module = lua.create_table_with_capacity(0, 3)?;
+    let module = lua.create_table_with_capacity(0, 4)?;
     module.set(
         "user_name",
         lookup(lua, || whoami::username().ok().map(OsString::from))?,
@@ -35,6 +35,7 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
         "host_name",
         lookup(lua, || nix::unistd::gethostname().ok())?,
     )?;
+    module.set("debug", lua.create_function(debug)?)?;
 
     // Constants stay outside the module so assignments to them invoke __newindex.
     let metatable = lua.create_table_with_capacity(0, 3)?;
@@ -62,6 +63,48 @@ where
     F: Fn() -> Option<OsString> + 'static,
 {
     lua.create_function(move |_, ()| Ok(query()))
+}
+
+fn debug(lua: &Lua, (value, indent): (Value, Value)) -> Result<String> {
+    let indent = match indent {
+        Value::Nil => 2,
+        Value::Integer(_) | Value::Number(_) => lua
+            .coerce_integer(indent)?
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                mlua::Error::runtime("cli.debug indent must be a non-negative integer")
+            })?,
+        _ => {
+            return Err(mlua::Error::runtime(
+                "cli.debug indent must be a non-negative integer",
+            ));
+        }
+    };
+    format_debug(&value, indent)
+}
+
+fn format_debug(value: &Value, indent: usize) -> Result<String> {
+    let rendered = format!("{value:#?}");
+    if indent == 2 {
+        return Ok(rendered);
+    }
+    let mut output = String::with_capacity(rendered.len());
+    // mlua's pretty formatter uses two spaces per nesting level.
+    for (index, line) in rendered.split('\n').enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let content = line.trim_start_matches(' ');
+        let leading = line.len() - content.len();
+        let width = (leading / 2)
+            .checked_mul(indent)
+            .and_then(|n| n.checked_add(leading % 2))
+            .ok_or_else(|| mlua::Error::runtime("debug indentation overflow"))?;
+        output.try_reserve(width).map_err(mlua::Error::external)?;
+        output.extend(std::iter::repeat_n(' ', width));
+        output.push_str(content);
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -191,7 +234,7 @@ assert(not pcall(setmetatable, cli, {}))
 local cli = require('cli')
 assert(cli.missing == nil)
 local key = {}
-for _, name in ipairs({'extra', 'user_name', 'home_dir', 'host_name', 1, key, '\255'}) do
+for _, name in ipairs({'extra', 'user_name', 'home_dir', 'host_name', 'debug', 1, key, '\255'}) do
     cli[name] = 'first'
     assert(cli[name] == 'first')
     cli[name] = 'second'
@@ -255,5 +298,96 @@ end
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn debug_formats_nested_values_with_custom_indentation() -> Result<()> {
+        let lua = Lua::new();
+        let value: Value = lua
+            .load("return {z = true, outer = {42, 'line\\nquoted\\\"'}, [false] = {}}")
+            .eval()?;
+        for (indent, expected) in [
+            (
+                2,
+                "{\n  [false] = {},\n  outer = {\n    42,\n    \"line\\nquoted\\\"\",\n  },\n  z = true,\n}",
+            ),
+            (
+                4,
+                "{\n    [false] = {},\n    outer = {\n        42,\n        \"line\\nquoted\\\"\",\n    },\n    z = true,\n}",
+            ),
+            (
+                0,
+                "{\n[false] = {},\nouter = {\n42,\n\"line\\nquoted\\\"\",\n},\nz = true,\n}",
+            ),
+        ] {
+            assert_eq!(format_debug(&value, indent)?, expected);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_handles_cycles_shared_tables_and_other_lua_types() -> Result<()> {
+        let lua = Lua::new();
+        let value: Value = lua
+            .load(
+                r#"
+local shared = {value = 1}
+local root = {first = shared, second = shared, fn = function() end,
+    co = coroutine.create(function() end), bytes = '\255\0'}
+root.self = root
+root[root] = root
+return root
+"#,
+            )
+            .eval()?;
+        let output = format_debug(&value, 4)?;
+
+        assert!(output.contains("self = table: "));
+        assert!(output.contains("second = table: "));
+        assert!(output.contains("[table: "));
+        assert!(output.contains("fn = function: "));
+        assert!(output.contains("co = thread: "));
+        assert!(output.contains("bytes = b\""));
+        assert!(output.contains("value = 1"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_rejects_invalid_indentation() -> Result<()> {
+        let lua = Lua::new();
+        preload(&lua, PathBuf::from("/configuration/config.lua"))?;
+        lua.load(
+            r#"
+local cli = require('cli')
+for _, indent in ipairs({-1, 1.5, '2', false, {}, math.huge, 0/0}) do
+    local ok, err = pcall(cli.debug, {}, indent)
+    assert(not ok)
+    assert(tostring(err):find('cli.debug indent must be a non-negative integer', 1, true))
+end
+"#,
+        )
+        .exec()
+    }
+
+    #[test]
+    fn debug_returns_a_single_string_without_an_added_newline() -> Result<()> {
+        let lua = Lua::new();
+        preload(&lua, PathBuf::from("/configuration/config.lua"))?;
+        lua.load(
+            r#"
+local cli = require('cli')
+assert(select('#', cli.debug(nil)) == 1)
+assert(cli.debug(nil) == 'nil')
+assert(cli.debug(true) == 'true')
+assert(cli.debug('hello') == '"hello"')
+assert(cli.debug({}) == '{}')
+assert(cli.debug({key = true}) == '{\n  key = true,\n}')
+assert(cli.debug({key = true}, nil) == cli.debug({key = true}, 2))
+assert(cli.debug({key = true}, 2.0) == cli.debug({key = true}, 2))
+"#,
+        )
+        .exec()
     }
 }

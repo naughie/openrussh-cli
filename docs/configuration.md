@@ -466,13 +466,14 @@ precedence over a local `cli.lua` file.
 ### Lua `cli` module
 
 `local cli = require("cli")` loads a built-in module supplied by the client.
-It provides three lookup functions and six string constants:
+It provides three lookup functions, a debug formatter, and six string constants:
 
 | Member | Type | Meaning |
 | --- | --- | --- |
 | `user_name()` | String or `nil` | Current OS username, obtained through `whoami::username`. |
 | `home_dir()` | String or `nil` | Current user's home directory, obtained through `std::env::home_dir`. |
 | `host_name()` | String or `nil` | Local machine hostname, obtained through `gethostname(2)`. |
+| `debug(v, indent)` | String | Return a pretty-formatted representation of any Lua value; indentation defaults to 2 spaces per nesting level. |
 | `__file__` | String | Absolute, canonical path of the selected Lua configuration file. |
 | `__dir__` | String | Parent directory of `__file__`. |
 | `__root__` | String | Parent of `__dir__` when the canonical filename is `init.lua`; otherwise `__dir__`. The filesystem root remains `/`. |
@@ -486,12 +487,29 @@ error. This uses Lua metatable protection; raw operations such as `rawset` bypas
 it. Platform constants describe the target for which the client binary was
 compiled; they do not query the remote SSH server.
 
-The three functions perform their OS lookup on each call; module registration
-and `require("cli")` do not perform those lookups. Results are not cached.
+The three lookup functions perform their OS lookup on each call. Module
+registration and `require("cli")` do not perform those lookups. Results are not cached.
 Lookup failure returns `nil`. Use `assert` when the configuration requires a
 value, or supply a Lua fallback. The username is the local OS user, and the
 hostname identifies the local machine; neither is the destination's SSH
 account or network name.
+
+`cli.debug(v, indent)` returns a diagnostic representation of `v` as a string.
+It does not print or append a newline. Use `print(cli.debug(v))` to print it, or
+`io.stderr:write(cli.debug(v), "\n")` to write it to stderr. Tables are expanded
+with sorted keys, strings are quoted and escaped, and cycles or repeated table
+references are shown as table pointers. Functions, threads, and userdata also
+have diagnostic representations.
+
+`indent` is the number of spaces per nesting level. Omitting it or passing `nil`
+uses `2`; `0` is accepted. It must be a nonnegative integer number (including
+values such as `2.0`); negative or fractional numbers, strings, and other types
+raise an error.
+
+```lua
+print(cli.debug({ host = "example.com", ports = { 22, 2222 } }))
+print(cli.debug({ host = "example.com", ports = { 22, 2222 } }, 4))
+```
 
 File metadata is available as soon as the module is required. It describes the
 actual selected file, including a file selected through `-F`, after resolving
