@@ -501,7 +501,8 @@ assert(type(cli.host_name) == 'function')
 assert(cli.os == 'linux')
 assert(cli.os_family == 'unix')
 assert(type(cli.arch) == 'string' and cli.arch ~= '')
-for _, name in ipairs({'__file__', '__dir__', 'os', 'arch', 'os_family'}) do
+assert(cli.__root__ == cli.__dir__)
+for _, name in ipairs({'__file__', '__dir__', '__root__', 'os', 'arch', 'os_family'}) do
     local original = cli[name]
     assert(type(original) == 'string')
     local replaced = pcall(function() cli[name] = 'replacement' end)
@@ -552,8 +553,6 @@ return {
             std::fs::create_dir_all(actual.join("another"))?;
             std::fs::create_dir(&work)?;
             let actual = actual.canonicalize()?;
-            let config = actual.join("config.lua");
-            let link = dir.path().join("link.lua");
             std::fs::write(
                 actual.join("config/some/module/init.lua"),
                 b"return {host_name = '127.0.0.1', user = 'bob', port = 2222, request_tty = false}",
@@ -566,46 +565,62 @@ return {
                 actual.join("cli.lua"),
                 b"error('local module must not replace the built-in cli module')",
             )?;
-            std::fs::write(
-                &config,
-                format!(
-                    r#"
-local cli = require('cli')
-assert(cli.__file__ == '{file}')
-assert(cli.__dir__ == '{dir}')
-local target = require('config.some.module')
-target.identity_file = require('another.module')
-return {{
-    meta = {{known_hosts = cli.__dir__ .. '/known_hosts'}},
-    hosts = {{target = target}},
-}}
-"#,
-                    file = config.to_str().unwrap(),
-                    dir = actual.to_str().unwrap(),
-                ),
-            )?;
-            symlink(&config, &link)?;
             let known_hosts = std::fs::read("/home/alice/.ssh/known_hosts")?;
             std::fs::write(actual.join("known_hosts"), &known_hosts)?;
             let _hosts = t::KnownHosts::replace(b"")?;
             let client = t::Client::default_config()?;
 
-            for path in [
-                config.as_path(),
-                link.as_path(),
-                Path::new("../link.lua"),
-                Path::new("../actual/nested/../config.lua"),
+            for (filename, alias) in [
+                ("config.lua", "link.lua"),
+                ("config/init.lua", "init-link.lua"),
             ] {
-                let output = timeout(
-                    Duration::from_secs(15),
-                    client
-                        .command(&["-F", path.to_str().unwrap(), "target", "printf", "adjacent"])
-                        .current_dir(&work)
-                        .stdin(Stdio::null())
-                        .output(),
-                )
-                .await??;
-                t::expect(&output, 0, b"adjacent", b"");
+                let config = actual.join(filename);
+                let link = dir.path().join(alias);
+                std::fs::write(
+                    &config,
+                    format!(
+                        r#"
+local cli = require('cli')
+assert(cli.__file__ == '{file}')
+assert(cli.__dir__ == '{dir}')
+assert(cli.__root__ == '{root}')
+local target = require('config.some.module')
+target.identity_file = require('another.module')
+return {{
+    meta = {{known_hosts = cli.__root__ .. '/known_hosts'}},
+    hosts = {{target = target}},
+}}
+"#,
+                        file = config.to_str().unwrap(),
+                        dir = config.parent().unwrap().to_str().unwrap(),
+                        root = actual.to_str().unwrap(),
+                    ),
+                )?;
+                symlink(&config, &link)?;
+
+                for path in [
+                    config,
+                    link,
+                    Path::new("..").join(alias),
+                    Path::new("../actual/nested/..").join(filename),
+                ] {
+                    let output = timeout(
+                        Duration::from_secs(15),
+                        client
+                            .command(&[
+                                "-F",
+                                path.to_str().unwrap(),
+                                "target",
+                                "printf",
+                                "adjacent",
+                            ])
+                            .current_dir(&work)
+                            .stdin(Stdio::null())
+                            .output(),
+                    )
+                    .await??;
+                    t::expect(&output, 0, b"adjacent", b"");
+                }
             }
 
             assert_eq!(std::fs::read(actual.join("known_hosts"))?, known_hosts);

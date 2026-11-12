@@ -429,18 +429,19 @@ errors retain the selected configuration file's error context.
 ### Lua modules
 
 Before executing the selected configuration, the client prepends
-`CONFIG_DIR/?.lua` and `CONFIG_DIR/?/init.lua`, in that order, to `package.path`.
-`CONFIG_DIR` is the canonical parent directory of the selected file, the same
-directory exposed as `cli.__dir__`. Modules therefore resolve beside the actual
-configuration file even when `-F` uses a relative path or symbolic link. The
-existing `package.path` entries remain available after these two patterns.
+`ROOT/?.lua` and `ROOT/?/init.lua`, in that order, to `package.path`. `ROOT` is
+`cli.__root__`: the parent of `cli.__dir__` when the canonical configuration
+filename is exactly `init.lua`, and `cli.__dir__` otherwise. If `__dir__` is the
+filesystem root `/`, `__root__` remains `/`. The root is determined after
+resolving relative paths and symbolic links. The existing `package.path` entries
+remain available after these two patterns.
 
 For example, this layout supports both file and directory modules:
 
 ```text
-CONFIG_DIR/config.lua
-CONFIG_DIR/config/some/module/init.lua
-CONFIG_DIR/another/module.lua
+ROOT/config.lua
+ROOT/config/some/module/init.lua
+ROOT/another/module.lua
 ```
 
 Inside `config.lua`, load them with dotted module names:
@@ -450,6 +451,14 @@ local some_module = require("config.some.module")
 local another_module = require("another.module")
 ```
 
+The same calls work with this layout, selecting `ROOT/config/init.lua` instead:
+
+```text
+ROOT/config/init.lua
+ROOT/config/some/module/init.lua
+ROOT/another/module.lua
+```
+
 These modules follow Lua's normal `require` and `package.loaded` caching rules.
 The built-in `cli` module remains registered through `package.preload` and takes
 precedence over a local `cli.lua` file.
@@ -457,7 +466,7 @@ precedence over a local `cli.lua` file.
 ### Lua `cli` module
 
 `local cli = require("cli")` loads a built-in module supplied by the client.
-It provides three lookup functions and five string constants:
+It provides three lookup functions and six string constants:
 
 | Member | Type | Meaning |
 | --- | --- | --- |
@@ -466,6 +475,7 @@ It provides three lookup functions and five string constants:
 | `host_name()` | String or `nil` | Local machine hostname, obtained through `gethostname(2)`. |
 | `__file__` | String | Absolute, canonical path of the selected Lua configuration file. |
 | `__dir__` | String | Parent directory of `__file__`. |
+| `__root__` | String | Parent of `__dir__` when the canonical filename is `init.lua`; otherwise `__dir__`. The filesystem root remains `/`. |
 | `os` | String | Binary's target operating system, from `std::env::consts::OS`, such as `"linux"` or `"macos"`. |
 | `arch` | String | Binary's target CPU architecture, from `std::env::consts::ARCH`, such as `"x86_64"` or `"aarch64"`. |
 | `os_family` | String | Binary's target operating-system family, from `std::env::consts::FAMILY`, such as `"unix"`. |

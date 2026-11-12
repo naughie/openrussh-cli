@@ -26,10 +26,7 @@ impl ParsedConfig {
         let profiles = {
             let lua = Lua::new();
             let name = format!("@{}", path.display());
-            let directory = path
-                .parent()
-                .context("Lua configuration path has no parent")?;
-            add_module_path(&lua, directory)?;
+            add_module_path(&lua, root_dir(&path)?)?;
             cli::preload(&lua, path)?;
             let value = lua.load(text).set_name(name).eval::<Value>()?;
             let options = DeserializeOptions::new()
@@ -46,11 +43,22 @@ impl ParsedConfig {
     }
 }
 
-fn add_module_path(lua: &Lua, directory: &Path) -> mlua::Result<()> {
+fn root_dir(path: &Path) -> mlua::Result<&Path> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| mlua::Error::external("Lua configuration path has no parent"))?;
+    if path.file_name().is_some_and(|name| name == "init.lua") {
+        Ok(directory.parent().unwrap_or(directory))
+    } else {
+        Ok(directory)
+    }
+}
+
+fn add_module_path(lua: &Lua, root: &Path) -> mlua::Result<()> {
     let package = lua.globals().get::<Table>("package")?;
     let original = package.get::<mlua::String>("path")?;
-    let module = directory.join("?.lua");
-    let init = directory.join("?/init.lua");
+    let module = root.join("?.lua");
+    let init = root.join("?/init.lua");
     let search_path = [
         module.as_os_str().as_encoded_bytes(),
         b";",
@@ -130,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn modules_load_beside_the_canonical_config_with_native_path_bytes() -> Result<()> {
+    fn modules_load_from_the_config_root_with_native_path_bytes() -> Result<()> {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
         use std::os::unix::fs::symlink;
@@ -146,7 +154,7 @@ mod tests {
             r#"
 local cli = require('cli')
 local another = require('another.module')
-assert(package.searchpath('another.module', package.path) == cli.__dir__ .. '/another/module.lua')
+assert(package.searchpath('another.module', package.path) == cli.__root__ .. '/another/module.lua')
 return {host_name = another.host_name}
 "#,
         )?;
@@ -162,17 +170,19 @@ assert(require('config.some.module') == some_module)
 assert(require('another.module') == another_module)
 return {hosts = {sample = {host_name = some_module.host_name, port = another_module.port}}}
 "#;
-        let path = actual.join("config.lua");
-        std::fs::write(&path, source)?;
-        let link = dir.path().join("alias.lua");
-        symlink(&path, &link)?;
-        let host = ParsedConfig::execute(source, &link)?
-            .resolve(&options("sample"))?
-            .chain
-            .target;
+        for (filename, alias) in [("config.lua", "init.lua"), ("config/init.lua", "alias.lua")] {
+            let path = actual.join(filename);
+            std::fs::write(&path, source)?;
+            let link = dir.path().join(alias);
+            symlink(&path, &link)?;
+            let host = ParsedConfig::execute(source, &link)?
+                .resolve(&options("sample"))?
+                .chain
+                .target;
 
-        assert_eq!(host.dest.name, "module.example");
-        assert_eq!(host.dest.port, 2222);
+            assert_eq!(host.dest.name, "module.example");
+            assert_eq!(host.dest.port, 2222);
+        }
 
         Ok(())
     }

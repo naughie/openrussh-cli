@@ -14,9 +14,10 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
     let parent = path
         .parent()
         .ok_or_else(|| mlua::Error::external("Lua configuration path has no parent"))?;
-    let constants = lua.create_table_with_capacity(0, 5)?;
+    let constants = lua.create_table_with_capacity(0, 6)?;
     constants.set("__file__", path.as_os_str())?;
     constants.set("__dir__", parent.as_os_str())?;
+    constants.set("__root__", super::root_dir(path)?.as_os_str())?;
     constants.set("os", std::env::consts::OS)?;
     constants.set("arch", std::env::consts::ARCH)?;
     constants.set("os_family", std::env::consts::FAMILY)?;
@@ -125,6 +126,10 @@ mod tests {
             module.get::<mlua::String>("__dir__")?.as_bytes().as_ref(),
             b"/configuration"
         );
+        assert_eq!(
+            module.get::<mlua::String>("__root__")?.as_bytes().as_ref(),
+            b"/configuration"
+        );
         assert_eq!(module.get::<String>("os")?, std::env::consts::OS);
         assert_eq!(module.get::<String>("arch")?, std::env::consts::ARCH);
         assert_eq!(module.get::<String>("os_family")?, std::env::consts::FAMILY);
@@ -158,7 +163,7 @@ mod tests {
         lua.load(
             r#"
 local cli = require('cli')
-for _, name in ipairs({'__file__', '__dir__', 'os', 'arch', 'os_family'}) do
+for _, name in ipairs({'__file__', '__dir__', '__root__', 'os', 'arch', 'os_family'}) do
     local original = cli[name]
     for _, replace in ipairs({true, false}) do
         local ok, err = pcall(function()
@@ -203,21 +208,51 @@ end
     fn file_metadata_preserves_non_utf8_paths() -> Result<()> {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let lua = Lua::new();
-        let path = PathBuf::from(OsString::from_vec(
-            b"/configuration/\xff/config.lua".to_vec(),
-        ));
-        preload(&lua, path.clone())?;
-        let module: Table = lua.load("return require('cli')").eval()?;
+        for (filename, root) in [
+            ("config.lua", b"/configuration/\xff".as_slice()),
+            ("init.lua", b"/configuration".as_slice()),
+        ] {
+            let lua = Lua::new();
+            let path =
+                PathBuf::from(OsString::from_vec(b"/configuration/\xff".to_vec())).join(filename);
+            preload(&lua, path.clone())?;
+            let module: Table = lua.load("return require('cli')").eval()?;
 
-        assert_eq!(
-            module.get::<mlua::String>("__file__")?.as_bytes().as_ref(),
-            path.as_os_str().as_encoded_bytes()
-        );
-        assert_eq!(
-            module.get::<mlua::String>("__dir__")?.as_bytes().as_ref(),
-            path.parent().unwrap().as_os_str().as_encoded_bytes()
-        );
+            assert_eq!(
+                module.get::<mlua::String>("__file__")?.as_bytes().as_ref(),
+                path.as_os_str().as_encoded_bytes()
+            );
+            assert_eq!(
+                module.get::<mlua::String>("__dir__")?.as_bytes().as_ref(),
+                path.parent().unwrap().as_os_str().as_encoded_bytes()
+            );
+            assert_eq!(
+                module.get::<mlua::String>("__root__")?.as_bytes().as_ref(),
+                root
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn root_metadata_uses_the_parent_only_for_init_lua() -> Result<()> {
+        for (file, root) in [
+            ("/configuration/config.lua", "/configuration"),
+            ("/configuration/config/init.lua", "/configuration"),
+            ("/configuration/config/Init.lua", "/configuration/config"),
+            (
+                "/configuration/config/not-init.lua",
+                "/configuration/config",
+            ),
+            ("/init.lua", "/"),
+        ] {
+            let lua = Lua::new();
+            preload(&lua, PathBuf::from(file))?;
+            let module: Table = lua.load("return require('cli')").eval()?;
+
+            assert_eq!(module.get::<String>("__root__")?, root, "{file}");
+        }
 
         Ok(())
     }
