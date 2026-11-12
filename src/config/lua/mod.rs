@@ -5,7 +5,7 @@ use super::{Options, Resolved};
 use openrussh_client::config::Chain;
 
 use mlua::serde::Deserializer;
-use mlua::{DeserializeOptions, Lua, Value};
+use mlua::{DeserializeOptions, Lua, Table, Value};
 use serde::Deserialize as _;
 
 use anyhow::{Context as _, Result};
@@ -26,6 +26,10 @@ impl ParsedConfig {
         let profiles = {
             let lua = Lua::new();
             let name = format!("@{}", path.display());
+            let directory = path
+                .parent()
+                .context("Lua configuration path has no parent")?;
+            add_module_path(&lua, directory)?;
             cli::preload(&lua, path)?;
             let value = lua.load(text).set_name(name).eval::<Value>()?;
             let options = DeserializeOptions::new()
@@ -40,6 +44,22 @@ impl ParsedConfig {
     pub(super) fn resolve(&self, options: &Options) -> Result<Resolved> {
         self.profiles.resolve(options, PathMode::Literal)
     }
+}
+
+fn add_module_path(lua: &Lua, directory: &Path) -> mlua::Result<()> {
+    let package = lua.globals().get::<Table>("package")?;
+    let original = package.get::<mlua::String>("path")?;
+    let module = directory.join("?.lua");
+    let init = directory.join("?/init.lua");
+    let search_path = [
+        module.as_os_str().as_encoded_bytes(),
+        b";",
+        init.as_os_str().as_encoded_bytes(),
+        b";",
+        original.as_bytes().as_ref(),
+    ]
+    .concat();
+    package.set("path", lua.create_string(search_path)?)
 }
 
 #[cfg(test)]
@@ -105,6 +125,81 @@ mod tests {
             host.dest.user,
             canonical.parent().unwrap().to_str().unwrap()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn modules_load_beside_the_canonical_config_with_native_path_bytes() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let actual = dir
+            .path()
+            .join(OsString::from_vec(b"config '\xff".to_vec()));
+        std::fs::create_dir_all(actual.join("config/some/module"))?;
+        std::fs::create_dir(actual.join("another"))?;
+        std::fs::write(
+            actual.join("config/some/module/init.lua"),
+            r#"
+local cli = require('cli')
+local another = require('another.module')
+assert(package.searchpath('another.module', package.path) == cli.__dir__ .. '/another/module.lua')
+return {host_name = another.host_name}
+"#,
+        )?;
+        std::fs::write(
+            actual.join("another/module.lua"),
+            "return {host_name = 'module.example', port = 2222}",
+        )?;
+        std::fs::write(actual.join("cli.lua"), "error('must use built-in cli')")?;
+        let source = r#"
+local some_module = require('config.some.module')
+local another_module = require('another.module')
+assert(require('config.some.module') == some_module)
+assert(require('another.module') == another_module)
+return {hosts = {sample = {host_name = some_module.host_name, port = another_module.port}}}
+"#;
+        let path = actual.join("config.lua");
+        std::fs::write(&path, source)?;
+        let link = dir.path().join("alias.lua");
+        symlink(&path, &link)?;
+        let host = ParsedConfig::execute(source, &link)?
+            .resolve(&options("sample"))?
+            .chain
+            .target;
+
+        assert_eq!(host.dest.name, "module.example");
+        assert_eq!(host.dest.port, 2222);
+
+        Ok(())
+    }
+
+    #[test]
+    fn config_modules_precede_existing_paths_and_keep_fallbacks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config");
+        let fallback = dir.path().join("fallback");
+        std::fs::create_dir_all(config.join("shared"))?;
+        std::fs::create_dir(&fallback)?;
+        std::fs::write(config.join("shared.lua"), "return 'config file'")?;
+        std::fs::write(config.join("shared/init.lua"), "return 'config init'")?;
+        std::fs::write(fallback.join("shared.lua"), "return 'fallback file'")?;
+        std::fs::write(fallback.join("other.lua"), "return 'fallback other'")?;
+
+        let lua = Lua::new();
+        let package = lua.globals().get::<Table>("package")?;
+        package.set("path", fallback.join("?.lua").as_os_str())?;
+        add_module_path(&lua, &config)?;
+        lua.load(
+            r#"
+assert(require('shared') == 'config file')
+assert(require('other') == 'fallback other')
+"#,
+        )
+        .exec()?;
 
         Ok(())
     }

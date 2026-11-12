@@ -426,10 +426,38 @@ cannot mix field-name keys with sequence entries. Invalid element types,
 non-table root results, and unsupported fields are errors. Syntax and execution
 errors retain the selected configuration file's error context.
 
+### Lua modules
+
+Before executing the selected configuration, the client prepends
+`CONFIG_DIR/?.lua` and `CONFIG_DIR/?/init.lua`, in that order, to `package.path`.
+`CONFIG_DIR` is the canonical parent directory of the selected file, the same
+directory exposed as `cli.__dir__`. Modules therefore resolve beside the actual
+configuration file even when `-F` uses a relative path or symbolic link. The
+existing `package.path` entries remain available after these two patterns.
+
+For example, this layout supports both file and directory modules:
+
+```text
+CONFIG_DIR/config.lua
+CONFIG_DIR/config/some/module/init.lua
+CONFIG_DIR/another/module.lua
+```
+
+Inside `config.lua`, load them with dotted module names:
+
+```lua
+local some_module = require("config.some.module")
+local another_module = require("another.module")
+```
+
+These modules follow Lua's normal `require` and `package.loaded` caching rules.
+The built-in `cli` module remains registered through `package.preload` and takes
+precedence over a local `cli.lua` file.
+
 ### Lua `cli` module
 
 `local cli = require("cli")` loads a built-in module supplied by the client.
-It has five members:
+It provides three lookup functions and five string constants:
 
 | Member | Type | Meaning |
 | --- | --- | --- |
@@ -438,6 +466,15 @@ It has five members:
 | `host_name()` | String or `nil` | Local machine hostname, obtained through `gethostname(2)`. |
 | `__file__` | String | Absolute, canonical path of the selected Lua configuration file. |
 | `__dir__` | String | Parent directory of `__file__`. |
+| `os` | String | Binary's target operating system, from `std::env::consts::OS`, such as `"linux"` or `"macos"`. |
+| `arch` | String | Binary's target CPU architecture, from `std::env::consts::ARCH`, such as `"x86_64"` or `"aarch64"`. |
+| `os_family` | String | Binary's target operating-system family, from `std::env::consts::FAMILY`, such as `"unix"`. |
+
+The constants are read-only and are accessed without parentheses, for example
+`cli.os == "macos"`. Ordinary assignment, including assigning `nil`, raises a Lua
+error. This uses Lua metatable protection; raw operations such as `rawset` bypass
+it. Platform constants describe the target for which the client binary was
+compiled; they do not query the remote SSH server.
 
 The three functions perform their OS lookup on each call; module registration
 and `require("cli")` do not perform those lookups. Results are not cached.

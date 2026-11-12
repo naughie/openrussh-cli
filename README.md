@@ -138,6 +138,13 @@ Lua configuration can load the built-in `cli` module with
 | `cli.host_name()` | Local machine hostname, or `nil` if unavailable. |
 | `cli.__file__` | Absolute, canonical path of the selected Lua configuration file. |
 | `cli.__dir__` | Directory containing that canonical file. |
+| `cli.os` | Binary's target operating system, such as `"linux"` or `"macos"`. |
+| `cli.arch` | Binary's target CPU architecture, such as `"x86_64"` or `"aarch64"`. |
+| `cli.os_family` | Binary's target operating-system family, such as `"unix"`. |
+
+`__file__`, `__dir__`, `os`, `arch`, and `os_family` are read-only string
+constants. The platform values come from Rust's `std::env::consts::OS`, `ARCH`,
+and `FAMILY`, respectively.
 
 The functions look up each value only when called and do not cache results.
 Lookup failures return `nil`. Requiring the module performs none of those
@@ -147,6 +154,14 @@ File metadata resolves relative components and symbolic links in the selected
 path; a canonicalization failure stops configuration loading. It can locate a
 resource beside the configuration, for example
 `known_hosts = cli.__dir__ .. "/known_hosts"` inside `meta`.
+
+Lua modules beside the selected configuration are available through `require`.
+The client prepends `CONFIG_DIR/?.lua` and `CONFIG_DIR/?/init.lua` to
+`package.path`, where `CONFIG_DIR` is the canonical configuration directory
+(`cli.__dir__`). For example, `require("another.module")` loads
+`CONFIG_DIR/another/module.lua`, and `require("config.some.module")` loads
+`CONFIG_DIR/config/some/module/init.lua`. The existing search paths remain as
+fallbacks, and modules use Lua's normal `package.loaded` cache.
 
 ### Boolean and TTY values
 

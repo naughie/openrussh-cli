@@ -102,10 +102,18 @@ absolute path supplies the chunk's debug name and the built-in `cli` module's
 links therefore resolve consistently in metadata and Lua errors. A
 canonicalization failure retains the selected filename in the load error.
 
+Before executing the chunk, the adapter prepends the canonical parent directory's
+`?.lua` and `?/init.lua` patterns to `package.path`, preserving the existing path
+as a fallback. Lua's normal file searcher can therefore load user modules beside
+the selected configuration, independently of the process working directory.
+
 The adapter registers a `package.preload["cli"]` provider for Lua's normal
 `require` and `package.loaded` behavior. Its `user_name`, `home_dir`, and `host_name`
 functions call `whoami::username`, `std::env::home_dir`, and `gethostname(2)`
-through `nix`, respectively. Registration and requiring the module do not
+through `nix`, respectively. The `__file__` and `__dir__` metadata and the `os`,
+`arch`, and `os_family` platform values are read-only string constants. The
+platform values come from `std::env::consts::{OS, ARCH, FAMILY}` and describe the
+binary's compilation target. Registration and requiring the module do not
 perform those OS lookups. Each function call obtains a fresh value and returns
 Lua `nil` on lookup failure. Lua strings preserve native Unix bytes for paths
 and the hostname; deserializing them into native configuration strings retains the

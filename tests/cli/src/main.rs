@@ -489,7 +489,7 @@ return {{
     });
 
     rt.register(
-        "Lua cli module exposes local user information",
+        "Lua cli module exposes local information and constants",
         async || {
             let client = t::Client::lua(
                 r#"
@@ -498,6 +498,19 @@ assert(require('cli') == cli)
 assert(type(cli.user_name) == 'function')
 assert(type(cli.home_dir) == 'function')
 assert(type(cli.host_name) == 'function')
+assert(cli.os == 'linux')
+assert(cli.os_family == 'unix')
+assert(type(cli.arch) == 'string' and cli.arch ~= '')
+for _, name in ipairs({'__file__', '__dir__', 'os', 'arch', 'os_family'}) do
+    local original = cli[name]
+    assert(type(original) == 'string')
+    local replaced = pcall(function() cli[name] = 'replacement' end)
+    assert(not replaced, name .. ' must reject reassignment')
+    assert(cli[name] == original)
+    local deleted = pcall(function() cli[name] = nil end)
+    assert(not deleted, name .. ' must reject deletion')
+    assert(cli[name] == original)
+end
 assert(cli.user_name() == 'alice')
 local home = cli.home_dir()
 assert(home == '/home/alice')
@@ -524,7 +537,7 @@ return {
     );
 
     rt.register(
-        "Lua cli paths locate the actual config and adjacent files",
+        "Lua cli paths locate the actual config, modules, and adjacent files",
         async || {
             use std::os::unix::fs::symlink;
             use std::path::Path;
@@ -535,10 +548,24 @@ return {
             let actual = dir.path().join("actual");
             let work = dir.path().join("work");
             std::fs::create_dir_all(actual.join("nested"))?;
+            std::fs::create_dir_all(actual.join("config/some/module"))?;
+            std::fs::create_dir_all(actual.join("another"))?;
             std::fs::create_dir(&work)?;
             let actual = actual.canonicalize()?;
             let config = actual.join("config.lua");
             let link = dir.path().join("link.lua");
+            std::fs::write(
+                actual.join("config/some/module/init.lua"),
+                b"return {host_name = '127.0.0.1', user = 'bob', port = 2222, request_tty = false}",
+            )?;
+            std::fs::write(
+                actual.join("another/module.lua"),
+                b"return '/home/alice/.ssh/id_ed25519'",
+            )?;
+            std::fs::write(
+                actual.join("cli.lua"),
+                b"error('local module must not replace the built-in cli module')",
+            )?;
             std::fs::write(
                 &config,
                 format!(
@@ -546,14 +573,11 @@ return {
 local cli = require('cli')
 assert(cli.__file__ == '{file}')
 assert(cli.__dir__ == '{dir}')
+local target = require('config.some.module')
+target.identity_file = require('another.module')
 return {{
     meta = {{known_hosts = cli.__dir__ .. '/known_hosts'}},
-    hosts = {{
-        target = {{
-            host_name = '127.0.0.1', user = 'bob', port = 2222,
-            identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
-        }},
-    }},
+    hosts = {{target = target}},
 }}
 "#,
                     file = config.to_str().unwrap(),

@@ -1,4 +1,4 @@
-use mlua::{Function, Lua, Result, Table};
+use mlua::{Function, Lua, Result, Table, Value};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -14,10 +14,14 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
     let parent = path
         .parent()
         .ok_or_else(|| mlua::Error::external("Lua configuration path has no parent"))?;
-    let module = lua.create_table_with_capacity(0, 5)?;
-    module.set("__file__", path.as_os_str())?;
-    module.set("__dir__", parent.as_os_str())?;
+    let constants = lua.create_table_with_capacity(0, 5)?;
+    constants.set("__file__", path.as_os_str())?;
+    constants.set("__dir__", parent.as_os_str())?;
+    constants.set("os", std::env::consts::OS)?;
+    constants.set("arch", std::env::consts::ARCH)?;
+    constants.set("os_family", std::env::consts::FAMILY)?;
 
+    let module = lua.create_table_with_capacity(0, 3)?;
     module.set(
         "user_name",
         lookup(lua, || whoami::username().ok().map(OsString::from))?,
@@ -30,6 +34,24 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
         "host_name",
         lookup(lua, || nix::unistd::gethostname().ok())?,
     )?;
+
+    // Constants stay outside the module so assignments to them invoke __newindex.
+    let metatable = lua.create_table_with_capacity(0, 3)?;
+    metatable.set("__index", constants.clone())?;
+    metatable.set(
+        "__newindex",
+        lua.create_function(move |_, (module, key, value): (Table, Value, Value)| {
+            if constants.contains_key(key.clone())? {
+                return Err(mlua::Error::runtime(format!(
+                    "cli.{} is a read-only constant",
+                    key.to_string()?
+                )));
+            }
+            module.raw_set(key, value)
+        })?,
+    )?;
+    metatable.set("__metatable", false)?;
+    module.set_metatable(Some(metatable))?;
 
     Ok(module)
 }
@@ -103,6 +125,9 @@ mod tests {
             module.get::<mlua::String>("__dir__")?.as_bytes().as_ref(),
             b"/configuration"
         );
+        assert_eq!(module.get::<String>("os")?, std::env::consts::OS);
+        assert_eq!(module.get::<String>("arch")?, std::env::consts::ARCH);
+        assert_eq!(module.get::<String>("os_family")?, std::env::consts::FAMILY);
 
         assert_eq!(
             module
@@ -124,6 +149,54 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn constants_reject_assignment_and_deletion() -> Result<()> {
+        let lua = Lua::new();
+        preload(&lua, PathBuf::from("/configuration/config.lua"))?;
+        lua.load(
+            r#"
+local cli = require('cli')
+for _, name in ipairs({'__file__', '__dir__', 'os', 'arch', 'os_family'}) do
+    local original = cli[name]
+    for _, replace in ipairs({true, false}) do
+        local ok, err = pcall(function()
+            if replace then cli[name] = 'replacement' else cli[name] = nil end
+        end)
+        assert(not ok)
+        assert(tostring(err):find('cli.' .. name .. ' is a read-only constant', 1, true))
+        assert(cli[name] == original)
+        assert(require('cli')[name] == original)
+    end
+end
+assert(getmetatable(cli) == false)
+assert(not pcall(setmetatable, cli, {}))
+"#,
+        )
+        .exec()
+    }
+
+    #[test]
+    fn nonconstant_module_members_remain_mutable() -> Result<()> {
+        let lua = Lua::new();
+        preload(&lua, PathBuf::from("/configuration/config.lua"))?;
+        lua.load(
+            r#"
+local cli = require('cli')
+assert(cli.missing == nil)
+local key = {}
+for _, name in ipairs({'extra', 'user_name', 'home_dir', 'host_name', 1, key, '\255'}) do
+    cli[name] = 'first'
+    assert(cli[name] == 'first')
+    cli[name] = 'second'
+    assert(cli[name] == 'second')
+    cli[name] = nil
+    assert(cli[name] == nil)
+end
+"#,
+        )
+        .exec()
     }
 
     #[test]
