@@ -19,7 +19,7 @@ fn main() {
                 let client = t::Client::new("")?;
 
                 for flag in ["-T", "-tt"] {
-                    let mut pty = client.pty(&[flag, "target", "sh", "-c", "printf ready; cat"])?;
+                    let mut pty = client.pty(&[flag, "target", "printf ready; cat"])?;
                     pty.read_until(b"ready").await?;
                     pty.signal(sig)?;
                     pty.wait(255).await?;
@@ -106,8 +106,6 @@ fn main() {
             let mut pty = client.pty(&[
                 "-tt",
                 "target",
-                "sh",
-                "-c",
                 "stty -echo; printf ready; IFS= read -r line; printf '<%s>' \"$line\"; cat",
             ])?;
             pty.read_until(b"ready").await?;

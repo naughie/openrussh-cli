@@ -251,13 +251,7 @@ fn main() {
         for client in logging_clients(Some("none"))? {
             let output = client
                 .run(
-                    &[
-                        "-v",
-                        "target",
-                        "sh",
-                        "-c",
-                        "printf stdout; printf stderr >&2; exit 7",
-                    ],
+                    &["-v", "target", "printf stdout; printf stderr >&2; exit 7"],
                     b"",
                 )
                 .await?;
@@ -350,12 +344,7 @@ request-tty = false
         )?;
         let output = client
             .run(
-                &[
-                    "target",
-                    "sh",
-                    "-c",
-                    "if test -t 0; then exit 1; else printf toml; fi",
-                ],
+                &["target", "if test -t 0; then exit 1; else printf toml; fi"],
                 b"",
             )
             .await?;
@@ -389,8 +378,6 @@ request-tty = "force"
                     "none",
                     "-T",
                     "target",
-                    "sh",
-                    "-c",
                     "if test -t 0; then exit 1; else printf overrides; fi",
                 ],
                 b"",
@@ -473,12 +460,7 @@ return {{
             ))?;
             let output = client
                 .run(
-                    &[
-                        "target",
-                        "sh",
-                        "-c",
-                        "if test -t 0; then exit 1; else printf lua; fi",
-                    ],
+                    &["target", "if test -t 0; then exit 1; else printf lua; fi"],
                     b"",
                 )
                 .await?;
@@ -720,8 +702,6 @@ return {
                     "none",
                     "-T",
                     "target",
-                    "sh",
-                    "-c",
                     "if test -t 0; then exit 1; else printf overrides; fi",
                 ],
                 b"",
@@ -995,10 +975,10 @@ return {
 
             for client in [&toml, &lua] {
                 let command = "if test -t 0; then printf tty; else printf pipe; fi";
-                let output = client.run(&["target", "sh", "-c", command], b"").await?;
+                let output = client.run(&["target", command], b"").await?;
                 t::expect(&output, 0, expected, b"");
 
-                let output = client.run(&["-tt", "target", "sh", "-c", command], b"").await?;
+                let output = client.run(&["-tt", "target", command], b"").await?;
                 t::expect(&output, 0, b"tty", b"");
             }
         }
@@ -1401,8 +1381,6 @@ request-tty = "no"
         let client = t::Client::default_config()?;
         let command = [
             "target",
-            "sh",
-            "-c",
             "if test -t 0; then printf openssh; else printf toml; fi",
         ];
         lua.write(br#"
@@ -1417,7 +1395,7 @@ return {
 }
 "#)?;
         let output = client.run(&[
-            "target", "sh", "-c",
+            "target",
             "if test -t 0; then printf lua; else printf toml; fi",
         ], b"").await?;
         t::expect(&output, 0, b"lua", b"");

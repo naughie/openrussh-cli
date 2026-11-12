@@ -129,7 +129,7 @@ struct Args {
     )]
     destination: String,
 
-    #[arg(value_name = "COMMAND", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, help = "Remote program and arguments")]
+    #[arg(value_name = "COMMAND", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, help = "Remote shell command (arguments are joined with spaces)")]
     command: Option<Vec<String>>,
 }
 
@@ -163,11 +163,20 @@ impl Args {
                 host: host.to_owned(),
                 port,
             }
-        } else if let Some(mut command) = args.command.filter(|v| !v.is_empty()) {
-            let prog = command.remove(0);
-            Session::Exec {
-                prog,
-                args: (!command.is_empty()).then_some(command),
+        } else if let Some(command) = args.command {
+            let mut words = command.into_iter();
+            let mut command = words.next().unwrap_or_default();
+            command.reserve(words.as_slice().iter().map(|word| word.len() + 1).sum());
+
+            for word in words {
+                command.push(' ');
+                command.push_str(&word);
+            }
+
+            if command.is_empty() {
+                Session::Shell
+            } else {
+                Session::Exec(command)
             }
         } else {
             Session::Shell
@@ -454,30 +463,42 @@ mod tests {
     }
 
     #[test]
-    fn command_arguments_preserve_their_boundaries() -> Result<()> {
-        let conf = parse(&[
-            "server", "printf", "%s\\n", "a b", "$PATH", "|", "cat", "-n",
-        ])?;
+    fn command_arguments_are_joined_without_escaping() -> Result<()> {
+        let cases: &[(&[&str], &str)] = &[
+            (&["server", "echo hello"], "echo hello"),
+            (&["server", "echo", "hello"], "echo hello"),
+            (
+                &[
+                    "server", "printf", "'%s\\n'", "a b", "$PATH", "|", "cat", "-n",
+                ],
+                "printf '%s\\n' a b $PATH | cat -n",
+            ),
+            (
+                &["server", "printf 'left", "", "right'"],
+                "printf 'left  right'",
+            ),
+            (&["server", "", "echo", "hello", ""], " echo hello "),
+            (
+                &["server", "printf 'line\nbreak' # comment"],
+                "printf 'line\nbreak' # comment",
+            ),
+            (&["server", "", ""], " "),
+        ];
 
-        assert_eq!(
-            conf.session,
-            Session::Exec {
-                prog: "printf".to_owned(),
-                args: Some(
-                    ["%s\\n", "a b", "$PATH", "|", "cat", "-n"]
-                        .map(str::to_owned)
-                        .into()
-                ),
-            }
-        );
+        for &(args, expected) in cases {
+            assert_eq!(
+                parse(args)?.session,
+                Session::Exec(expected.to_owned()),
+                "{args:?}"
+            );
+        }
 
-        assert_eq!(
-            parse(&["server", "true"])?.session,
-            Session::Exec {
-                prog: "true".to_owned(),
-                args: None
-            }
-        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_command_starts_a_shell() -> Result<()> {
+        assert_eq!(parse(&["server", ""])?.session, Session::Shell);
 
         Ok(())
     }
@@ -506,13 +527,7 @@ mod tests {
             let conf = parse(&[flags, "server", "printf", "-v"])?;
 
             assert!(conf.verbose);
-            assert_eq!(
-                conf.session,
-                Session::Exec {
-                    prog: "printf".to_owned(),
-                    args: Some(vec!["-v".to_owned()]),
-                }
-            );
+            assert_eq!(conf.session, Session::Exec("printf -v".to_owned()));
         }
 
         Ok(())

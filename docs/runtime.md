@@ -31,7 +31,7 @@ ssh [OPTIONS] DESTINATION [COMMAND [ARGUMENT ...]]
 
 Repeated scalar options use the last occurrence. `-t` and `-T` follow command-line order: a later `-T` cancels earlier `-t` occurrences, and a later `-t` cancels `-T`. More than one active `-t` forces allocation. `-N` and `-W` select distinct session modes, conflict with each other and a remote command, and disable the remote PTY.
 
-Omitting `COMMAND` starts a remote shell. A command supplies a program and an ordered argument list. Tokens following the program are its arguments, including tokens beginning with `-`. CLI connection settings take precedence over file settings; details of file selection, host matching, defaults, and list merging belong to the configuration reference.
+Omitting `COMMAND` starts a remote shell. When a command is supplied, the CLI joins `COMMAND` and every following argument with one ASCII space into a remote command string, following OpenSSH CLI semantics. It adds no quoting or escaping. An empty resulting string also starts a shell. Tokens following `COMMAND`, including tokens beginning with `-`, belong to that command string. CLI connection settings take precedence over file settings; details of file selection, host matching, defaults, and list merging belong to the configuration reference.
 
 The CLI does not expose arbitrary `-o` settings, subsystem requests, remote forwarding (`-R`), dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), or X11 forwarding (`-X`). Parsing a directive in an OpenSSH configuration file does not itself add an application feature or extend the dependency's implementation.
 
@@ -84,13 +84,15 @@ separately.
 
 The application calls `Connection::connect()` with the resolved destination/jump chain and its handler factory. The dependency owns connection establishment, SSH algorithm negotiation, and user authentication. The configuration layer supplies identity paths, user certificates, and agent sockets according to the selected format's rules. The dependency uses those resolved settings for authentication; the CLI does not reproduce that state machine or add authentication methods.
 
-The application uses `Connection::shell()` for shells and `Connection::exec()` for commands. It builds commands with `Command::new().prog(...).arg(...).complete(false)`. The dependency quotes each program and argument for the server's shell, preserving the boundaries supplied to the CLI. There is no unchecked command-string construction.
+The application uses `Connection::shell()` for shells. For commands, it calls the dependency's safe `process::cmd::exec()` helper with the connection handle, the command string, and the connection's PTY policy. This is the same helper used by `Connection::exec()`, without the literal-argument quoting performed by its `Command` builder. The CLI does not use `Command::new_unchecked()` or add an explicit shell wrapper.
 
-An SSH `exec` request carries a command string, rather than an operating-system argument vector. The quoting step preserves literal arguments through the remote shell; it does not make a positional CLI argument into shell syntax. To request a shell expression, invoke the shell explicitly:
+An SSH `exec` request carries one command string, rather than an operating-system argument vector. The remote user's shell interprets that string, including operators, quotes, and expansions. The local shell first processes the invocation's own quoting; quote the remote expression locally to preserve the text that the remote shell should receive:
 
 ```sh
-ssh my-host sh -c 'printf "%s\n" "$HOME"; printf "%s\n" done'
+ssh my-host 'printf "%s\n" "$HOME"; printf "%s\n" done'
 ```
+
+Here the local single quotes preserve `$HOME` and the inner double quotes for the remote shell. Local argument boundaries are not preserved after joining: `ssh my-host echo 'one two'` sends `echo one two`, while `ssh my-host 'printf "%s\n" "one two"'` includes the remote quotes needed to keep `one two` together.
 
 User authentication keys, server host keys, key-exchange algorithms, ciphers, and message authentication codes have distinct roles. The handler's host-key check authenticates the server; it does not select or verify the client's user authentication identity. Cipher and MAC preferences modify the dependency's transport configuration. Native configuration can supply independent key-exchange and host-key policies for the destination and every jump host. An explicit host-key policy replaces both plain-key and certificate lists without known-host preference adjustments; when omitted, known-host information may adjust those preferences. Host-key verification still applies in either case. The application preserves the transport's default KEX extension signals when applying configured methods.
 

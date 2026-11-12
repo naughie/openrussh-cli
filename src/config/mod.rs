@@ -117,15 +117,9 @@ pub(crate) struct Destination {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Session {
     Shell,
-    Exec {
-        prog: String,
-        args: Option<Vec<String>>,
-    },
+    Exec(String),
     None,
-    Forward {
-        host: String,
-        port: u16,
-    },
+    Forward { host: String, port: u16 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -794,10 +788,7 @@ return {
             options.proxy_jump = Some(vec!["jump".to_owned()]);
             options.tty = Some(RequestTty::Never);
             options.verbose = true;
-            options.session = Session::Exec {
-                prog: "printf".to_owned(),
-                args: Some(vec!["hello".to_owned()]),
-            };
+            options.session = Session::Exec("printf hello".to_owned());
             options.stdin_null = true;
             options.escape_char = Some(b'!');
             options.compression = true;

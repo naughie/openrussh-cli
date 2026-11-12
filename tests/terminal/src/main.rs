@@ -6,8 +6,6 @@ fn main() {
         let mut pty = client.pty(&[
             "-tt",
             "target",
-            "sh",
-            "-c",
             "printf 'ready\\n'; trap 'stty size' WINCH; while :; do sleep 1; done",
         ])?;
         pty.read_until(b"ready").await?;
@@ -16,7 +14,7 @@ fn main() {
         pty.signal(t::Signal::SIGTERM)?;
         pty.wait(255).await?;
 
-        let mut pty = client.pty(&["-tt", "target", "sh", "-c", "printf ready; cat"])?;
+        let mut pty = client.pty(&["-tt", "target", "printf ready; cat"])?;
         pty.read_until(b"ready").await?;
         pty.write(b"~\x1a").await?;
         pty.wait_stopped().await?;
@@ -44,8 +42,6 @@ fn main() {
                         &[
                             flag,
                             "target",
-                            "sh",
-                            "-c",
                             "if test -t 0; then printf tty; else printf pipe; fi",
                         ],
                         b"",

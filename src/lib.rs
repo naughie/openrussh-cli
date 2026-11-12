@@ -201,13 +201,7 @@ mod tests {
 
     #[test]
     fn terminating_remote_sessions_fails() {
-        for session in [
-            Session::Shell,
-            Session::Exec {
-                prog: "sleep".to_owned(),
-                args: Some(vec!["10".to_owned()]),
-            },
-        ] {
+        for session in [Session::Shell, Session::Exec("sleep 10".to_owned())] {
             for sig in [
                 nix::libc::SIGTERM,
                 nix::libc::SIGINT,

@@ -3,7 +3,7 @@ use crate::terminal::{self, Event, Events, Input, InputMode, Terminal};
 
 use openrussh_client::config::RequestTty;
 use openrussh_client::connect::Connection;
-use openrussh_client::process::{Child, ChildIn, ChildOut, Chunk, Command};
+use openrussh_client::process::{Child, ChildIn, ChildOut, Chunk, cmd};
 use openrussh_client::russh::client::Handler;
 
 use anyhow::{Context as _, Result};
@@ -52,15 +52,9 @@ pub(crate) async fn run<H: Handler>(
             tracing::debug!("Requesting shell.");
             conn.shell().await?
         }
-        Session::Exec { prog, args } => {
-            tracing::debug!("Sending command: {prog}");
-            let mut cmd = Command::new().prog(&prog);
-
-            for arg in args.iter().flatten() {
-                cmd = cmd.arg(arg);
-            }
-
-            conn.exec(cmd.complete(false)).await?
+        Session::Exec(command) => {
+            tracing::debug!("Sending command: {command}");
+            cmd::exec(conn.handle(), command, conn.request_tty()).await?
         }
         Session::Forward { host, port } => {
             tracing::debug!("Opening stdio forwarding to {host} port {port}.");
