@@ -1,6 +1,6 @@
 [package]
 name = "openrussh-cli-terminal"
-version = "0.2.4"
+version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/naughie/openrussh-cli"
 

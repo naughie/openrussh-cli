@@ -1,6 +1,6 @@
 [package]
 name = "openrussh-cli"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 repository = "https://github.com/naughie/openrussh-cli"
 
@@ -22,8 +22,8 @@ tokio = "1.54"
 tracing-subscriber = { version = "0.3", default-features = false }
 
 [dependencies]
-openrussh-cli-config = { version = "0.2.4", path = "crates/openrussh-cli-config" }
-openrussh-cli-terminal = { version = "0.2.4", path = "crates/openrussh-cli-terminal" }
+openrussh-cli-config = { version = "0.1.0", path = "crates/openrussh-cli-config" }
+openrussh-cli-terminal = { version = "0.1.0", path = "crates/openrussh-cli-terminal" }
 
 openrussh-client = { workspace = true, features = ["aws-lc-rs", "rsa", "flate2", "known-hosts", "local-stream-forwarding", "local-tcp-forwarding", "process"] }
 

@@ -1257,7 +1257,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openrussh-cli"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "openrussh-cli-config"
-version = "0.2.4"
+version = "0.1.0"
 dependencies = [
  "mlua",
  "nix",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "openrussh-cli-terminal"
-version = "0.2.4"
+version = "0.1.0"
 dependencies = [
  "nix",
  "tempfile",
