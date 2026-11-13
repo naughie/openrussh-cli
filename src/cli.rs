@@ -1,6 +1,7 @@
-use crate::config::{
-    BindHost, Destination, ForwardTarget, LocalBind, LocalForward, Options, Session,
+use openrussh_cli_config::{
+    BindHost, Config, Destination, ForwardTarget, LocalBind, LocalForward, Session,
 };
+use openrussh_client::config::RequestTty;
 
 use anyhow::{Context as _, Result, bail, ensure};
 
@@ -133,16 +134,64 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-pub(crate) fn parse() -> Result<Options> {
+pub(crate) struct Invocation {
+    destination: Destination,
+    config_file: Option<PathBuf>,
+    identities: Option<Vec<PathBuf>>,
+    proxy_jump: Option<Vec<String>>,
+    tty: Option<RequestTty>,
+    verbose: bool,
+    session: Session,
+    stdin_null: bool,
+    escape_char: Option<u8>,
+    local_forwards: Option<Vec<LocalForward>>,
+    compression: bool,
+    ciphers: Option<String>,
+    macs: Option<String>,
+}
+
+impl Invocation {
+    pub(crate) fn build(self) -> Result<Config> {
+        let mut builder = Config::builder()
+            .verbose(self.verbose)
+            .stdin_null(self.stdin_null)
+            .escape_char(self.escape_char)
+            .compression(self.compression);
+
+        if let Some(path) = self.config_file {
+            builder = builder.config_file(path);
+        }
+        if let Some(identities) = self.identities {
+            builder = builder.identities(identities);
+        }
+        if let Some(jumps) = self.proxy_jump {
+            builder = builder.proxy_jump(jumps);
+        }
+        if let Some(tty) = self.tty {
+            builder = builder.tty(tty);
+        }
+        if let Some(forwards) = self.local_forwards {
+            builder = builder.local_forwards(forwards);
+        }
+        if let Some(ciphers) = self.ciphers {
+            builder = builder.ciphers(ciphers);
+        }
+        if let Some(macs) = self.macs {
+            builder = builder.macs(macs);
+        }
+
+        Ok(builder.build(self.destination, self.session)?)
+    }
+}
+
+pub(crate) fn parse() -> Result<Invocation> {
     use clap::Parser as _;
 
-    Args::parse().into_options()
+    Args::parse().into_invocation()
 }
 
 impl Args {
-    fn into_options(self) -> Result<Options> {
-        use openrussh_client::config::RequestTty;
-
+    fn into_invocation(self) -> Result<Invocation> {
         let args = self;
 
         let mut destination = parse_destination(args.destination)?;
@@ -176,7 +225,7 @@ impl Args {
             if command.is_empty() {
                 Session::Shell
             } else {
-                Session::Exec(command)
+                Session::Exec { command }
             }
         } else {
             Session::Shell
@@ -209,7 +258,7 @@ impl Args {
             }
         });
 
-        Ok(Options {
+        Ok(Invocation {
             destination,
             config_file: args.config,
             identities: args.identities,
@@ -398,12 +447,172 @@ fn split_forward(s: &str) -> Result<([&str; 4], usize)> {
 mod tests {
     use super::*;
 
-    use openrussh_client::config::RequestTty;
-
-    fn parse(args: &[&str]) -> Result<Options> {
+    fn parse(args: &[&str]) -> Result<Invocation> {
         use clap::Parser as _;
 
-        Args::try_parse_from(std::iter::once("ssh").chain(args.iter().copied()))?.into_options()
+        Args::try_parse_from(std::iter::once("ssh").chain(args.iter().copied()))?.into_invocation()
+    }
+
+    #[test]
+    fn readme_examples_resolve_documented_host_settings() -> Result<()> {
+        use openrussh_cli_config::ConfigBuilder;
+
+        use std::path::Path;
+
+        fn example<'src>(readme: &'src str, fence: &str) -> Result<&'src str> {
+            let (_, code) = readme.split_once(fence).context("Missing README example")?;
+            let (code, _) = code
+                .split_once("\n```")
+                .context("Unclosed README example")?;
+
+            Ok(code)
+        }
+
+        let readme = include_str!("../README.md");
+        let dir = tempfile::tempdir()?;
+        let toml_path = dir.path().join("config.toml");
+        let lua_path = dir.path().join("config.lua");
+        std::fs::write(&toml_path, example(readme, "```toml\n")?)?;
+        std::fs::write(&lua_path, example(readme, "```lua\n")?)?;
+
+        let identity = std::env::home_dir()
+            .context("Missing home directory")?
+            .join(".ssh/id_ed25519");
+        let load = |path: &Path, alias: &str| {
+            ConfigBuilder::new().config_file(path).build(
+                Destination {
+                    host: alias.to_owned(),
+                    user: None,
+                    port: None,
+                },
+                Session::Shell,
+            )
+        };
+
+        for (alias, host, user, port, tty) in [
+            ("github", "github.com", "git", 22, RequestTty::ForShell),
+            ("my-host", "example.com", "alice", 2222, RequestTty::IfTty),
+        ] {
+            let toml = load(&toml_path, alias)?.chain;
+            let lua = load(&lua_path, alias)?.chain;
+
+            assert_eq!(toml.target.dest.name, host);
+            assert_eq!(toml.target.dest.user, user);
+            assert_eq!(toml.target.dest.port, port);
+            assert_eq!(
+                toml.target.auth.identities.as_deref(),
+                Some(std::slice::from_ref(&identity))
+            );
+            assert!(toml.target.auth.identities_only);
+            assert_eq!(toml.target.tty, tty);
+            assert!(toml.bastions.is_none());
+            assert!(lua.bastions.is_none());
+
+            let mut expected_lua = toml.target;
+            expected_lua.auth.agent = None;
+            assert_eq!(lua.target, expected_lua);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn building_preserves_cli_overrides_and_application_settings() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[default]\nuser = 'configured'\nport = 2200\nproxy-jump = ['jump']\n[hosts.server]\nhost-name = 'target.example'\n[hosts.jump]\nhost-name = 'jump.example'\n",
+        )?;
+
+        let conf = parse(&[
+            "-F",
+            path.to_str().context("Configuration path is not UTF-8")?,
+            "-l",
+            "alice",
+            "-p",
+            "2222",
+            "-i",
+            "/keys/cli",
+            "-J",
+            "none",
+            "-vttnC",
+            "-e",
+            "none",
+            "-L",
+            "8080:db:5432",
+            "-c",
+            "aes128-ctr",
+            "-m",
+            "hmac-sha2-256",
+            "server",
+            "printf",
+            "hello",
+        ])?
+        .build()?;
+
+        assert_eq!(conf.chain.target.dest.name, "target.example");
+        assert_eq!(conf.chain.target.dest.user, "alice");
+        assert_eq!(conf.chain.target.dest.port, 2222);
+        assert_eq!(
+            conf.chain.target.auth.identities,
+            Some(vec![PathBuf::from("/keys/cli")])
+        );
+        assert!(conf.chain.bastions.is_none());
+        assert_eq!(conf.chain.target.tty, RequestTty::Always);
+
+        assert!(conf.verbose);
+        assert!(conf.stdin_null);
+        assert_eq!(conf.escape_char, None);
+        assert_eq!(
+            conf.session,
+            Session::Exec {
+                command: "printf hello".to_owned()
+            }
+        );
+        assert_eq!(
+            conf.local_forwards,
+            Some(vec![parse_forward("8080:db:5432", false)?])
+        );
+        assert!(conf.compression);
+        assert_eq!(conf.ciphers.as_deref(), Some("aes128-ctr"));
+        assert_eq!(conf.macs.as_deref(), Some("hmac-sha2-256"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_defers_loading_and_build_errors_retain_log_metadata() -> Result<()> {
+        use openrussh_cli_config::{Error, LogLevel};
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let path_arg = path.to_str().context("Configuration path is not UTF-8")?;
+
+        let invocation = parse(&["-F", path_arg, "server"])?;
+        assert!(invocation.build().is_err());
+
+        std::fs::write(
+            &path,
+            "[meta]\nlog-level = 'none'\n[default]\nidentity-file = 'relative'\n",
+        )?;
+        let error = match parse(&["-F", path_arg, "server"])?.build() {
+            Ok(_) => panic!("A relative native identity path should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<Error>().and_then(Error::log_level),
+            Some(LogLevel::None)
+        ));
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "Could not read SSH config {}: identity_file must be an absolute path: relative",
+                path.display()
+            )
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -488,7 +697,9 @@ mod tests {
         for &(args, expected) in cases {
             assert_eq!(
                 parse(args)?.session,
-                Session::Exec(expected.to_owned()),
+                Session::Exec {
+                    command: expected.to_owned()
+                },
                 "{args:?}"
             );
         }
@@ -527,7 +738,12 @@ mod tests {
             let conf = parse(&[flags, "server", "printf", "-v"])?;
 
             assert!(conf.verbose);
-            assert_eq!(conf.session, Session::Exec("printf -v".to_owned()));
+            assert_eq!(
+                conf.session,
+                Session::Exec {
+                    command: "printf -v".to_owned()
+                }
+            );
         }
 
         Ok(())

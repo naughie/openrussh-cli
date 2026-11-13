@@ -1,5 +1,5 @@
-use crate::config::algorithms::Policies;
 use crate::known_hosts::KnownHostsFile;
+use openrussh_cli_config::algorithms::Policies;
 
 use openrussh_client::config::{Chain, Host};
 use openrussh_client::connect::{Context, MakeHandler};
@@ -529,6 +529,52 @@ mod tests {
         assert_eq!(conf.preferred.cipher.as_ref(), &[cipher::AES_256_CTR]);
 
         assert!(!conf.preferred.host_key_certificates.is_empty());
+    }
+
+    #[test]
+    fn known_hosts_does_not_widen_an_explicit_host_key_list() -> Result<()> {
+        use openrussh_cli_config::{Config, Destination, Session};
+        use openrussh_client::russh::keys::Algorithm;
+        use openrussh_client::russh::keys::ssh_key::HashAlg;
+
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[default]\nhost-name = 'server.example'\nhost-key-algorithms = 'rsa-sha2-512'",
+        )?;
+        let resolved = Config::builder().config_file(config_path).build(
+            Destination {
+                host: "sample".to_owned(),
+                user: None,
+                port: None,
+            },
+            Session::Shell,
+        )?;
+
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let path = dir.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            format!("server.example {}\n", key.public_key().to_openssh()?),
+        )?;
+        let maker = MyMakeHandler::new(Preferred::default(), KnownHostsFile::load(Some(&path))?)
+            .with_algorithms(&resolved.chain, &resolved.algorithms);
+        let (_, client) = maker
+            .make_handler(&resolved.chain.target)
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            client.preferred.key.as_ref(),
+            &[Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512)
+            }]
+        );
+        assert!(client.preferred.host_key_certificates.is_empty());
+        assert!(maker.make_handler(&resolved.chain.target.clone()).is_err());
+
+        Ok(())
     }
 
     #[test]

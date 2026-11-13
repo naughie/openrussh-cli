@@ -1,0 +1,17 @@
+[package]
+name = "openrussh-cli-config"
+version = "0.2.4"
+edition = "2024"
+repository = "https://github.com/naughie/openrussh-cli"
+
+[dependencies]
+mlua = { version = "0.11", default-features = false, features = ["vendored", "lua54", "serde", "error-send"] }
+nix = { workspace = true, features = ["hostname"] }
+openrussh-client = { workspace = true, features = ["aws-lc-rs", "rsa", "flate2", "config-parser"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+whoami = "2.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

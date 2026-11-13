@@ -1,27 +1,27 @@
 mod cli;
-mod config;
 mod forwarding;
 mod handler;
 mod known_hosts;
 mod logging;
 mod session;
-mod terminal;
 
+use openrussh_cli_config as config;
+use openrussh_cli_terminal as terminal;
 use openrussh_client::connect::Connection;
 use openrussh_client::russh::client::Handler;
 
 use anyhow::Result;
 
 pub async fn main_impl() {
-    let conf = cli::parse().and_then(config::Options::load);
+    let conf = cli::parse().and_then(cli::Invocation::build);
     let (verbose, level) = conf
         .as_ref()
         .map(|conf| (conf.verbose, conf.meta.log_level.as_ref()))
         .unwrap_or_else(|e| {
             (
                 false,
-                e.downcast_ref::<config::LoadError>()
-                    .and_then(|e| e.log_level.as_ref()),
+                e.downcast_ref::<config::Error>()
+                    .and_then(config::Error::log_level),
             )
         });
     logging::init(verbose, level);
@@ -43,7 +43,7 @@ pub async fn main_impl() {
 async fn run(conf: config::Config) -> Result<u8> {
     use crate::handler::MyMakeHandler;
     use crate::known_hosts::KnownHostsFile;
-    use crate::terminal::{Event, Signals};
+    use openrussh_cli_terminal::{Event, Signals};
 
     let preferred = conf.preferred()?;
     let known_hosts = KnownHostsFile::load(conf.meta.known_hosts.as_deref())?;
@@ -138,18 +138,18 @@ async fn run_session<H: Handler>(
     signals: &mut terminal::Signals,
 ) -> Result<u8> {
     let (shutdown, events) = signals.split();
-    let sigterm_status = signal_status(&session, nix::libc::SIGTERM);
+    let sigterm_status = signal_status(&session, libc::SIGTERM);
 
     tokio::select! {
         res = session::run(conn, session, stdin_null, escape_char, events) => res,
-        sig = shutdown.recv() => Ok(if sig == nix::libc::SIGTERM { sigterm_status } else { 255 }),
+        sig = shutdown.recv() => Ok(if sig == libc::SIGTERM { sigterm_status } else { 255 }),
     }
 }
 
 fn signal_status(session: &config::Session, sig: i32) -> u8 {
-    use crate::config::Session;
+    use openrussh_cli_config::Session;
 
-    if matches!(session, Session::None | Session::Forward { .. }) && sig == nix::libc::SIGTERM {
+    if matches!(session, Session::None | Session::Forward { .. }) && sig == libc::SIGTERM {
         0
     } else {
         255
@@ -180,7 +180,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::signal_status;
-    use crate::config::Session;
+    use openrussh_cli_config::Session;
 
     #[test]
     fn terminating_forward_only_sessions_succeeds() {
@@ -191,23 +191,23 @@ mod tests {
                 port: 22,
             },
         ] {
-            assert_eq!(signal_status(&session, nix::libc::SIGTERM), 0);
+            assert_eq!(signal_status(&session, libc::SIGTERM), 0);
 
-            assert_eq!(signal_status(&session, nix::libc::SIGINT), 255);
+            assert_eq!(signal_status(&session, libc::SIGINT), 255);
 
-            assert_eq!(signal_status(&session, nix::libc::SIGHUP), 255);
+            assert_eq!(signal_status(&session, libc::SIGHUP), 255);
         }
     }
 
     #[test]
     fn terminating_remote_sessions_fails() {
-        for session in [Session::Shell, Session::Exec("sleep 10".to_owned())] {
-            for sig in [
-                nix::libc::SIGTERM,
-                nix::libc::SIGINT,
-                nix::libc::SIGQUIT,
-                nix::libc::SIGHUP,
-            ] {
+        for session in [
+            Session::Shell,
+            Session::Exec {
+                command: "sleep 10".to_owned(),
+            },
+        ] {
+            for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] {
                 assert_eq!(signal_status(&session, sig), 255);
             }
         }

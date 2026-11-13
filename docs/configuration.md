@@ -73,8 +73,10 @@ Host github
 
 ## Native formats: TOML and Lua
 
-TOML and Lua describe the same host fields. Lua additionally supports inline
-host records in jump settings. Their canonical spellings differ:
+The current TOML and Lua formats support the host fields described below.
+Each owns its schema and resolution rules; their current overlapping behavior
+is presented together here. Lua additionally supports inline host records in
+jump settings. Their canonical spellings differ:
 
 | Concept | TOML | Lua |
 | --- | --- | --- |

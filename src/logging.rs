@@ -1,4 +1,4 @@
-use crate::config::LogLevel;
+use openrussh_cli_config::LogLevel;
 
 use tracing::level_filters::LevelFilter;
 use tracing::{Event, Level, Subscriber};
@@ -123,7 +123,7 @@ mod tests {
     }
 
     fn directives(value: &str) -> LogLevel {
-        LogLevel::Filter(Box::new(EnvFilter::try_new(value).unwrap()))
+        LogLevel::try_from_filter(value).unwrap()
     }
 
     #[test]

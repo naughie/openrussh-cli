@@ -8,24 +8,37 @@ repository = "https://github.com/naughie/openrussh-cli"
 name = "ssh"
 path = "src/main.rs"
 
+[workspace]
+members = [".", "crates/*"]
+default-members = [".", "crates/*"]
+exclude = ["tests"]
+resolver = "3"
+
+[workspace.dependencies]
+nix = "0.31"
+openrussh-client = { version = "0.4", default-features = false }
+tempfile = "3.27"
+tokio = "1.54"
+tracing-subscriber = { version = "0.3", default-features = false }
+
 [dependencies]
+openrussh-cli-config = { version = "0.2.4", path = "crates/openrussh-cli-config" }
+openrussh-cli-terminal = { version = "0.2.4", path = "crates/openrussh-cli-terminal" }
+
+openrussh-client = { workspace = true, features = ["aws-lc-rs", "rsa", "flate2", "known-hosts", "local-stream-forwarding", "local-tcp-forwarding", "process"] }
+
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
-mlua = { version = "0.11", default-features = false, features = ["vendored", "lua54", "serde", "error-send"] }
-nix = { version = "0.31", features = ["fs", "hostname", "net", "process", "signal", "term"] }
-openrussh-client = { version = "0.4", default-features = false, features = ["aws-lc-rs", "rsa", "flate2", "config-parser", "known-hosts", "local-stream-forwarding", "local-tcp-forwarding", "process"] }
-serde = { version = "1.0", features = ["derive"] }
-terminal_size = "0.4"
-whoami = "2.1"
-toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
-tokio = { version = "1.54", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+libc = "0.2"
+socket2 = "0.6"
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "tracing-log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "tracing-log"] }
 
 [dev-dependencies]
 rand = "0.10"
-tempfile = "3.27"
-tokio = { version = "1.54", features = ["process"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

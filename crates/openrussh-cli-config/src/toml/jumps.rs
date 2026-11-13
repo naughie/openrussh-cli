@@ -1,4 +1,4 @@
-use super::HostFields;
+use super::profiles::HostFields;
 use super::values::Text;
 
 use serde::de::{Error, MapAccess, SeqAccess, Visitor};
@@ -15,7 +15,8 @@ pub(super) enum Jumps<'src> {
 
 pub(super) enum Jump<'src> {
     Name(Text<'src>),
-    Host(Box<HostFields<'src>>),
+    // Retain shape-valid inline input until parsed logging metadata is available.
+    InvalidInline,
 }
 
 impl Jumps<'_> {
@@ -33,7 +34,7 @@ impl<'de: 'src, 'src> Visitor<'de> for JumpVisitor<'src> {
     type Value = Jump<'src>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a jump-host string or host record")
+        f.write_str("a jump-host string")
     }
 
     fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -51,9 +52,9 @@ impl<'de: 'src, 'src> Visitor<'de> for JumpVisitor<'src> {
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         use serde::de::value::MapAccessDeserializer;
 
-        HostFields::deserialize(MapAccessDeserializer::new(map))
-            .map(Box::new)
-            .map(Jump::Host)
+        // Invalid inline fields still fail during TOML deserialization, before
+        // the later named-only check can attach successfully parsed metadata.
+        HostFields::deserialize(MapAccessDeserializer::new(map)).map(|_| Jump::InvalidInline)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
@@ -63,7 +64,7 @@ impl<'de: 'src, 'src> Visitor<'de> for JumpVisitor<'src> {
             return Err(A::Error::custom("a jump must be a string or host record"));
         }
 
-        Ok(Jump::Host(Box::default()))
+        Ok(Jump::InvalidInline)
     }
 }
 
@@ -81,7 +82,7 @@ impl<'de: 'src, 'src> Deserialize<'de> for Jumps<'src> {
             type Value = Jumps<'src>;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a jump-host string, host record, or array of jumps")
+                f.write_str("a jump-host string or array of strings")
             }
 
             fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -120,22 +121,19 @@ impl<'de: 'src, 'src> Deserialize<'de> for Jumps<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::formats::Profiles;
+
+    #[derive(Deserialize)]
+    struct Input<'src> {
+        #[serde(borrow, rename = "proxy-jump")]
+        jumps: Jumps<'src>,
+    }
 
     #[test]
     fn named_jumps_preserve_borrowing_and_decode_escapes() {
         for value in ["'plain'", r#"['plain', "esc\u0061ped"]"#] {
-            let source = format!("[hosts.target]\nproxy-jump = {value}");
-            let profiles: Profiles<'_> = ::toml::from_str(&source).unwrap();
-            profiles.require_named_jumps().unwrap();
-            let jumps = profiles
-                .hosts
-                .get("target")
-                .unwrap()
-                .proxy_jump
-                .as_ref()
-                .unwrap();
-            let names = jumps.as_slice();
+            let source = format!("proxy-jump = {value}");
+            let input: Input<'_> = ::toml::from_str(&source).unwrap();
+            let names = input.jumps.as_slice();
             let Jump::Name(plain) = &names[0] else {
                 panic!("expected a named jump")
             };

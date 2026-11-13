@@ -1,0 +1,14 @@
+[package]
+name = "openrussh-cli-terminal"
+version = "0.2.4"
+edition = "2024"
+repository = "https://github.com/naughie/openrussh-cli"
+
+[dependencies]
+nix = { workspace = true, features = ["fs", "process", "signal", "term"] }
+terminal_size = "0.4"
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "signal"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }

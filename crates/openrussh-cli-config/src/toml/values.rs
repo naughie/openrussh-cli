@@ -38,6 +38,20 @@ impl<'src> Strings<'src> {
     }
 }
 
+impl crate::algorithms::AlgorithmList for Strings<'_> {
+    fn algorithm_names(&self) -> impl Iterator<Item = &str> + Clone {
+        let (single, array) = match self {
+            Self::One(value) => (Some(value.as_str()), None),
+            Self::Many(values) => (None, Some(values.as_slice())),
+        };
+
+        single
+            .into_iter()
+            .flat_map(|names| names.split(','))
+            .chain(array.into_iter().flatten().map(Text::as_str))
+    }
+}
+
 impl<'de: 'src, 'src> Deserialize<'de> for Strings<'src> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::{SeqAccess, Visitor};

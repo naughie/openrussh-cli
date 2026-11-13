@@ -1,4 +1,4 @@
-use crate::config::{BindHost, ForwardTarget, LocalBind, LocalForward};
+use openrussh_cli_config::{BindHost, ForwardTarget, LocalBind, LocalForward};
 
 use openrussh_client::connect::Connection;
 use openrussh_client::russh::client::Handler;
@@ -167,7 +167,7 @@ fn bind_tcp<'conf>(
     target: &'conf ForwardTarget,
     listeners: &mut Vec<(Listener, &'conf ForwardTarget)>,
 ) -> io::Result<()> {
-    use nix::sys::socket::{setsockopt, sockopt::Ipv6V6Only};
+    use socket2::SockRef;
 
     let before = listeners.len();
     let mut error = None;
@@ -176,7 +176,7 @@ fn bind_tcp<'conf>(
         let bind = || {
             let socket = if addr.is_ipv6() {
                 let socket = TcpSocket::new_v6()?;
-                setsockopt(&socket, Ipv6V6Only, &true)?;
+                SockRef::from(&socket).set_only_v6(true)?;
                 socket
             } else {
                 TcpSocket::new_v4()?
@@ -315,7 +315,7 @@ mod tests {
             Err(e)
                 if e.kind() == io::ErrorKind::AddrNotAvailable
                     || e.kind() == io::ErrorKind::Unsupported
-                    || e.raw_os_error() == Some(nix::libc::EAFNOSUPPORT) =>
+                    || e.raw_os_error() == Some(libc::EAFNOSUPPORT) =>
             {
                 Ok(false)
             }
@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn wildcard_binds_each_available_address_family() -> Result<()> {
-        use nix::sys::socket::{getsockopt, sockopt::Ipv6V6Only};
+        use socket2::SockRef;
 
         let ipv6 = ipv6_available()?;
         let forwards = [conf(LocalBind::Tcp {
@@ -475,7 +475,7 @@ mod tests {
             v6 |= addr.is_ipv6();
 
             if addr.is_ipv6() {
-                assert!(getsockopt(listener, Ipv6V6Only)?);
+                assert!(SockRef::from(listener).only_v6()?);
             }
         }
 
@@ -488,7 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_ipv6_does_not_create_an_ipv4_listener() -> Result<()> {
-        use nix::sys::socket::{getsockopt, sockopt::Ipv6V6Only};
+        use socket2::SockRef;
 
         if !ipv6_available()? {
             return Ok(());
@@ -506,7 +506,7 @@ mod tests {
 
         assert_eq!(listener.local_addr()?.ip(), Ipv6Addr::LOCALHOST);
 
-        assert!(getsockopt(listener, Ipv6V6Only)?);
+        assert!(SockRef::from(listener).only_v6()?);
 
         Ok(())
     }

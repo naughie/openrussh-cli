@@ -1,5 +1,5 @@
-use crate::config::Session;
-use crate::terminal::{self, Event, Events, Input, InputMode, Terminal};
+use openrussh_cli_config::Session;
+use openrussh_cli_terminal::{self as terminal, Event, Events, Input, InputMode, Terminal};
 
 use openrussh_client::config::RequestTty;
 use openrussh_client::connect::Connection;
@@ -52,7 +52,7 @@ pub(crate) async fn run<H: Handler>(
             tracing::debug!("Requesting shell.");
             conn.shell().await?
         }
-        Session::Exec(command) => {
+        Session::Exec { command } => {
             tracing::debug!("Sending command: {command}");
             cmd::exec(conn.handle(), command, conn.request_tty()).await?
         }

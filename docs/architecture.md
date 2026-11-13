@@ -9,19 +9,32 @@ The [configuration reference](configuration.md) defines observable loading and
 resolution rules. This document describes the types and processing boundaries
 that implement them.
 
+The `openrussh-cli-config` workspace package owns configuration, with the Rust
+crate name `openrussh_cli_config`. The `config::` prefix below abbreviates that
+crate, including its private implementation types. The root `openrussh-cli`
+package owns argument parsing and runtime coordination; it consumes the
+configuration crate through its public API. The separate `openrussh-cli-terminal`
+package owns Unix terminal modes, signals, size queries, suspension, and
+asynchronous input resources. Its Rust crate name is `openrussh_cli_terminal`.
+
 ## Types and responsibilities
 
 | Type | Meaning | Representation |
 | --- | --- | --- |
-| `config::Options` | CLI-derived inputs, overrides, and file-selection policy before loading. | Destination alias, optional user/port and overrides, selected file, verbosity, session and forwarding options. |
+| `cli::Invocation` | Parsed application arguments before loading. | Destination, session, and optional overrides retained without configuration-file IO. |
+| `config::ConfigBuilder` | Public configuration construction API. | Private fields set through consuming fluent methods; destination and session are supplied to `build`. |
+| `config::ResolveOptions<'a>` | Private borrowed inputs used during source resolution. | A destination reference and optional identity/jump slices borrowed for resolution; not part of the crate API. |
+| `config::ResolveConfig` | Private statically dispatched source-resolution protocol. | Each format's `ParsedConfig` implements `resolve()` independently and returns `Resolved`. |
 | `config::toml::ParsedConfig<'src>` | The result of parsing a TOML document. | Native profiles that can borrow from the source text. |
 | `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles, independent of the Lua VM and source text. |
 | `config::openssh::ParsedConfig` | The result of parsing OpenSSH syntax with the CLI override prefix. | The dependency's `SshConfig`. |
-| `config::formats::Profiles<'src>` | Shared Serde representation of native configuration. | Top-level setup metadata, a defaults record, and a map of exact host aliases to `HostFields`. |
+| `config::toml::profiles::Profiles<'src>` | TOML source representation. | Borrowed or decoded TOML strings, setup metadata, defaults, and exact named hosts. |
+| `config::lua::profiles::Profiles` | Lua source representation. | Owned strings, setup metadata, defaults, named hosts, and named or inline jumps. |
 | `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, and resolved setup `Meta`. |
 | `config::Meta` | Application setup settings for the invocation. | An optional known-host database path and log filter. |
 | `config::algorithms::Policies` | Algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
 | `config::Config` | Final application configuration for one invocation. | The resolved chain, algorithms, and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
+| `config::Error` | Configuration failure with its underlying cause. | Typed error and source chain, with an optional parsed log filter accessible through `log_level()`. |
 
 `Config` is a struct, not a configuration-provider trait or a union of file
 formats. It has no Serde implementation, source-text lifetime, Lua value, file
@@ -33,61 +46,99 @@ one format does not manufacture another format's parser output. In particular,
 TOML and Lua do not go through `ssh2_config::HostParams`: that type belongs to
 the OpenSSH parser and its merging rules.
 
-`Profiles` is deliberately a native source representation, not the universal
-configuration model. It retains omitted fields, string/list alternatives,
-unexpanded paths, defaults, and all named hosts. Sharing this representation
-keeps TOML and Lua's common host semantics consistent without imposing their
-schema on OpenSSH. Its private `HostFields` records describe supplied fields
-rather than a fully resolved SSH host.
+TOML and Lua own independent profile, host, metadata, value, jump, path, and
+resolution implementations. Each source representation retains supplied and
+omitted fields, string/list alternatives, defaults, and named hosts until its
+own resolver constructs the final connection values. Neither representation is
+a shared native base model or an intermediate for another format.
 
-`formats::jumps` represents a jump setting as `Jumps::One` or `Jumps::Many`.
-Each `Jump` is either `Name(Text)` or `Host(Box<HostFields>)`. Boxing the inline
-record permits nested `proxy_jump` without copying the host-field schema.
-This shared representation supports Lua's named, inline, and mixed jump forms;
-the TOML adapter calls `require_named_jumps()` after deserialization to preserve
-its string-only jump syntax.
+TOML profiles can borrow source text; escaped strings are owned when decoding
+requires allocation. Its jump schema accepts names, with inline records
+rejected after deserialization so successfully parsed log metadata can remain
+available on that error. Lua profiles own `String` values and support named,
+inline, and mixed jumps. Lua's inline jump variant boxes its own host record to
+permit recursive jump settings.
+
+The formats currently produce equivalent results for documented overlapping
+features. That is a property of their present implementations and regression
+fixtures, rather than a requirement to keep their schemas or semantics in
+lockstep. A change to one format is evaluated against that format's contract.
 
 ## Loading pipeline
 
 ```mermaid
 flowchart TD
-    A[CLI arguments] --> B[config::Options]
+    A[CLI arguments] --> P[cli::Invocation]
+    P --> B[ConfigBuilder + Destination + Session]
     B --> C{Selected source}
     C -->|TOML| D[toml::ParsedConfig]
     C -->|Lua execution| E[lua::ParsedConfig]
     C -->|OpenSSH| F[openssh::ParsedConfig]
     C -->|No file| G[Built-in defaults]
-    D --> H[Resolve destination and jump hosts]
-    E --> H
-    F --> H
-    G --> H
-    B --> H
-    H --> I[config::Resolved: Chain, algorithms, Meta]
+    D --> HT[Resolve TOML hosts and jumps]
+    E --> HL[Resolve Lua hosts and jumps]
+    F --> HO[Query OpenSSH dependency]
+    G --> HB[Resolve built-in settings]
+    HT --> I[config::Resolved: Chain, algorithms, Meta]
+    HL --> I
+    HO --> I
+    HB --> I
     I --> J[Apply final-host CLI PTY override]
     J --> K[config::Config]
     K --> L[Configure logging, known-host resource, and handler factory]
     L --> M[Connection, session, and forwarding runtime]
 ```
 
-`cli::parse()` produces `Options`; it does not open configuration files or
-establish a connection. `Options::load(self)` discovers one source, resolves its
-connection/setup settings into `Resolved`, applies the final-host CLI PTY
-override, and moves the remaining application settings into `Config`.
+`cli::parse()` produces an application-owned `Invocation`; it does not open
+configuration files or establish a connection. `Invocation::build()` adapts
+these parsed values to `ConfigBuilder` and calls its finalizer. Other users of
+the configuration crate can construct the builder directly.
 
-File selection is centralized in `Options`. Neither `Config` nor the runtime
-contains extension checks or fallback logic. Explicit `-F`, default-file
+`ConfigBuilder::new()` and `Config::builder()` create equivalent builders. Their
+defaults leave file discovery and host settings to the resolver, select
+nonverbose logging, enable stdin, use `~` as the escape prefix, configure no
+local forwards or cipher/MAC override, and leave compression preference off.
+Each setter consumes the builder and returns it. The eleven optional settings
+are `config_file`, `identities`, `proxy_jump`, `tty`, `verbose`, `stdin_null`,
+`escape_char`, `local_forwards`, `compression`, `ciphers`, and `macs`. An empty
+jump vector explicitly clears configured jumps, while `escape_char(None)`
+disables escapes.
+
+`build(self, destination: Destination, session: Session) -> Result<Config>`
+requires both the destination and session at finalization, so a builder cannot
+silently manufacture either. It discovers one source, resolves its connection
+and setup settings into `Resolved`, applies the final-host CLI PTY override,
+and moves the remaining application settings into `Config`.
+
+File selection is centralized in `ConfigBuilder`. Its finalizer creates a
+private `ResolveOptions` borrowing the destination and any supplied identity
+and jump lists. Source adapters receive that view without owning the builder
+or session settings. Neither `Config` nor the runtime contains extension checks
+or fallback logic. Explicit `-F`, default-file
 precedence, and `-F none` use the same resolution endpoint. Failures from a
 selected file retain the filename and underlying error; they do not trigger
-fallback to another format.
+fallback to another format. The crate returns its own `Error` and `Result`
+types, with no dependency on `anyhow`. `Error` is a public, non-exhaustive enum
+covering IO, format parsing/execution, path and algorithm validation, and policy
+lookup failures; `Result<T>` aliases `std::result::Result<T, Error>`. `Error::log_level()` retains a successfully
+parsed native filter on later validation or resolution failures, including
+TOML jump-shape validation. Reading, execution, or deserialization failures
+use the default error filter. The application converts the error at its own
+`anyhow` boundary and uses the preserved source chain for diagnostics.
 
-Each format has an explicit construction step and a separate
-`resolve(&Options) -> Result<Resolved>` step:
+Each format has an explicit construction step and independently implements the
+private `ResolveConfig` trait's
+`resolve(&self, &ResolveOptions<'_>) -> Result<Resolved>` operation. A generic
+builder helper adds selected-file error context using static dispatch; there
+are no trait objects or common native parsing/resolution implementation.
+
+Construction remains format-specific:
 
 - TOML: `ParsedConfig::parse(&str)` deserializes the text with `toml` and Serde.
 - Lua: `ParsedConfig::execute(&str, &Path)` receives the source text and selected
   file path, evaluates a Lua 5.4 chunk, and deserializes its returned value with
   `mlua`'s Serde deserializer.
-- OpenSSH: `ParsedConfig::parse(File, &Options)` seeds CLI overrides, then invokes
+- OpenSSH: `ParsedConfig::parse(File, &ResolveOptions<'_>)` seeds CLI overrides, then invokes
   the dependency's parser with `ALLOW_UNSUPPORTED_FIELDS`.
 
 For OpenSSH, the override prefix is part of the parsed result. Parse and resolve
@@ -129,23 +180,27 @@ or appending a newline; callers choose how to display or use the result.
 
 ## Resolution and validation boundaries
 
-Native deserialization handles field names, aliases, unknown fields, scalar
-types, and string/list shapes. `formats::values` supplies the small Serde
-visitors for borrowed/owned text, strings or arrays, boolean strings, PTY modes,
-and integer/string ports. `formats::jumps` distinguishes scalar names, inline
-host records, and sequences, including an outer empty sequence used to clear
-jumps. Neither module implements a TOML or Lua syntax parser.
+Each native format deserializes field names, aliases, unknown fields, scalar
+types, and string/list shapes through its own schema. `toml::values` handles
+borrowed/owned TOML text and its scalar visitors; `lua::values` handles owned
+Lua strings and its scalar visitors. Each format also owns its jump
+representation and deserializer. Lua distinguishes names, inline records, and
+sequences, including an outer empty sequence that clears jumps; TOML accepts
+names only. These visitors consume Serde input rather than parsing the source
+language syntax themselves.
 
-Native resolution uses the requested alias for an exact host lookup. It merges
-the selected host with defaults and CLI overrides, resolves paths and the
-authentication-agent socket, and constructs the dependency's `Host`, `Auth`,
+Each native resolver currently uses the requested alias for an exact host
+lookup, merges the selected host with defaults and CLI overrides, resolves its
+own paths and agent setting, and constructs the dependency's `Host`, `Auth`,
 and `Chain` values directly. The dependency's configuration types are the
-connection API boundary, not intermediates for translating between file
-formats. A borrowed `HostRef` selects either a named `Target` or an inline
-`HostFields` record. Named targets perform the exact alias lookup; inline
-records bypass that lookup and require an effective `host_name` from themselves
-or defaults. Both use the same host-resolution and jump-traversal rules; see
-the configuration reference for ordering and inheritance details.
+connection API boundary, not intermediates for translating between formats.
+Lua's resolver separately handles named targets and inline records: an inline
+record bypasses alias lookup and needs an effective `host_name` of its own or
+from defaults. TOML resolves named targets and contains no Lua inline-host
+model. See the configuration reference for each format's current ordering and
+inheritance behavior. The root `defaults` module constructs an owned `Chain`,
+`Auth`, and `Meta` for the no-file path independently of either native profile
+type.
 
 The resolver compiles each effective native algorithm list into typed transport
 names. Per-host values override defaults; list modifiers use raw transport
@@ -155,9 +210,9 @@ both and identifies each actual `&Host` by reference identity, so two named or
 inline hosts with the same network destination can still have different
 policies. It neither clones hosts nor uses destination names as policy keys.
 
-`Meta` is invocation setup, outside the host/default schema. Native metadata
-paths resolve under the selected format's path mode. Its optional log directives
-are parsed with `tracing_subscriber::EnvFilter` and combined with the CLI
+`Meta` is invocation setup, outside each format's host/default schema. Metadata
+paths resolve under that format's own rules. Optional log directives use
+`LogLevel::try_from_filter()`, backed by `tracing_subscriber::EnvFilter`, and combine with the CLI
 verbosity flag when configuring the tracing subscriber. An omitted filter means
 error-only logging without `-v` and debug logging with `-v`; an explicit empty
 string means error-only logging in either mode. Non-verbose mode additionally
@@ -165,12 +220,16 @@ caps any filter at errors. OpenSSH resolution and the no-file path produce
 default metadata and omit explicit algorithm policies; the OpenSSH adapter does
 not extract new directives for these features.
 
-`formats::paths` implements the native path policy. TOML selects `PathMode::Expand`;
-Lua selects `PathMode::Literal`. This choice belongs to the source adapter and
-does not survive into `Config`. Literal mode also disables implicit agent
-environment lookup: an omitted Lua `identity_agent` resolves to no agent unless
-the defaults record supplies an explicit value. Environment reads must occur in
-Lua itself, including for default values.
+`toml::paths` implements TOML's tilde expansion, agent environment selectors,
+and absolute-path validation. `lua::paths` independently validates literal
+absolute paths and never performs implicit agent environment lookup. An omitted
+Lua `identity_agent` resolves to no agent unless defaults supply an explicit
+value. Environment reads must occur in Lua itself, including for defaults.
+There is no shared path-mode switch or native path resolver, and these
+source-specific policies do not survive into `Config`. CLI identity overrides
+retain library-compatible expansion behavior implemented separately by TOML,
+Lua, and the no-file resolver. This duplication keeps their source-resolution
+paths independent.
 
 Literal relative paths are rejected in every native profile, including nested
 inline jump records. TOML expands selected tilde paths and agent environment
@@ -192,8 +251,12 @@ compression preferences into the dependency's `Preferred`. Unknown CLI cipher
 or MAC names fail before connection establishment. These are application
 settings, independent of the file format used for host settings.
 
-`config::algorithms` validates native names and compiles replacement, append,
-remove, and prepend operations. It stores KEX methods separately from protocol
+`config::algorithms` validates transport algorithm names and compiles
+replacement, append, remove, and prepend operations. Its private `AlgorithmList`
+trait lets each format's string-list type supply its own iteration; default
+trait methods invoke the transport compiler. It shares transport-policy
+operations without sharing source-language parsing, scalar/list types, or host
+resolution. It stores KEX methods separately from protocol
 extension signals. Applying a policy preserves the default signals while
 replacing methods. Host-key policies distinguish certificates from plain keys
 and reject an order the transport cannot represent. An explicit host-key
@@ -214,8 +277,8 @@ stays alive through resolution and is dropped before connection establishment.
 Resolved destination names and authentication paths are owned by the library
 connection configuration, so they do not retain the file's text buffer.
 
-Lua deserialization produces `Profiles<'static>` with owned strings. The Lua VM
-is dropped before `execute` returns. Resolving a Lua `ParsedConfig` neither
+Lua deserialization produces its own `Profiles` with owned strings and no
+source-text lifetime. The Lua VM is dropped before `execute()` returns. Resolving a Lua `ParsedConfig` neither
 reruns the chunk nor keeps Lua resources alive. The loader is synchronous and
 uses no Lua async runtime or shared Lua state.
 
@@ -234,31 +297,55 @@ resolved `Config`.
 
 ```text
 src/
-    logging.rs         Tracing initialization, level policy, and stderr format
-    known_hosts.rs     Known-host setup resource and selected database path
-    config/
-        mod.rs         Options, Resolved, Config, Meta, and file loading
-        algorithms.rs  Typed per-host policies and algorithm-list operations
-        toml.rs        TOML ParsedConfig
-        openssh.rs     OpenSSH ParsedConfig and CLI override adapter
+    cli.rs                 Argument parsing and the builder adapter
+    logging.rs             Tracing initialization and stderr formatting
+    known_hosts.rs         Known-host setup resource and selected database path
+    handler.rs             Runtime policy application and host-key checks
+crates/openrussh-cli-config/
+    Cargo.toml             Configuration-only dependencies
+    src/
+        lib.rs             Config, Meta, public model types, and private resolution inputs
+        builder.rs         ConfigBuilder, file discovery, and static source dispatch
+        defaults.rs        Independent no-file connection/authentication defaults
+        error.rs           Typed configuration errors and source context
+        tests.rs           Cross-format loading, builder, and resolution tests
+        algorithms.rs      Typed policies, AlgorithmList, and transport-list operations
+        openssh.rs         OpenSSH ParsedConfig and CLI override adapter
+        toml/
+            mod.rs         TOML ParsedConfig
+            profiles.rs    TOML profiles, metadata, and named-host resolution
+            jumps.rs       TOML named jumps and shape validation
+            values.rs      Borrowed TOML text and scalar/list visitors
+            paths.rs       TOML expansion, agent selectors, and path validation
+            resolution_tests.rs  TOML resolution tests
         lua/
-            mod.rs     Lua ParsedConfig and source-path handling
-            cli.rs     Built-in Lua cli module
-        formats/
-            mod.rs     Native profiles, metadata, and host/jump resolution
-            jumps.rs   Named/inline jump representations and Serde visitors
-            values.rs  Native Serde value representations and visitors
-            paths.rs   Expansion, literal paths, and agent selection
+            mod.rs         Lua ParsedConfig and source-path handling
+            profiles.rs    Owned Lua profiles, metadata, and host/jump resolution
+            jumps.rs       Lua named/inline jumps and sequence visitors
+            values.rs      Owned Lua strings and scalar/list visitors
+            paths.rs       Literal Lua paths and explicit agent settings
+            cli.rs         Built-in Lua cli module
+            tests.rs       Lua execution and resolution tests
+    tests/builder.rs       External public-builder API tests
+crates/openrussh-cli-terminal/
+    Cargo.toml             Terminal-only dependencies and member feature selection
+    src/lib.rs             Unix signal, terminal, size, suspension, and input APIs
 ```
 
-Changes to one parser should stay within its adapter unless the shared native
-schema or application semantics change. Changes to native host semantics belong
-in `formats`; they must not silently change OpenSSH behavior. New application
-settings belong in `Options`/`Config`, with format fields added only when the
-configuration specification calls for them.
+Format-specific schema and resolution changes belong in that format's module.
+A TOML change does not imply a Lua change, and vice versa; neither should
+silently change OpenSSH behavior. Common final configuration and transport
+policies remain separate from all source representations. The private
+`ResolveConfig` trait shares only the source-resolution operation and output
+contract; `AlgorithmList` shares only transport-list operations. New application
+settings cross the public `ConfigBuilder`/`Config` boundary, with format fields
+added only when the configuration specification calls for them.
 
-Inline tests cover cross-format equivalence, parsing once and resolving multiple
-hosts, source/VM lifetimes, defaults, overrides, value validation, and path
-policies. The separate OpenSSH-backed integration suites verify selection and
-resolution through the built CLI. See [Development](development.md) for commands
-and fixture ownership.
+Format-local tests cover parsing once and resolving multiple hosts, source/VM
+lifetimes, defaults, overrides, value validation, and path rules. Selected
+cross-format fixtures record equivalent current outcomes for overlapping
+features without imposing shared future semantics. External builder tests
+exercise the public crate API. README-example and handler-boundary regressions
+remain in the application, while the separate OpenSSH-backed integration suites
+verify selection and resolution through the built CLI. See
+[Development](development.md) for commands and fixture ownership.

@@ -1,7 +1,5 @@
-use super::{Options, Resolved};
+use super::{Error, ResolveConfig, ResolveOptions, Resolved, Result};
 use openrussh_client::ssh2_config::{ParseRule, SshConfig};
-
-use anyhow::{Context as _, Result};
 
 use std::fs::File;
 use std::io::BufReader;
@@ -11,7 +9,7 @@ pub(super) struct ParsedConfig {
 }
 
 impl ParsedConfig {
-    pub(super) fn parse(f: File, options: &Options) -> Result<Self> {
+    pub(super) fn parse(f: File, options: &ResolveOptions<'_>) -> Result<Self> {
         let config = {
             let mut rdr = BufReader::new(f);
             overrides(options).parse(&mut rdr, ParseRule::ALLOW_UNSUPPORTED_FIELDS)?
@@ -19,8 +17,10 @@ impl ParsedConfig {
 
         Ok(Self { config })
     }
+}
 
-    pub(super) fn resolve(&self, options: &Options) -> Result<Resolved> {
+impl ResolveConfig for ParsedConfig {
+    fn resolve(&self, options: &ResolveOptions<'_>) -> Result<Resolved> {
         use openrussh_client::config::Target;
 
         Target {
@@ -30,11 +30,11 @@ impl ParsedConfig {
         }
         .query(&self.config)
         .map(Resolved::from)
-        .context("Could not resolve the SSH connection settings")
+        .map_err(Error::OpenSshResolve)
     }
 }
 
-fn overrides(options: &Options) -> SshConfig {
+fn overrides(options: &ResolveOptions<'_>) -> SshConfig {
     use openrussh_client::ssh2_config::{DefaultAlgorithms, Host, HostClause, HostParams};
 
     if options.destination.user.is_some()
@@ -45,8 +45,8 @@ fn overrides(options: &Options) -> SshConfig {
         let mut params = HostParams::new(&DefaultAlgorithms::empty());
         params.user.clone_from(&options.destination.user);
         params.port = options.destination.port;
-        params.identity_file.clone_from(&options.identities);
-        params.proxy_jump.clone_from(&options.proxy_jump);
+        params.identity_file = options.identities.map(<[std::path::PathBuf]>::to_vec);
+        params.proxy_jump = options.proxy_jump.map(<[String]>::to_vec);
         SshConfig::from_hosts(vec![Host::new(
             vec![HostClause::new(options.destination.host.clone(), false)],
             params,

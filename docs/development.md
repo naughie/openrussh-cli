@@ -4,38 +4,89 @@ This document covers implementation boundaries, repository conventions, validati
 
 ## Application boundaries
 
-The Cargo package is `openrussh-cli`, the library crate is `openrussh_cli`, and the executable is `ssh`. `main.rs` creates the Tokio runtime and calls `pub async fn main_impl()`. The library keeps implementation modules private and owns error reporting, exit status, and resource cleanup before the final process exit.
+The root Cargo package is `openrussh-cli`, its library crate is `openrussh_cli`, and the executable is `ssh`. `main.rs` creates the Tokio runtime and calls `pub async fn main_impl()`. The application keeps implementation modules private and owns error reporting, exit status, and resource cleanup before the final process exit.
+
+The root manifest also defines a workspace containing the application and
+`crates/*`. The configuration library lives in
+`crates/openrussh-cli-config`, with the Rust crate name
+`openrussh_cli_config`. Unix terminal resources live in
+`crates/openrussh-cli-terminal`, with the Rust crate name
+`openrussh_cli_terminal`. All three packages are workspace default members.
+The application uses path dependencies on both libraries and retains its
+remaining `src/` modules.
 
 | Module | Responsibility |
 | --- | --- |
-| `cli` | Parse arguments, validate CLI syntax, and construct configuration inputs. |
-| `config` | Resolve format-specific configuration and CLI inputs into the application's format-independent configuration. |
+| `cli` | Parse arguments into an `Invocation`, validate CLI syntax, and adapt its values to `ConfigBuilder`. |
+| `openrussh_cli_config` | Resolve format-specific configuration and supplied inputs into the application's format-independent configuration. |
 | `logging` | Initialize tracing, apply native filter directives and the CLI verbosity limit, and format client diagnostics for stderr. |
 | `known_hosts` | Load the selected trust database once and retain its save path as a setup resource. |
 | `handler` | Apply per-host transport policies and integrate the library's known-host checks with local trust prompts and persistence. |
 | `session` | Select the library session operation and pump channel input/output, escapes, and terminal events. |
-| `terminal` | Own Unix signal streams, terminal-mode guards, input flags, and asynchronous stdin reading. |
+| `openrussh_cli_terminal` | Own Unix signal streams, terminal-mode guards, input flags, size queries, suspension, and asynchronous input reading. |
 | `forwarding` | Bind local listeners, supervise accepted-stream tasks, and release listener resources. |
 | `lib` | Coordinate connection, session, forwarding, shutdown, and final status. |
 
 `openrussh-client` owns SSH transport, negotiation, user authentication, jump connections, and supported channel operations. Use its `Connection` methods for shells and local forwarding, and its safe `process::cmd::exec()` helper for the CLI's remote command string. That helper is also the implementation behind `Connection::exec()` and retains the connection's PTY policy when passed `conn.request_tty()`. The application's direct-channel use for `-W` adapts standard streams to a library `Child`; it does not justify duplicating helpers that already accept the required resource.
 
-The CLI joins all command arguments after the destination with single ASCII spaces, without adding quotes or escaping, and constructs `Session::Exec(String)` for a nonempty result. An empty result selects `Session::Shell`. Session execution passes the command string directly to the library helper as one SSH `exec` command. The remote user's shell interprets its operators, quotes, and expansions. Preserve these OpenSSH CLI semantics across the parser, domain configuration, and session boundaries; do not preserve local argument boundaries through extra quoting or an explicit shell wrapper.
+The CLI joins all command arguments after the destination with single ASCII spaces, without adding quotes or escaping, and constructs `Session::Exec { command }` for a nonempty result. An empty result selects `Session::Shell`. Session execution passes the command string directly to the library helper as one SSH `exec` command. The remote user's shell interprets its operators, quotes, and expansions. Preserve these OpenSSH CLI semantics across the parser, domain configuration, and session boundaries; do not preserve local argument boundaries through extra quoting or an explicit shell wrapper.
 
 `MyMakeHandler` and `MyHandler` are the application integration types. The outer connection setup instantiates them; session, forwarding, and lifecycle code remains generic over the dependency's handler trait. Keep this boundary when introducing reusable operations. Application configuration is a concrete domain type, distinct from both parser output and `openrussh_client::config` intermediate types.
 
-Each format's `ParsedConfig` resolves to `config::Resolved`, containing the
-connection chain, typed per-host algorithm policies, and setup metadata.
-`Options::load` combines that result with CLI application settings into
-`Config`. Setup metadata remains outside host/default records and is used when
+Each format's private `ParsedConfig` resolves to the configuration crate's
+private `Resolved`, containing the connection chain, typed per-host algorithm
+policies, and setup metadata. `ConfigBuilder::new()` or `Config::builder()`
+starts construction; consuming fluent setters configure optional values.
+`build(destination, session)` requires both invocation-specific values and
+combines the resolved source with the supplied application settings into
+`Config`. `cli::parse()` remains free of configuration-file IO; the parsed
+`Invocation::build()` performs the builder adaptation and finalization.
+Setup metadata remains outside host/default records and is used when
 initializing resources; handlers receive the known-host resource and its
 save path rather than `Meta`. Policy lookup uses resolved `Host` reference
 identity, preserving distinct policies even for hosts with identical network
 destinations.
 
+TOML and Lua own independent schemas and resolvers under their respective
+modules. TOML profiles can borrow their source text; Lua profiles use owned
+strings independent of the VM. Each format owns its host and metadata records,
+scalar/list visitors, jump representation, path handling, and host resolution.
+The root `defaults` module resolves the no-file path directly into owned
+connection/authentication values without either profile type. TOML, Lua, and
+this no-file resolver each implement CLI identity expansion independently.
+Current overlap in observable behavior is documented and tested with selected
+fixtures; it does not require future schema or semantic changes to affect both
+formats.
+
+The private `ResolveConfig` trait defines the resolution operation implemented
+separately by all three `ParsedConfig` types. Builder loading uses a generic
+helper with static dispatch to add selected-file error context. The private
+`algorithms::AlgorithmList` trait shares transport-list compilation through
+format-owned string iteration. Neither trait provides a shared native schema,
+value/path parser, or host/jump resolver, and neither uses trait objects.
+
 ## Dependencies and build contract
 
 The project uses Rust edition 2024 and major/minor dependency requirements in manifests. The lockfile records the resolved dependency versions; the current SSH implementation is `openrussh-client` 0.4.6. Its enabled features select AWS-LC cryptography, RSA support, compression, the OpenSSH config parser, known hosts, process operations, and local TCP/Unix-domain forwarding. Disabling an unused feature is preferable to retaining an unnecessary implementation dependency.
+
+Shared versions for `nix`, `openrussh-client`, `tokio`, `tracing-subscriber`,
+and `tempfile` live in `[workspace.dependencies]`. Each member selects the
+features it needs. The configuration package owns `mlua`, `serde`, `toml`, and
+`whoami`; these are not direct application dependencies. Configuration uses
+`nix` only for hostname lookup and `tracing-subscriber` for filter parsing.
+The terminal package owns `terminal_size` and selects the `nix` filesystem,
+process, signal, and terminal features. Its production Tokio features provide
+files, asynchronous IO/readiness, signal streams, and selection macros;
+terminal tests additionally enable the runtime and time utilities.
+
+The application has no direct `nix` dependency. It uses `libc` for signal and
+OS error constants and `socket2` for IPv6 listener options, while terminal
+operations go through `openrussh_cli_terminal`. The application enables the SSH
+dependency's process, forwarding, and known-host features and its own logging
+formatting features. The application and configuration packages both select
+the transport crypto backend, RSA, and compression support. The configuration
+library needs the compression constants when compiling `Config::preferred()`
+and builds independently.
 
 `mlua` enables `vendored`, `lua54`, `serde`, and `error-send`, with default features disabled. Lua 5.4 is built from bundled source and linked into the executable, so release users do not install Lua separately. Configuration is evaluated synchronously once; the Lua async feature is deliberately absent. `error-send` allows errors to cross the application's error boundary without making the Lua state an asynchronous shared service. Serde performs native configuration deserialization, with `toml` handling TOML syntax. Do not introduce a manual TOML or Lua configuration parser.
 
@@ -66,6 +117,7 @@ Apply these conventions during implementation and review:
 
 - Divide modules and types by semantic responsibility and processing stage. A module with child files uses `foo/mod.rs` and `foo/bar.rs`, not `foo.rs` alongside `foo/bar.rs`.
 - Preserve distinct concepts as distinct concrete types or enum variants. Do not convert unrelated parser output into an intermediate type solely to reuse an implementation path.
+- Keep TOML and Lua schemas, value/jump visitors, path rules, and host resolution inside their respective modules. Share the resolved application types and transport-policy operations without introducing a common native source model or path-mode switch. Evaluate a format change against that format's documented contract.
 - Borrow where ownership is unnecessary. Move or clone at task boundaries; use `Arc` to express task sharing or avoid copying a large value.
 - Prefer generics or enums to trait objects, except where a dependency requires dynamic dispatch. Keep helper visibility and import scope narrow; import traits anonymously unless their names are required for bounds or implementations.
 - Allocate only when a value is needed. Retain optional collections as `Option<Vec<_>>` where absence is meaningful, avoid materializing strings for formatting alone, and review each clone, collection, and task spawn for a concrete purpose.
@@ -74,20 +126,22 @@ Apply these conventions during implementation and review:
 - Use blank lines to separate semantic stages and related definitions. Keep imports, names, and type paths readable without mechanically grouping everything or spelling every type as a full path.
 - Consider LLVM optimization and allocation/context-switch costs, without CPU-specific or assembly-level optimization. Choose task spawning, async combinators, or a custom future according to ownership, cancellation, and actual cost.
 
-Errors at the application boundary use `anyhow` with short English operation/context messages. Do not suppress input, persistence, or cleanup failures merely to make a path appear successful. Likewise, do not add validation to library-owned behavior unless the application's own format or syntax requires it.
+Errors at the application boundary use `anyhow` with short English operation/context messages. The configuration crate has no `anyhow` dependency, including in its tests; it exposes its own `Error` and `Result` types. Its error source chain preserves parser, IO, and resolution causes, and `Error::log_level()` exposes a parsed native filter when later validation fails. Convert these errors into `anyhow` only in the application adapter. Do not suppress input, persistence, or cleanup failures merely to make a path appear successful. Likewise, do not add validation to library-owned behavior unless the application's own format or syntax requires it.
 
 ## Test architecture
 
-Unit tests live inside the individual implementation files. They cover application parsing, native configuration resolution, listener ownership, known-host persistence, escape state, input flags, terminal guards, and exit policy. They should exercise meaningful behavior and edge cases rather than repeat the implementation as assertions.
+Unit tests live alongside the implementation in all three workspace packages. The configuration crate owns builder, format-local resolution, and selected cross-format outcome coverage; the terminal crate owns terminal attributes, size, asynchronous input, and shared input-flag restoration tests; the application owns README-example and handler-boundary regressions. Together they cover application parsing, native configuration resolution, listener ownership, known-host persistence, escape state, input flags, terminal guards, and exit policy. They should exercise meaningful behavior and edge cases rather than repeat the implementation as assertions.
 
 Algorithm coverage should distinguish transport defaults from known-host
 preference adjustments, preserve explicit allowlists and KEX extension signals,
 and exercise named/inline jump policies independently. Known-host tests cover
 both reading and saving the selected database, including missing-file setup and
-existing locking/permission behavior. Native additions must retain the existing
-OpenSSH adapter behavior.
+existing locking/permission behavior. Each format's tests should assert its
+own outcomes directly; cross-format comparisons are regression fixtures for
+selected overlapping behavior rather than a semantic coupling requirement.
+Native additions must retain the existing OpenSSH adapter behavior.
 
-The root Cargo project and `tests/` are separate workspaces. Consequently, `cargo test` at the repository root runs inline unit tests but does not run the executable integration suites. The `tests/` workspace contains six application suites and a shared `tester` support crate:
+The root workspace and `tests/` are separate workspaces; `tests/` is explicitly excluded from the root workspace. Consequently, `cargo test` at the repository root runs unit tests for all three packages, public API tests, and doctests, but does not run the executable integration suites. The `tests/` workspace contains six application suites and a shared `tester` support crate:
 
 | Suite | Application behavior |
 | --- | --- |
@@ -111,8 +165,15 @@ Terminal restoration tests compare all relevant termios state. On macOS, their c
 Run unit tests and the real-server suites separately:
 
 ```sh
-cargo test --locked
+cargo test --locked --workspace
 ./tests/x.sh
+```
+
+To validate either library by itself, select its package:
+
+```sh
+cargo test --locked -p openrussh-cli-config
+cargo test --locked -p openrussh-cli-terminal
 ```
 
 Docker is required for the integration suites. The runner builds and runs all suites by default, reports failed suites, and works with or without a controlling terminal. Select a suite or separate image construction from execution when iterating:
@@ -127,7 +188,7 @@ Formatting and lint checks cover both workspaces:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --manifest-path tests/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path tests/Cargo.toml --workspace --all-targets -- -D warnings
 ```
@@ -138,7 +199,7 @@ Select additional platform or artifact checks when a change affects termios, pla
 
 `dist-workspace.toml` configures cargo-dist 0.32.0, GitHub CI, archive artifacts without generated installers, and the release target matrix. The `dist` Cargo profile inherits `release`, uses thin LTO, and strips symbols. The Apple Silicon runner override is `macos-15`; keep runner selection in the dist configuration rather than relying on a retired default label.
 
-`.github/workflows/release.yml` runs on pull requests and version-like tags. Its Ubuntu planning job installs stable Rust, runs `cargo +stable test --locked`, and runs `./tests/x.sh` before invoking dist planning or release creation. Artifact build jobs depend on that job. The publishing job also explicitly requires successful planning, so the test gate cannot be bypassed through skipped artifact jobs. The default pull-request path plans the release without building all release artifacts unless dist's PR run mode requests uploads.
+`.github/workflows/release.yml` runs on pull requests and version-like tags. Its Ubuntu planning job installs stable Rust, runs `cargo +stable test --locked` for all default workspace members, and runs `./tests/x.sh` before invoking dist planning or release creation. Artifact build jobs depend on that job. The publishing job also explicitly requires successful planning, so the test gate cannot be bypassed through skipped artifact jobs. The default pull-request path plans the release without building all release artifacts unless dist's PR run mode requests uploads.
 
 The test gate currently executes on Linux. macOS jobs build artifacts; they do not run the unit or integration suites. Preserve this distinction when interpreting a successful workflow.
 
