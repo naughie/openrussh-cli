@@ -557,6 +557,8 @@ nested parent directories are not created.
 Directory creation is attempted only on the first call. If it fails, the failure
 is remembered and every later call also returns `nil`. Requiring `cli` without
 calling `temp_file` creates no temporary directory or temporary-resource state.
+Calls from finalizers during VM shutdown return `nil` once the owning Lua
+handle is no longer available.
 
 The directory remains alive after the Lua VM is destroyed, while the resolved
 configuration and SSH session use its files. It is removed automatically after

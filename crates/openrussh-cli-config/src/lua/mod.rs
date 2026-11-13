@@ -29,6 +29,15 @@ pub(super) struct ParsedConfig {
 
 impl ParsedConfig {
     pub(super) fn execute(text: &str, path: &Path) -> Result<Self> {
+        let package_path = std::env::var_os("SSH_LUA_PACKAGE_PATH");
+        Self::execute_with_package_path(text, path, package_path.as_deref())
+    }
+
+    fn execute_with_package_path(
+        text: &str,
+        path: &Path,
+        package_path: Option<&OsStr>,
+    ) -> Result<Self> {
         let path = path
             .canonicalize()
             .map_err(|source| Error::CanonicalizeLua {
@@ -38,15 +47,14 @@ impl ParsedConfig {
         let (profiles, temp_dir) = {
             let lua = Lua::new();
             let name = format!("@{}", path.display());
-            let package_path = std::env::var_os("SSH_LUA_PACKAGE_PATH");
-            add_module_path(&lua, root_dir(&path)?, package_path.as_deref())?;
+            add_module_path(&lua, root_dir(&path)?, package_path)?;
             cli::preload(&lua, path)?;
             let value = lua.load(text).set_name(name).eval::<Value>()?;
             let options = DeserializeOptions::new()
                 .encode_empty_tables_as_array(true)
                 .detect_mixed_tables(true);
             let profiles = Profiles::deserialize(Deserializer::new_with_options(value, options))?;
-            (profiles, temp::take(&lua))
+            (profiles, temp::owner(&lua))
         };
 
         Ok(Self { profiles, temp_dir })
@@ -112,7 +120,7 @@ fn add_module_path(lua: &Lua, root: &Path, configured: Option<&OsStr>) -> mlua::
 #[cfg(test)]
 pub(super) fn execute(text: &str) -> Result<ParsedConfig> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lua/mod.rs");
-    ParsedConfig::execute(text, &path)
+    ParsedConfig::execute_with_package_path(text, &path, None)
 }
 
 #[cfg(test)]

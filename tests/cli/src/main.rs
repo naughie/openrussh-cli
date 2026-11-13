@@ -595,6 +595,41 @@ return {{hosts = {{target = {{
     );
 
     rt.register(
+        "Lua temp_file is unavailable once the VM owner has been destroyed",
+        async || {
+            let dir = t::tempdir()?;
+            let manifest = dir.path().join("finalizer-result");
+            let client = t::Client::lua(&format!(
+                r#"
+local cli = require('cli')
+local identity = assert(cli.temp_file('identity'))
+local source = assert(io.open('/home/alice/.ssh/id_ed25519', 'r'))
+local key = assert(source:read('*a'))
+assert(source:close())
+local file = assert(io.open(identity, 'w'))
+assert(file:write(key))
+assert(file:close())
+_G.finalizer = setmetatable({{}}, {{__gc = function()
+    local result = assert(io.open('{manifest}', 'w'))
+    assert(result:write(tostring(cli.temp_file('identity')), '\n',
+        tostring(cli.temp_file())))
+    assert(result:close())
+end}})
+return {{hosts = {{target = {{
+    host_name = '127.0.0.1', user = 'bob', port = 2222,
+    identity_file = identity, request_tty = false,
+}}}}}}
+"#,
+                manifest = manifest.to_str().unwrap(),
+            ))?;
+            let output = client.run(&["target", "printf finalizer"], b"").await?;
+            t::expect(&output, 0, b"finalizer", b"");
+            assert_eq!(std::fs::read_to_string(manifest)?, "nil\nnil");
+            Ok(())
+        },
+    );
+
+    rt.register(
         "Lua temporary files are removed after configuration and connection failures",
         async || {
             use std::path::PathBuf;

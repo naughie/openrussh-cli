@@ -36,7 +36,7 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
         lookup(lua, || nix::unistd::gethostname().ok())?,
     )?;
     module.set("debug", lua.create_function(debug)?)?;
-    module.set("temp_file", lua.create_function(super::temp::file)?)?;
+    module.set("temp_file", super::temp::create_function(lua)?)?;
 
     // Constants stay outside the module so assignments to them invoke __newindex.
     let metatable = lua.create_table_with_capacity(0, 3)?;

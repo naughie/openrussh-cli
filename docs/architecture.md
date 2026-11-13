@@ -193,11 +193,14 @@ or appending a newline; callers choose how to display or use the result.
 
 The `temp_file(fname)` helper returns a path within one lazily created
 `tempfile::TempDir`, without creating a file. Its first call registers
-`Option<Arc<TempDir>>` in Lua application data: `Some` owns the private directory,
-and `None` remembers a creation failure. Later calls read this state without
-replacing it. An omitted filename is random; a supplied filename must remain
-inside the temporary directory. `Builder::permissions` sets mode `0700` when
+a private `State` in Lua application data: `Ready` owns the private directory,
+and `Unavailable` remembers a creation failure. An absent `State` means the helper has
+not been called. Later calls read this state without replacing it. An omitted
+filename is random; a supplied filename must remain inside the temporary
+directory. `Builder::permissions` sets mode `0700` when
 creating the directory, before it can contain caller-written secrets.
+The callback holds a weak Lua handle, so calls during `lua_close`, after the
+last owning handle has been destroyed, return `nil` without accessing app data.
 
 ## Resolution and validation boundaries
 
@@ -320,15 +323,17 @@ source-text lifetime. The Lua VM is dropped before `execute()` returns. Resolvin
 reruns the chunk nor keeps Lua resources alive. The loader is synchronous and
 uses no Lua async runtime or shared Lua state.
 
-After successful Lua execution and deserialization, the adapter removes any
-temporary-directory owner from application data and moves it into `ParsedConfig`.
+After successful Lua execution and deserialization, the adapter clones any
+temporary-directory owner from application data into `ParsedConfig`. The VM keeps
+its state until it is destroyed, so garbage-collection finalizers cannot reset
+the helper's directory or cached creation failure.
 Each resolution clones its optional `Arc` into `Resolved`; loading moves that
 owner into `ConnectionConfig`. The owner follows the connection settings even
 when they are moved out of `Config`, keeping files available through
 authentication, the session, and disconnect. Ordinary Rust ownership and scopes
-remove the directory when the last owner ends. Execution, deserialization, resolution, and connection
-errors also release their owners through the same scopes; cleanup needs no
-explicit `drop()` calls.
+remove the directory when the last owner ends. Execution, deserialization,
+resolution, and connection errors also release their owners through the same
+scopes; cleanup needs no explicit `drop()` calls.
 
 OpenSSH, TOML, and built-in defaults carry inline `None` for this resource and
 perform no additional heap allocation for temporary-file support. Lua also

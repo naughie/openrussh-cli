@@ -1,4 +1,4 @@
-use mlua::{Lua, Result, Value};
+use mlua::{Function, Lua, Result, Value};
 use tempfile::TempDir;
 
 use std::ffi::OsString;
@@ -7,21 +7,39 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-pub(super) fn file(lua: &Lua, name: Value) -> Result<Option<OsString>> {
-    // Absent means unused; a stored None caches the first creation failure.
-    let initialized = lua.app_data_ref::<Option<Arc<TempDir>>>().is_some();
+enum State {
+    Ready(Arc<TempDir>),
+    Unavailable,
+}
+
+pub(super) fn create_function(lua: &Lua) -> Result<Function> {
+    let weak = lua.weak();
+    lua.create_function(move |_, name| {
+        // lua_close can run finalizers after the last owning Lua handle is gone.
+        let Some(lua) = weak.try_upgrade() else {
+            return Ok(None);
+        };
+        path(&lua, name)
+    })
+}
+
+fn path(lua: &Lua, name: Value) -> Result<Option<OsString>> {
+    // Absence means unused; Unavailable caches the first creation failure.
+    let initialized = lua.app_data_ref::<State>().is_some();
     if !initialized {
-        let directory = tempfile::Builder::new()
+        let state = match tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
-            .ok()
-            .map(Arc::new);
-        lua.set_app_data(directory);
+        {
+            Ok(directory) => State::Ready(Arc::new(directory)),
+            Err(_) => State::Unavailable,
+        };
+        lua.set_app_data(state);
     }
     let state = lua
-        .app_data_ref::<Option<Arc<TempDir>>>()
+        .app_data_ref::<State>()
         .expect("temporary directory state was initialized");
-    let Some(directory) = state.as_ref() else {
+    let State::Ready(directory) = &*state else {
         return Ok(None);
     };
 
@@ -32,7 +50,7 @@ pub(super) fn file(lua: &Lua, name: Value) -> Result<Option<OsString>> {
         Value::String(name) => {
             let bytes = name.as_bytes();
             let relative = Path::new(std::ffi::OsStr::from_bytes(&bytes));
-            if !contained_file(relative) {
+            if !is_contained_path(relative) {
                 return Ok(None);
             }
             directory.path().join(relative)
@@ -42,11 +60,16 @@ pub(super) fn file(lua: &Lua, name: Value) -> Result<Option<OsString>> {
     Ok(Some(path.into_os_string()))
 }
 
-pub(super) fn take(lua: &Lua) -> Option<Arc<TempDir>> {
-    lua.remove_app_data::<Option<Arc<TempDir>>>().flatten()
+pub(super) fn owner(lua: &Lua) -> Option<Arc<TempDir>> {
+    // Finalizers may still call the helper while Lua is dropping. Keep its
+    // initialized state in place until the VM itself releases it.
+    match &*lua.app_data_ref::<State>()? {
+        State::Ready(directory) => Some(Arc::clone(directory)),
+        State::Unavailable => None,
+    }
 }
 
-fn contained_file(path: &Path) -> bool {
+fn is_contained_path(path: &Path) -> bool {
     if path.as_os_str().as_encoded_bytes().contains(&0) {
         return false;
     }
@@ -79,8 +102,8 @@ mod tests {
         lua.load("local cli = require('cli'); assert(type(cli.temp_file) == 'function')")
             .exec()?;
 
-        assert!(lua.app_data_ref::<Option<Arc<TempDir>>>().is_none());
-        assert!(take(&lua).is_none());
+        assert!(lua.app_data_ref::<State>().is_none());
+        assert!(owner(&lua).is_none());
         Ok(())
     }
 
@@ -145,15 +168,16 @@ assert(cli.temp_file({}) == nil)
     #[test]
     fn a_cached_creation_failure_stays_nil() -> Result<()> {
         let lua = Lua::new();
-        lua.set_app_data::<Option<Arc<TempDir>>>(None);
+        lua.set_app_data(State::Unavailable);
 
-        assert!(file(&lua, Value::Nil)?.is_none());
-        assert!(file(&lua, Value::String(lua.create_string("key")?))?.is_none());
-        assert!(
-            lua.app_data_ref::<Option<Arc<TempDir>>>()
-                .unwrap()
-                .is_none()
-        );
+        assert!(owner(&lua).is_none());
+
+        assert!(path(&lua, Value::Nil)?.is_none());
+        assert!(path(&lua, Value::String(lua.create_string("key")?))?.is_none());
+        assert!(matches!(
+            &*lua.app_data_ref::<State>().unwrap(),
+            State::Unavailable
+        ));
         Ok(())
     }
 }

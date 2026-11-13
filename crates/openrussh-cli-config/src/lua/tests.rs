@@ -19,7 +19,8 @@ fn source_paths_are_canonical_and_outlive_the_lua_state() -> Result<()> {
     std::fs::write(&path, &source)?;
     symlink(&path, dir.path().join("alias.lua"))?;
     let canonical = path.canonicalize()?;
-    let parsed = ParsedConfig::execute(&source, &real.join("../alias.lua"))?;
+    let parsed =
+        ParsedConfig::execute_with_package_path(&source, &real.join("../alias.lua"), None)?;
     drop(source);
     let host = parsed.resolve(&options("sample").options())?.chain.target;
 
@@ -67,6 +68,29 @@ return {hosts = {sample = {identity_file = path}}}
     }
     assert!(!path.exists());
     assert!(!directory.exists());
+    Ok(())
+}
+
+#[test]
+fn temporary_files_keep_their_directory_during_vm_cleanup() -> Result<()> {
+    let parsed = execute(
+        r#"
+collectgarbage('stop')
+local cli = require('cli')
+local identity = assert(cli.temp_file('identity'))
+local finalizer = setmetatable({}, {__gc = function()
+    local path = assert(cli.temp_file('identity'))
+    assert(path == identity)
+    local file = assert(io.open(path, 'w'))
+    assert(file:write('written during VM cleanup'))
+    assert(file:close())
+end})
+return {hosts = {sample = {identity_file = identity}}}
+"#,
+    )?;
+    let resolved = parsed.resolve(&options("sample").options())?;
+    let path = &resolved.chain.target.auth.identities.as_ref().unwrap()[0];
+    assert_eq!(std::fs::read_to_string(path)?, "written during VM cleanup");
     Ok(())
 }
 
@@ -121,7 +145,7 @@ return {hosts = {sample = {host_name = some_module.host_name, port = another_mod
         std::fs::write(&path, source)?;
         let link = dir.path().join(alias);
         symlink(&path, &link)?;
-        let host = ParsedConfig::execute(source, &link)?
+        let host = ParsedConfig::execute_with_package_path(source, &link, None)?
             .resolve(&options("sample").options())?
             .chain
             .target;
@@ -230,18 +254,21 @@ fn configured_module_paths_preserve_native_bytes() -> Result<()> {
 fn source_path_failures_and_lua_errors_identify_the_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("actual-config.lua");
-    let error = match ParsedConfig::execute("error('must not execute')", &path) {
-        Ok(_) => panic!("missing configuration path should fail"),
-        Err(error) => error,
-    };
+    let error =
+        match ParsedConfig::execute_with_package_path("error('must not execute')", &path, None) {
+            Ok(_) => panic!("missing configuration path should fail"),
+            Err(error) => error,
+        };
     assert!(error.to_string().contains("canonicalize"));
     assert!(error.to_string().contains(path.to_str().unwrap()));
 
     std::fs::write(&path, "error('configuration failed')")?;
-    let error = match ParsedConfig::execute("error('configuration failed')", &path) {
-        Ok(_) => panic!("Lua execution should fail"),
-        Err(error) => error,
-    };
+    let error =
+        match ParsedConfig::execute_with_package_path("error('configuration failed')", &path, None)
+        {
+            Ok(_) => panic!("Lua execution should fail"),
+            Err(error) => error,
+        };
     assert!(
         error
             .to_string()
