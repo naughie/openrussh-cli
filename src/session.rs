@@ -15,6 +15,8 @@ pub(crate) async fn run<H: Handler>(
     escape_char: Option<u8>,
     events: &mut Events,
 ) -> Result<u8> {
+    use std::os::fd::AsFd as _;
+
     if matches!(session, Session::None) {
         tracing::debug!("Entering forwarding-only session.");
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
@@ -34,9 +36,7 @@ pub(crate) async fn run<H: Handler>(
         }
     }
 
-    use std::os::fd::AsFd as _;
-
-    let tty = match conn.request_tty() {
+    let request_pty = match conn.request_tty() {
         RequestTty::Never => false,
         RequestTty::Always => true,
         RequestTty::IfTty => {
@@ -46,7 +46,7 @@ pub(crate) async fn run<H: Handler>(
         RequestTty::ForShell => matches!(session, Session::Shell),
     };
 
-    let forwarding = matches!(session, Session::Forward { .. });
+    let stdio_forwarding = matches!(session, Session::Forward { .. });
     let mut child = match session {
         Session::Shell => {
             tracing::debug!("Requesting shell.");
@@ -70,9 +70,9 @@ pub(crate) async fn run<H: Handler>(
     let stdin = std::io::stdin();
     let fd = stdin.as_fd();
 
-    let interactive = tty && !forwarding;
+    let interactive = request_pty && !stdio_forwarding;
     let term = Terminal::new(fd, interactive && !stdin_null)?;
-    tracing::debug!("Entering interactive session.");
+    tracing::debug!("Entering session.");
     {
         let (writer, reader) = child.channel();
         let input = if stdin_null {
@@ -105,16 +105,15 @@ pub(crate) async fn run<H: Handler>(
                     input_done = true;
                     mode = None;
 
-                    let close = match res {
-                        Ok(close) => close,
-                        Err(e) if input_closed(&e) => false,
+                    match res {
+                        Ok(InputEnd::Eof) => {},
+                        Ok(InputEnd::Disconnect) => {
+                            let _ = writer.channel().close().await;
+
+                            return Ok(255);
+                        }
+                        Err(e) if input_closed(&e) => {},
                         Err(e) => return Err(e),
-                    };
-
-                    if close {
-                        let _ = writer.channel().close().await;
-
-                        return Ok(255);
                     }
                 }
                 event = events.recv() => match event {
@@ -127,9 +126,7 @@ pub(crate) async fn run<H: Handler>(
                         }
                     }
                     Event::Suspend => {
-                        if let Some(mode) = mode { mode.pause()?; }
-                        term.suspend()?;
-                        if let Some(mode) = mode { mode.resume()?; }
+                        suspend_local(&term, mode)?;
                         if interactive {
                             let (w, h) = term.size();
                             writer.channel().window_change(w, h, 0, 0).await?;
@@ -140,7 +137,12 @@ pub(crate) async fn run<H: Handler>(
         }
     }
 
-    Ok(child.status().code().unwrap_or(255) as u8)
+    Ok(u8::try_from(child.status().code().unwrap_or(255)).unwrap_or(255))
+}
+
+enum InputEnd {
+    Eof,
+    Disconnect,
 }
 
 async fn send_input(
@@ -149,11 +151,11 @@ async fn send_input(
     term: &Terminal<'_>,
     mode: Option<InputMode<'_>>,
     escape_char: Option<u8>,
-) -> Result<bool> {
+) -> Result<InputEnd> {
     let Some(mut input) = input else {
         writer.eof().await?;
 
-        return Ok(false);
+        return Ok(InputEnd::Eof);
     };
 
     let mut buf = [0; 8192];
@@ -168,13 +170,30 @@ async fn send_input(
             }
             writer.eof().await?;
 
-            return Ok(false);
+            return Ok(InputEnd::Eof);
         }
 
-        if escapes.write(&buf[..n], writer, term, mode).await? {
-            return Ok(true);
+        if escapes
+            .write(&buf[..n], writer, term, mode)
+            .await?
+            .is_break()
+        {
+            return Ok(InputEnd::Disconnect);
         }
     }
+}
+
+fn suspend_local(term: &Terminal<'_>, mode: Option<InputMode<'_>>) -> std::io::Result<()> {
+    if let Some(mode) = mode {
+        mode.pause()?;
+    }
+    term.suspend()?;
+
+    if let Some(mode) = mode {
+        mode.resume()?;
+    }
+
+    Ok(())
 }
 
 fn input_closed(e: &anyhow::Error) -> bool {
@@ -209,10 +228,15 @@ async fn read_output(mut reader: ChildOut<'_>) -> Result<()> {
     Ok(())
 }
 
-struct Escapes {
-    key: Option<u8>,
-    pending: bool,
-    line_start: bool,
+enum Escapes {
+    Disabled,
+    Enabled { key: u8, state: EscapeState },
+}
+
+enum EscapeState {
+    LineStart,
+    MidLine,
+    Prefix,
 }
 
 #[derive(Debug, PartialEq)]
@@ -226,62 +250,76 @@ enum Escape<'buf> {
 
 impl Escapes {
     fn new(key: Option<u8>) -> Self {
-        Self {
-            key,
-            pending: false,
-            line_start: true,
+        match key {
+            Some(key) => Self::Enabled {
+                key,
+                state: EscapeState::LineStart,
+            },
+            None => Self::Disabled,
         }
     }
 
     fn next<'buf>(&mut self, buf: &mut &'buf [u8]) -> Option<Escape<'buf>> {
         let (&first, rest) = buf.split_first()?;
-        let Some(key) = self.key else {
+        let Self::Enabled { key, state } = self else {
             return Some(Escape::Data(std::mem::take(buf)));
         };
+        let key = *key;
 
-        if self.pending {
-            self.pending = false;
+        if matches!(state, EscapeState::Prefix) {
+            *state = EscapeState::LineStart;
 
-            if first != key && !matches!(first, b'.' | 26 | b'?') {
-                self.line_start = false;
+            if first == key {
+                *buf = rest;
+                *state = EscapeState::after(key);
 
                 return Some(Escape::Literal(key));
             }
-            *buf = rest;
 
-            return Some(match first {
+            let escape = match first {
                 b'.' => Escape::Close,
                 26 => Escape::Suspend,
                 b'?' => Escape::Help(key),
                 _ => {
-                    self.line_start = matches!(key, b'\r' | b'\n');
-                    Escape::Literal(key)
+                    *state = EscapeState::after(key);
+
+                    return Some(Escape::Literal(key));
                 }
-            });
+            };
+            *buf = rest;
+
+            return Some(escape);
         }
 
         for (idx, &c) in buf.iter().enumerate() {
-            if self.line_start && c == key {
+            if matches!(state, EscapeState::LineStart) && c == key {
                 if idx != 0 {
                     let (data, rest) = buf.split_at(idx);
                     *buf = rest;
 
                     return Some(Escape::Data(data));
                 }
-                self.pending = true;
+                *state = EscapeState::Prefix;
                 *buf = rest;
 
                 return self.next(buf);
             }
-            self.line_start = matches!(c, b'\r' | b'\n');
+            *state = EscapeState::after(c);
         }
         Some(Escape::Data(std::mem::take(buf)))
     }
 
     fn finish(&mut self) -> Option<u8> {
-        std::mem::take(&mut self.pending)
-            .then_some(self.key)
-            .flatten()
+        match self {
+            Self::Enabled {
+                key,
+                state: state @ EscapeState::Prefix,
+            } => {
+                *state = EscapeState::after(*key);
+                Some(*key)
+            }
+            _ => None,
+        }
     }
 
     async fn write(
@@ -290,35 +328,37 @@ impl Escapes {
         writer: ChildIn<'_>,
         term: &Terminal<'_>,
         mode: Option<InputMode<'_>>,
-    ) -> Result<bool> {
+    ) -> Result<std::ops::ControlFlow<()>> {
+        use std::ops::ControlFlow;
+
         while let Some(escape) = self.next(&mut buf) {
             match escape {
                 Escape::Data(data) => writer.write_stdin_io(data).await?,
                 Escape::Literal(c) => writer.write_stdin_io(&[c][..]).await?,
-                Escape::Close => return Ok(true),
+                Escape::Close => return Ok(ControlFlow::Break(())),
                 Escape::Suspend => {
-                    if let Some(mode) = mode {
-                        mode.pause()?;
-                    }
-                    term.suspend()?;
-
-                    if let Some(mode) = mode {
-                        mode.resume()?;
-                    }
+                    suspend_local(term, mode)?;
 
                     let (w, h) = term.size();
                     writer.channel().window_change(w, h, 0, 0).await?;
                 }
                 Escape::Help(key) => {
-                    let key = escape_key(key);
-                    eprintln!(
-                        "\r\nSupported escape sequences:\r\n  {key}.   Close connection\r\n  {key}^Z  Suspend ssh\r\n  {key}{key}   Send the escape character\r\n  {key}?   Display this message\r"
-                    );
+                    eprintln!("{}", escape_help(key));
                 }
             }
         }
 
-        Ok(false)
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+impl EscapeState {
+    fn after(byte: u8) -> Self {
+        if matches!(byte, b'\r' | b'\n') {
+            Self::LineStart
+        } else {
+            Self::MidLine
+        }
     }
 }
 
@@ -340,9 +380,37 @@ fn escape_key(key: u8) -> impl std::fmt::Display {
     Key(key)
 }
 
+fn escape_help(key: u8) -> impl std::fmt::Display {
+    use std::fmt;
+
+    struct Help(u8);
+
+    impl fmt::Display for Help {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let key = escape_key(self.0);
+            f.write_str("\r\nSupported escape sequences:\r\n")?;
+
+            if self.0 != b'.' {
+                write!(f, "  {key}.   Close connection\r\n")?;
+            }
+            if self.0 != 26 {
+                write!(f, "  {key}^Z  Suspend ssh\r\n")?;
+            }
+            write!(f, "  {key}{key}   Send the escape character\r\n")?;
+            if self.0 != b'?' {
+                write!(f, "  {key}?   Display this message\r\n")?;
+            }
+
+            f.write_str("\r")
+        }
+    }
+
+    Help(key)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Escape, Escapes, escape_key, input_closed};
+    use super::{Escape, Escapes, escape_help, escape_key, input_closed};
 
     use openrussh_client::russh::Error;
 
@@ -418,6 +486,20 @@ mod tests {
     }
 
     #[test]
+    fn doubled_action_character_prefixes_are_literal() {
+        for key in [b'.', b'?', 26] {
+            let input = [key, key, b'\n', key, b'x'];
+
+            for split in 0..=input.len() {
+                assert_eq!(
+                    decode(&[&input[..split], &input[split..]], Some(key)),
+                    (vec![key, b'\n', key, b'x'], vec![])
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unknown_and_unfinished_escapes_are_preserved() {
         for chunks in [vec![b"~x\n~".as_slice()], vec![b"~", b"x\n", b"~"]] {
             assert_eq!(decode(&chunks, Some(b'~')), (b"~x\n~".to_vec(), vec![]));
@@ -478,6 +560,21 @@ mod tests {
             (127, "^?"),
         ] {
             assert_eq!(escape_key(key).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn help_omits_actions_shadowed_by_a_doubled_prefix() {
+        for (key, shadowed) in [(b'.', "Close"), (b'?', "Display"), (26, "Suspend")] {
+            let help = escape_help(key).to_string();
+
+            assert!(!help.contains(shadowed));
+            assert!(help.contains("Send the escape character"));
+        }
+        let help = escape_help(b'~').to_string();
+
+        for action in ["Close", "Suspend", "Send", "Display"] {
+            assert!(help.contains(action));
         }
     }
 

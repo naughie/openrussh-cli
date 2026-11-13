@@ -1,6 +1,6 @@
 use crate::{
-    Config, Destination, Error, LocalForward, ResolveConfig, ResolveOptions, Resolved, Result,
-    Session,
+    Config, ConnectionConfig, Destination, Error, LocalForward, ResolveConfig, ResolveOptions,
+    Resolved, Result, Session,
 };
 use crate::{defaults, lua, openssh, toml};
 
@@ -141,7 +141,7 @@ impl ConfigBuilder {
     ///         Session::Shell,
     ///     )?;
     /// assert_eq!(
-    ///     config.chain.target.auth.identities,
+    ///     config.connection.chain().target.auth.identities,
     ///     Some(vec![PathBuf::from("/keys/primary"), PathBuf::from("relative-key")]),
     /// );
     /// # Ok::<(), openrussh_cli_config::Error>(())
@@ -169,8 +169,8 @@ impl ConfigBuilder {
     /// The final destination's user, port, and builder identity overrides do not
     /// propagate to jumps. In native formats, a jump specification's embedded
     /// user or port is a fallback below that jump's file settings. The first jump
-    /// can inherit additional ancestors from its own configuration; routes must
-    /// be acyclic because resolution does not detect cycles.
+    /// can inherit additional ancestors from its own configuration. Native
+    /// resolution rejects cycles in those inherited routes.
     ///
     /// An explicitly empty iterator suppresses a route inherited from a file:
     ///
@@ -189,14 +189,14 @@ impl ConfigBuilder {
     /// let inherited = ConfigBuilder::new()
     ///     .config_file(&path)
     ///     .build(destination(), Session::Shell)?;
-    /// assert!(inherited.chain.bastions.is_some());
+    /// assert!(inherited.connection.chain().bastions.is_some());
     ///
     /// let direct = ConfigBuilder::new()
     ///     .config_file(&path)
     ///     .proxy_jump(std::iter::empty::<&str>())
     ///     .build(destination(), Session::Shell)?;
-    /// assert!(direct.chain.bastions.is_none());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// assert!(direct.connection.chain().bastions.is_none());
+    /// # Ok::<(), openrussh_cli_config::Error>(())
     /// ```
     pub fn proxy_jump<I, S>(mut self, jumps: I) -> Self
     where
@@ -264,9 +264,8 @@ impl ConfigBuilder {
     /// collection rather than append to it.
     ///
     /// Specifications are stored without binding listeners or validating their
-    /// endpoints. The application owns binding, transport compatibility checks,
-    /// forwarding tasks, and cleanup. See [`LocalForward`] for constructing TCP
-    /// and Unix-domain specifications.
+    /// endpoint values. The application owns binding, forwarding tasks, and
+    /// cleanup. See [`LocalForward`] for constructing TCP and Unix-domain pairs.
     ///
     /// Use a typed empty iterator when an explicitly empty collection is needed:
     ///
@@ -379,8 +378,8 @@ impl ConfigBuilder {
     ///         },
     ///         Session::None,
     ///     )?;
-    /// assert_eq!(config.chain.target.dest.port, 2222);
-    /// assert_eq!(config.chain.target.tty, RequestTty::Never);
+    /// assert_eq!(config.connection.chain().target.dest.port, 2222);
+    /// assert_eq!(config.connection.chain().target.tty, RequestTty::Never);
     /// assert!(config.verbose && config.stdin_null);
     /// assert_eq!(config.escape_char, None);
     /// assert_eq!(config.session, Session::None);
@@ -395,7 +394,7 @@ impl ConfigBuilder {
     /// resolution error for a selected file. Defaults-only resolution can also
     /// fail, for example if a username cannot be obtained or an authentication
     /// agent path is invalid. Native resolution errors retain any successfully
-    /// parsed logging metadata through [`Error::log_level()`]. Loading errors do
+    /// parsed logging metadata through [`Error::log_filter()`]. Loading errors do
     /// not fall back to another format or configuration file.
     pub fn build(self, destination: Destination, session: Session) -> Result<Config> {
         let Resolved {
@@ -409,8 +408,10 @@ impl ConfigBuilder {
         }
 
         Ok(Config {
-            chain,
-            algorithms,
+            connection: ConnectionConfig {
+                chain,
+                policies: algorithms,
+            },
             meta,
             verbose: self.verbose,
             session,
@@ -447,14 +448,10 @@ impl ConfigBuilder {
         let dir = std::env::home_dir()
             .ok_or(Error::HomeDirectory)?
             .join(".ssh");
-        self.default_config(&dir, options)
+        Self::default_config(&dir, options)
     }
 
-    pub(super) fn default_config(
-        &self,
-        dir: &Path,
-        options: &ResolveOptions<'_>,
-    ) -> Result<Resolved> {
+    pub(super) fn default_config(dir: &Path, options: &ResolveOptions<'_>) -> Result<Resolved> {
         use std::fs::File;
         use std::io::ErrorKind;
 
@@ -492,18 +489,18 @@ impl ConfigBuilder {
 
             return if path.extension().is_some_and(|extension| extension == "lua") {
                 let parsed = lua::ParsedConfig::execute(&text, path).map_err(read_error)?;
-                Self::resolve_source(parsed, options, path)
+                Self::resolve_source(&parsed, options, path)
             } else {
                 let parsed = toml::ParsedConfig::parse(&text).map_err(read_error)?;
-                Self::resolve_source(parsed, options, path)
+                Self::resolve_source(&parsed, options, path)
             };
         }
 
         let parsed = openssh::ParsedConfig::parse(file, options).map_err(read_error)?;
-        Self::resolve_source(parsed, options, path)
+        Self::resolve_source(&parsed, options, path)
     }
 
-    fn resolve_source<S>(source: S, options: &ResolveOptions<'_>, path: &Path) -> Result<Resolved>
+    fn resolve_source<S>(source: &S, options: &ResolveOptions<'_>, path: &Path) -> Result<Resolved>
     where
         S: ResolveConfig,
     {

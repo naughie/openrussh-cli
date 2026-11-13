@@ -11,7 +11,8 @@
 //!
 //! Pollable descriptors, including pipes, terminals, and sockets, use Tokio's I/O
 //! driver. Descriptors rejected by polling with `EPERM` use Tokio's file reader.
-//! Construct [`Input`] inside a Tokio runtime with I/O enabled:
+//! [`Input`] implements [`tokio::io::AsyncRead`]. Construct it inside a Tokio
+//! runtime with I/O enabled:
 //!
 //! ```
 //! use openrussh_cli_terminal::Input;
@@ -34,10 +35,13 @@
 
 use nix::sys::termios::{self, SetArg, Termios};
 
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::signal::unix::{Signal, SignalKind};
 
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 
 /// A terminal-related process signal, received through [`Events::recv()`].
 pub enum Event {
@@ -187,6 +191,7 @@ impl Events {
 /// drop(terminal); // Restores the attributes saved before raw mode.
 /// # Ok::<(), io::Error>(())
 /// ```
+#[must_use = "dropping the terminal guard restores its saved attributes"]
 pub struct Terminal<'fd> {
     fd: BorrowedFd<'fd>,
     saved: Option<Termios>,
@@ -309,10 +314,14 @@ fn attrs(fd: BorrowedFd<'_>) -> io::Result<Termios> {
 
     let mut raw = MaybeUninit::<nix::libc::termios>::zeroed();
 
+    // SAFETY: `fd` is borrowed for this call and `raw` is writable. Zeroing also
+    // initializes fields the platform may leave untouched, such as unused
+    // control-character slots.
     if unsafe { nix::libc::tcgetattr(fd.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: Every field started initialized, and tcgetattr succeeded.
     Ok(unsafe { raw.assume_init() }.into())
 }
 
@@ -327,16 +336,25 @@ fn attrs(fd: BorrowedFd<'_>) -> io::Result<Termios> {
 /// When the platform refuses polling with `EPERM`, as for regular files on Linux,
 /// reads use [`tokio::fs::File`] instead. [`Self::mode()`] returns `None` for that
 /// fallback. The source descriptor must remain alive for `'fd` in either case.
+#[must_use = "dropping the input reader restores its saved file-status flags"]
 pub struct Input<'fd> {
     kind: InputKind<'fd>,
 }
 
 enum InputKind<'fd> {
-    Poll {
-        fd: tokio::io::unix::AsyncFd<Nonblocking>,
-        source: BorrowedFd<'fd>,
-    },
+    Poll(PollInput<'fd>),
     File(tokio::fs::File),
+}
+
+struct PollInput<'fd> {
+    fd: tokio::io::unix::AsyncFd<OwnedFd>,
+    mode: InputMode<'fd>,
+}
+
+impl Drop for PollInput<'_> {
+    fn drop(&mut self) {
+        let _ = self.mode.pause();
+    }
 }
 
 impl<'fd> Input<'fd> {
@@ -357,38 +375,36 @@ impl<'fd> Input<'fd> {
     /// Panics outside a Tokio runtime with its I/O driver enabled.
     pub fn new(source: BorrowedFd<'fd>) -> io::Result<Self> {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        use nix::unistd::dup;
         use tokio::io::unix::AsyncFd;
 
-        let fd = dup(source)?;
-        let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+        let fd = source.try_clone_to_owned()?;
+        let flags = OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL)?);
 
-        match unsafe {
-            AsyncFd::register_with_interest(
-                Nonblocking { fd, flags },
-                tokio::io::Interest::READABLE,
-            )
-        }
-        .map_err(io::Error::from)
-        {
+        // SAFETY: OwnedFd keeps this descriptor open and unchanged until
+        // AsyncFd deregisters it. No operation replaces the owned descriptor.
+        match unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) } {
             Ok(fd) => {
-                fcntl(
-                    &fd.get_ref().fd,
-                    FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
-                )?;
+                let input = PollInput {
+                    fd,
+                    mode: InputMode { fd: source, flags },
+                };
+                input.mode.resume()?;
 
                 Ok(Self {
-                    kind: InputKind::Poll { fd, source },
+                    kind: InputKind::Poll(input),
                 })
             }
-            Err(e) if e.raw_os_error() == Some(nix::libc::EPERM) => {
-                let f = std::fs::File::from(dup(source)?);
+            Err(e) => {
+                let (fd, e) = e.into_parts();
+
+                if e.raw_os_error() != Some(nix::libc::EPERM) {
+                    return Err(e);
+                }
 
                 Ok(Self {
-                    kind: InputKind::File(tokio::fs::File::from_std(f)),
+                    kind: InputKind::File(tokio::fs::File::from_std(fd.into())),
                 })
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -399,15 +415,15 @@ impl<'fd> Input<'fd> {
     /// suspension, then reenable nonblocking flags after continuation.
     pub fn mode(&self) -> Option<InputMode<'fd>> {
         match &self.kind {
-            InputKind::Poll { fd, source } => Some(InputMode {
-                fd: *source,
-                flags: fd.get_ref().flags,
-            }),
+            InputKind::Poll(input) => Some(input.mode),
             InputKind::File(_) => None,
         }
     }
 
-    /// Reads bytes into `buf`, returning the number read, including zero at EOF.
+    /// Reads bytes into `buf`, returning the number read.
+    ///
+    /// An empty buffer returns zero immediately without waiting for input. For a
+    /// nonempty buffer, zero indicates EOF.
     ///
     /// Polling input waits for readability, retries interrupted reads, and clears
     /// stale readiness before retrying. Cancelling a pending polling read does
@@ -418,21 +434,39 @@ impl<'fd> Input<'fd> {
     ///
     /// Returns an I/O error from readiness registration or the underlying read.
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use tokio::io::AsyncReadExt as _;
+        tokio::io::AsyncReadExt::read(self, buf).await
+    }
+}
 
-        match &mut self.kind {
-            InputKind::Poll { fd, .. } => loop {
-                let mut ready = fd.readable().await?;
+impl AsyncRead for Input<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
-                match ready
-                    .try_io(|fd| nix::unistd::read(&fd.get_ref().fd, buf).map_err(io::Error::from))
-                {
-                    Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Ok(res) => return res,
-                    Err(_) => continue,
+        match &mut self.get_mut().kind {
+            InputKind::Poll(input) => loop {
+                let mut ready = ready!(input.fd.poll_read_ready(cx))?;
+
+                match ready.try_io(|fd| {
+                    nix::unistd::read(fd.get_ref(), buf.initialize_unfilled())
+                        .map_err(io::Error::from)
+                }) {
+                    Ok(Ok(n)) => {
+                        buf.advance(n);
+
+                        return Poll::Ready(Ok(()));
+                    }
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Ok(Err(e)) => return Poll::Ready(Err(e)),
+                    Err(_) => {}
                 }
             },
-            InputKind::File(f) => f.read(buf).await,
+            InputKind::File(f) => Pin::new(f).poll_read(cx, buf),
         }
     }
 }
@@ -480,25 +514,6 @@ impl InputMode<'_> {
         fcntl(self.fd, FcntlArg::F_SETFL(self.flags | OFlag::O_NONBLOCK))?;
 
         Ok(())
-    }
-}
-
-struct Nonblocking {
-    fd: std::os::fd::OwnedFd,
-    flags: nix::fcntl::OFlag,
-}
-
-impl std::os::fd::AsRawFd for Nonblocking {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-impl Drop for Nonblocking {
-    fn drop(&mut self) {
-        use nix::fcntl::{FcntlArg, fcntl};
-
-        let _ = fcntl(&self.fd, FcntlArg::F_SETFL(self.flags));
     }
 }
 
@@ -716,6 +731,64 @@ mod tests {
         drop(input);
 
         assert_eq!(flags(r.as_fd()), saved);
+    }
+
+    #[tokio::test]
+    async fn empty_input_read_does_not_wait_for_readiness_or_consume_input() {
+        let (r, w) = pipe().unwrap();
+        let mut input = Input::new(r.as_fd()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(20), input.read(&mut []))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        write(&w, b"remaining").unwrap();
+        let mut buf = [0; 16];
+        let n = input.read(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..n], b"remaining");
+    }
+
+    #[tokio::test]
+    async fn async_read_appends_to_an_uninitialized_read_buffer() {
+        use std::future::poll_fn;
+        use std::mem::MaybeUninit;
+        use std::pin::Pin;
+        use tokio::io::{AsyncRead as _, ReadBuf};
+
+        let (r, w) = pipe().unwrap();
+        let mut input = Input::new(r.as_fd()).unwrap();
+        write(&w, b"suffix").unwrap();
+
+        let mut storage = [MaybeUninit::uninit(); 32];
+        let mut buf = ReadBuf::uninit(&mut storage);
+        buf.put_slice(b"prefix");
+        poll_fn(|cx| Pin::new(&mut input).poll_read(cx, &mut buf))
+            .await
+            .unwrap();
+
+        assert_eq!(buf.filled(), b"prefixsuffix");
+    }
+
+    #[tokio::test]
+    async fn owned_input_descriptor_is_close_on_exec() {
+        use super::InputKind;
+        use nix::fcntl::FdFlag;
+
+        let (r, _w) = pipe().unwrap();
+        let saved = fcntl(&r, FcntlArg::F_GETFD).unwrap();
+        let input = Input::new(r.as_fd()).unwrap();
+        let InputKind::Poll(input) = &input.kind else {
+            panic!("pipes must use readiness polling");
+        };
+        let flags = FdFlag::from_bits_retain(fcntl(input.fd.get_ref(), FcntlArg::F_GETFD).unwrap());
+
+        assert!(flags.contains(FdFlag::FD_CLOEXEC));
+        assert_eq!(fcntl(&r, FcntlArg::F_GETFD).unwrap(), saved);
     }
 
     #[tokio::test]

@@ -4,7 +4,14 @@ This document covers implementation boundaries, repository conventions, validati
 
 ## Application boundaries
 
-The root Cargo package is `openrussh-cli`, its library crate is `openrussh_cli`, and the executable is `ssh`. `main.rs` creates the Tokio runtime and calls `pub async fn main_impl()`. The application keeps implementation modules private and owns error reporting, exit status, and resource cleanup before the final process exit.
+The root Cargo package is `openrussh-cli`, its library crate is `openrussh_cli`, and the executable is `ssh`. `main.rs` creates the Tokio runtime and calls `pub async fn run() -> ExitCode`.
+The application keeps implementation modules private and owns error reporting,
+exit status, and resource cleanup. The binary shuts the runtime down with
+`shutdown_background()` and returns the code through Rust's `Termination`
+mechanism. This prevents runtime teardown from waiting indefinitely when a
+signal ends an invocation while a blocking host-key prompt is still reading.
+The application library does not call `process::exit`; Clap retains its own
+help, version, and argument-error exits.
 
 The root manifest also defines a workspace containing the application and
 `crates/*`. The configuration library lives in
@@ -31,7 +38,7 @@ remaining `src/` modules.
 
 The CLI joins all command arguments after the destination with single ASCII spaces, without adding quotes or escaping, and constructs `Session::Exec { command }` for a nonempty result. An empty result selects `Session::Shell`. Session execution passes the command string directly to the library helper as one SSH `exec` command. The remote user's shell interprets its operators, quotes, and expansions. Preserve these OpenSSH CLI semantics across the parser, domain configuration, and session boundaries; do not preserve local argument boundaries through extra quoting or an explicit shell wrapper.
 
-`MyMakeHandler` and `MyHandler` are the application integration types. The outer connection setup instantiates them; session, forwarding, and lifecycle code remains generic over the dependency's handler trait. Keep this boundary when introducing reusable operations. Application configuration is a concrete domain type, distinct from both parser output and `openrussh_client::config` intermediate types.
+`ClientHandlerFactory` and `ClientHandler` are the application integration types. The outer connection setup instantiates them. Factory construction requires its resolved `ConnectionConfig`, so host membership is checked even without explicit algorithm overrides. Session, forwarding, and lifecycle code remains generic over the dependency's handler trait. Keep this boundary when introducing reusable operations. Application configuration is a concrete domain type, distinct from both parser output and `openrussh_client::config` intermediate types.
 
 Each format's private `ParsedConfig` resolves to the configuration crate's
 private `Resolved`, containing the connection chain, typed per-host algorithm
@@ -43,9 +50,11 @@ combines the resolved source with the supplied application settings into
 `Invocation::build()` performs the builder adaptation and finalization.
 Setup metadata remains outside host/default records and is used when
 initializing resources; handlers receive the known-host resource and its
-save path rather than `Meta`. Policy lookup uses resolved `Host` reference
-identity, preserving distinct policies even for hosts with identical network
-destinations.
+save path rather than `Meta`. `ConnectionConfig` owns the chain and its policies
+behind private fields, preventing independent replacement or host reordering.
+Policy lookup uses resolved `Host` reference identity within that connection
+configuration, preserving distinct policies even for hosts with identical
+network destinations.
 
 TOML and Lua own independent schemas and resolvers under their respective
 modules. TOML profiles can borrow their source text; Lua profiles use owned
@@ -94,7 +103,10 @@ Client diagnostics use `tracing` with `tracing-subscriber` for initialization
 and formatting, including its bridge for dependency `log` records. Keep the
 effective filter controlled by the CLI verbosity flag and native metadata.
 Use `tracing_subscriber::EnvFilter` for directive parsing and matching, without
-reading `RUST_LOG` from the environment. Retain the OpenSSH-style stderr format
+reading `RUST_LOG` from the environment. Move the owned filter into subscriber
+setup; after a configuration failure, `Error::take_log_filter()` transfers only
+the policy while retaining the diagnostic and its causes. Retain the OpenSSH-style
+stderr format
 described in the [runtime reference](runtime.md#logging). Remote channel output and terminal
 interaction are separate from log diagnostics.
 
@@ -119,14 +131,14 @@ Apply these conventions during implementation and review:
 - Preserve distinct concepts as distinct concrete types or enum variants. Do not convert unrelated parser output into an intermediate type solely to reuse an implementation path.
 - Keep TOML and Lua schemas, value/jump visitors, path rules, and host resolution inside their respective modules. Share the resolved application types and transport-policy operations without introducing a common native source model or path-mode switch. Evaluate a format change against that format's documented contract.
 - Borrow where ownership is unnecessary. Move or clone at task boundaries; use `Arc` to express task sharing or avoid copying a large value.
-- Prefer generics or enums to trait objects, except where a dependency requires dynamic dispatch. Keep helper visibility and import scope narrow; import traits anonymously unless their names are required for bounds or implementations.
-- Allocate only when a value is needed. Retain optional collections as `Option<Vec<_>>` where absence is meaningful, avoid materializing strings for formatting alone, and review each clone, collection, and task spawn for a concrete purpose.
+- Use generics or enums for abstraction; do not introduce trait objects. The standard `std::error::Error::source` signature remains the interoperability boundary for error causes. Keep helper visibility and import scope narrow; import traits anonymously unless their names are required for bounds or implementations.
+- Changes must not increase heap allocations. Allocate only when a value is needed. Retain optional collections as `Option<Vec<_>>` where absence is meaningful, avoid materializing strings for formatting alone, and review each clone, collection, and task spawn for a concrete purpose.
 - Use safe library process helpers appropriate to the command semantics. Pass the CLI's remote command string to `process::cmd::exec(conn.handle(), command, conn.request_tty())`; use the `Command::new().prog(...).arg(...)` builder when an operation requires literal program and argument values. Do not use `Command::new_unchecked()` for CLI execution. Keep any required unsafe operation local and satisfy its resource, initialization, and lifetime requirements.
 - Release files, descriptors, terminal modes, listeners, and tasks promptly through scopes and guards. Preserve the original failure when cleanup also fails.
 - Use blank lines to separate semantic stages and related definitions. Keep imports, names, and type paths readable without mechanically grouping everything or spelling every type as a full path.
 - Consider LLVM optimization and allocation/context-switch costs, without CPU-specific or assembly-level optimization. Choose task spawning, async combinators, or a custom future according to ownership, cancellation, and actual cost.
 
-Errors at the application boundary use `anyhow` with short English operation/context messages. The configuration crate has no `anyhow` dependency, including in its tests; it exposes its own `Error` and `Result` types. Its error source chain preserves parser, IO, and resolution causes, and `Error::log_level()` exposes a parsed native filter when later validation fails. Convert these errors into `anyhow` only in the application adapter. Do not suppress input, persistence, or cleanup failures merely to make a path appear successful. Likewise, do not add validation to library-owned behavior unless the application's own format or syntax requires it.
+Errors at the application boundary use `anyhow` with short English operation/context messages. The configuration crate has no `anyhow` dependency, including in its tests; it exposes its own `Error` and `Result` types. Its error source chain preserves parser, IO, and resolution causes, and `Error::log_filter()` exposes a parsed native filter when later validation fails. Convert these errors into `anyhow` only in the application adapter. Do not suppress input, persistence, or cleanup failures merely to make a path appear successful. Likewise, do not add validation to library-owned behavior unless the application's own format or syntax requires it.
 
 ## Test architecture
 

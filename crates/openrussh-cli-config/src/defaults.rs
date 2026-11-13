@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(jumps[1].dest.port, 2200);
         assert!(jumps.iter().all(|jump| jump.auth.identities.is_none()));
         assert!(resolved.meta.known_hosts.is_none());
-        assert!(resolved.meta.log_level.is_none());
+        assert!(resolved.meta.log_filter.is_none());
         Ok(())
     }
 

@@ -19,7 +19,7 @@ impl<'src> ParsedConfig<'src> {
         let profiles: Profiles<'src> = ::toml::from_str(text)?;
         profiles
             .require_named_jumps()
-            .map_err(|error| error.with_log_level(profiles.log_level()))?;
+            .map_err(|error| error.with_log_filter(profiles.log_filter()))?;
 
         Ok(Self { profiles })
     }
@@ -41,7 +41,7 @@ pub(super) fn query(text: &str, options: &ResolveOptions<'_>) -> Result<Chain> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LogLevel;
+    use crate::LogFilter;
 
     #[test]
     fn toml_rejects_inline_jumps_in_defaults_and_unused_hosts() {
@@ -55,7 +55,7 @@ mod tests {
             let error = ParsedConfig::parse(&source)
                 .err()
                 .expect("Inline TOML jumps must be rejected");
-            assert!(matches!(error.log_level(), Some(LogLevel::None)));
+            assert!(matches!(error.log_filter(), Some(LogFilter::Disabled)));
             assert_eq!(
                 error.to_string(),
                 "TOML proxy-jump must be a string or an array of strings"
@@ -78,7 +78,7 @@ mod tests {
                 .expect("Malformed inline TOML jumps must be rejected");
 
             assert!(matches!(&error, crate::Error::Toml(_)), "{value}");
-            assert!(error.log_level().is_none(), "{value}");
+            assert!(error.log_filter().is_none(), "{value}");
         }
     }
 }

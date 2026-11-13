@@ -1,4 +1,4 @@
-use openrussh_cli_config::LogLevel;
+use openrussh_cli_config::LogFilter;
 
 use tracing::level_filters::LevelFilter;
 use tracing::{Event, Level, Subscriber};
@@ -11,9 +11,9 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 
 use std::fmt;
 
-pub(crate) fn init(verbose: bool, level: Option<&LogLevel>) {
+pub(crate) fn init(verbose: bool, policy: Option<LogFilter>) {
     tracing_subscriber::fmt()
-        .with_env_filter(filter(verbose, level))
+        .with_env_filter(filter(verbose, policy))
         .with_ansi(false)
         .event_format(OpenSshFormat)
         .with_writer(std::io::stderr)
@@ -22,10 +22,10 @@ pub(crate) fn init(verbose: bool, level: Option<&LogLevel>) {
         .init();
 }
 
-fn filter(verbose: bool, level: Option<&LogLevel>) -> EnvFilter {
-    match level {
-        Some(LogLevel::None) => EnvFilter::default().add_directive(LevelFilter::OFF.into()),
-        Some(LogLevel::Filter(filter)) => filter.as_ref().clone(),
+fn filter(verbose: bool, policy: Option<LogFilter>) -> EnvFilter {
+    match policy {
+        Some(LogFilter::Disabled) => EnvFilter::default().add_directive(LevelFilter::OFF.into()),
+        Some(LogFilter::Filter(filter)) => *filter,
         None => {
             let default = if verbose {
                 LevelFilter::DEBUG
@@ -97,10 +97,10 @@ mod tests {
         }
     }
 
-    fn capture(verbose: bool, level: Option<LogLevel>, emit: impl FnOnce()) -> String {
+    fn capture(verbose: bool, policy: Option<LogFilter>, emit: impl FnOnce()) -> String {
         let output = Output::default();
         let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter(verbose, level.as_ref()))
+            .with_env_filter(filter(verbose, policy))
             .with_ansi(false)
             .event_format(OpenSshFormat)
             .with_writer(output.clone())
@@ -112,8 +112,8 @@ mod tests {
         String::from_utf8(output.0.lock().unwrap().clone()).unwrap()
     }
 
-    fn messages(verbose: bool, level: Option<LogLevel>) -> String {
-        capture(verbose, level, || {
+    fn messages(verbose: bool, policy: Option<LogFilter>) -> String {
+        capture(verbose, policy, || {
             tracing::error!("Connection failed");
             tracing::warn!("Warning: Host key added");
             tracing::info!("Authenticated");
@@ -122,8 +122,8 @@ mod tests {
         })
     }
 
-    fn directives(value: &str) -> LogLevel {
-        LogLevel::try_from_filter(value).unwrap()
+    fn directives(value: &str) -> LogFilter {
+        LogFilter::try_from_filter(value).unwrap()
     }
 
     #[test]
@@ -135,7 +135,7 @@ mod tests {
         let trace = format!("{debug}debug2: Packet data\r\n");
 
         for verbose in [false, true] {
-            assert_eq!(messages(verbose, Some(LogLevel::None)), "");
+            assert_eq!(messages(verbose, Some(LogFilter::Disabled)), "");
             assert_eq!(messages(verbose, Some(directives("off"))), "");
             assert_eq!(messages(verbose, Some(directives("error"))), errors);
         }

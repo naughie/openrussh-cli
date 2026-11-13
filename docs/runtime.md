@@ -112,13 +112,20 @@ Local input EOF sends SSH channel EOF after forwarding an unfinished escape pref
 
 The current dependency does not translate an SSH `exit-signal` message into the local process being terminated by that signal. Its absence of an `exit-status` therefore follows the no-status behavior above. Clap handles its own help, version, and argument-parsing exits before the runtime path.
 
-When a connected operation ends, the application sends an SSH disconnect with reason `ByApplication`. An existing operation error takes precedence over a disconnect error. A disconnect error can turn an otherwise successful operation into a failure while the connection handle remains open.
+When a connected operation ends, including a local-listener setup failure, the application sends an SSH disconnect with reason `ByApplication`. An existing operation error takes precedence over a disconnect error. A disconnect error can turn an otherwise successful operation into a failure while the connection handle remains open.
 
 ## PTYs, local terminal state, and escapes
 
 The remote PTY policy comes from the resolved configuration: `Never` disables it, `Always` requests it, `IfTty` checks local stdin, and `ForShell` requests it for a shell session. The dependency makes the actual PTY request. A remote PTY and a local terminal are separate resources: local raw mode is entered only for an interactive session whose stdin is a terminal and whose input is enabled.
 
-The local terminal guard saves termios attributes, enters raw mode with `TCSADRAIN`, and restores the saved attributes on drop. Terminal size comes from the borrowed terminal descriptor, with `80 × 24` as the fallback. The input reader duplicates stdin's descriptor while preserving the original file-status flags. Its nonblocking guard restores those shared flags when reading ends or the operation is cancelled. Regular files use a Tokio file reader when the asynchronous descriptor backend cannot register them.
+The local terminal guard saves termios attributes, enters raw mode with
+`TCSADRAIN`, and restores the saved attributes on drop. Terminal size comes from
+the borrowed terminal descriptor, with `80 × 24` as the fallback. The input reader
+implements Tokio's `AsyncRead`. It duplicates stdin's descriptor
+with close-on-exec set while preserving the original descriptor's flags. Polling
+uses `AsyncFd<OwnedFd>`; an `EPERM` registration failure transfers that same owned
+descriptor to the Tokio file-reader fallback. A guard restores the captured
+shared file-status flags when polling input ends or is cancelled.
 
 Escape processing is enabled for sessions requesting a PTY, except `-W`. A prefix is recognized at the start of input and immediately after carriage return or newline. Prefix state survives input-buffer boundaries.
 
@@ -129,7 +136,7 @@ Escape processing is enabled for sessions requesting a PTY, except `-W`. A prefi
 | `~~` | Send one literal `~`. |
 | `~?` | Print escape help to stderr. |
 
-Unrecognized sequences are sent literally. A lone prefix at input EOF is also sent literally. `-e` accepts one ASCII byte, caret notation `^@` through `^_`, or `^?` for DEL. A custom prefix changes the prefix for all four actions. `-e none` forwards all input bytes without escape interpretation.
+Unrecognized sequences are sent literally. A lone prefix at input EOF is also sent literally. `-e` accepts one ASCII byte, caret notation `^@` through `^_`, or `^?` for DEL. A custom prefix changes the prefix for all four actions. Doubling the prefix always sends one literal prefix, including when the prefix is `.`, `?`, or Ctrl-Z. In those cases the corresponding close/help/suspend action is shadowed; help lists only available actions. `-e none` forwards all input bytes without escape interpretation.
 
 ## Signals and suspension
 
@@ -155,13 +162,16 @@ bind_address:port:host:hostport
 local_socket_path:remote_socket_path
 ```
 
-TCP address parsing supports bracketed IPv6 addresses. Ports must fit `u16`, and the target host cannot be empty. Both paths in the Unix-domain form must contain `/`; the forwarding syntax does not impose the absolute-path rule used for native configuration identity paths. TCP-to-Unix and Unix-to-TCP combinations are rejected.
+TCP address parsing supports bracketed IPv6 addresses. Brackets delimit host fields only; bracketed ports and empty bracketed hosts are rejected. Ports must fit `u16`, and the target host cannot be empty. Both paths in the Unix-domain form must contain `/`; brackets in those paths are literal filename characters. The forwarding syntax does not impose the absolute-path rule used for native configuration identity paths. TCP-to-Unix and Unix-to-TCP combinations are rejected by the CLI and are unrepresentable in the resolved `LocalForward` type.
 
 An unspecified TCP bind address means loopback, or all interfaces with `-g`. An explicit empty bind address or `*` means all interfaces. An explicit address remains explicit regardless of `-g`. Loopback and wildcard bindings try both IPv4 and IPv6; IPv6 sockets use `IPV6_V6ONLY` so each listener has a distinct address family. An explicit hostname is resolved to its socket addresses. A forwarding specification succeeds if at least one of its addresses can be bound, and fails if none can be bound.
 
-All requested local listeners are bound before accepting connections. If a later specification fails, earlier bindings are dropped. A Unix-domain listener never removes an existing path to make room. Its cleanup guard records the created socket's device and inode and removes the path only if that same filesystem object is still present, preserving replacements and symlinks.
+All requested local listeners are bound before accepting connections. If a later specification fails, earlier bindings are dropped. A Unix-domain listener never removes an existing path to make room. Its cleanup guard records the created socket's device and inode and removes the path only if that same filesystem object is still present, preserving replacements and symlinks. If the initial metadata lookup fails,
+the listener is closed and that error is returned; the path may remain because
+its ownership could not be established.
 
-Each listener accepts streams and starts a task for each accepted connection. TCP-to-TCP forwarding uses `Connection::forward_local_tcp()` and supplies the local peer address as the originator. Unix-to-Unix forwarding uses `Connection::forward_local_uds()`. Both wait for the library forwarding handle. Failure of one accepted stream is logged as an error and leaves the listener running; listener failure or a task panic ends the forwarding operation. Ending the session shuts down listener and stream tasks and releases bindings.
+One supervisor polls all listeners in rotation and owns the tasks for accepted
+connections. Listeners do not run in separate tasks. TCP-to-TCP forwarding uses `Connection::forward_local_tcp()` and supplies the local peer address as the originator. Unix-to-Unix forwarding uses `Connection::forward_local_uds()`. Both wait for the library forwarding handle. Failure of one accepted stream is logged as an error and leaves the listeners running; listener failure or a task panic ends the forwarding operation. Ending the session releases listener bindings and cancels and joins all accepted-stream tasks before disconnecting the SSH connection.
 
 `-W HOST:PORT` has no local listener. It opens an SSH `direct-tcpip` channel with originator `127.0.0.1:0`, wraps that channel in the dependency's `Child`, and uses the standard-stream pump. This lower-level channel opening is necessary because the dependency's local forwarding helpers take a network stream. It does not add a subsystem or a second forwarding implementation.
 
@@ -180,4 +190,4 @@ The handler delegates known-host matching and host-certificate validation to `Kn
 
 The prompt opens `/dev/tty`, independently of redirected stdin/stdout. It displays the public-key algorithm and SHA-256 fingerprint and accepts `yes` or the complete displayed fingerprint; `no` or terminal EOF rejects it. Other answers repeat the prompt. Without an accessible controlling terminal, confirmation fails.
 
-Acceptance appends an unhashed host-key entry to the same selected file and caches that accepted key for the handler instance. A later different key is not covered by the cached acceptance. Hostnames are normalized to lowercase; the known-host token is the hostname for port `22` and `[hostname]:port` otherwise. Handlers receive the resource's selected save path, so prompting does not fall back to another database. Newly created parent directories use mode `0700` and newly created files use mode `0600`; existing permissions are retained. Appends take a file lock and preserve existing content, inserting a missing final newline. Save errors fail the connection rather than silently discarding the user's acceptance.
+Acceptance appends an unhashed host-key entry to the same selected file and caches that accepted key for the handler instance. A later different key is not covered by the cached acceptance. Lookup, prompts, and persistence share the dependency's normalized hostname: surrounding address brackets and any bracket-attached port suffix are removed, then the name is lowercased. The separately configured port remains authoritative. The known-host token is the hostname for port `22` and `[hostname]:port` otherwise. Handlers receive the resource's selected save path, so prompting does not fall back to another database. Newly created parent directories use mode `0700` and newly created files use mode `0600`; existing permissions are retained. Appends take a file lock and preserve existing content, inserting a missing final newline. Save errors fail the connection rather than silently discarding the user's acceptance.

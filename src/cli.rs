@@ -1,6 +1,4 @@
-use openrussh_cli_config::{
-    BindHost, Config, Destination, ForwardTarget, LocalBind, LocalForward, Session,
-};
+use openrussh_cli_config::{BindHost, Config, Destination, LocalForward, Session};
 use openrussh_client::config::RequestTty;
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -17,7 +15,7 @@ struct Args {
     #[arg(
         short = 'v',
         overrides_with = "verbose",
-        help = "Enable verbose logging at the configured log level"
+        help = "Enable verbose logging with the configured filter"
     )]
     verbose: bool,
 
@@ -207,7 +205,7 @@ impl Args {
         let session = if args.no_session {
             Session::None
         } else if let Some(s) = &args.stdio {
-            let (host, port) = parse_address(s)?;
+            let (host, port) = parse_tcp_endpoint(s)?;
             Session::Forward {
                 host: host.to_owned(),
                 port,
@@ -276,17 +274,20 @@ impl Args {
     }
 }
 
-fn parse_destination(s: String) -> Result<Destination> {
+fn parse_destination(mut s: String) -> Result<Destination> {
     let query = s.strip_prefix("ssh://").unwrap_or(&s);
+    let mut host_start = s.len() - query.len();
     let query = query.strip_suffix('/').unwrap_or(query);
     let (user, host) = if let Some((user, host)) = query.rsplit_once('@') {
         ensure!(!user.is_empty(), "The destination user is empty");
+        host_start += user.len() + 1;
         (Some(user.to_owned()), host)
     } else {
         (None, query)
     };
 
     let (host, port) = if let Some(s) = host.strip_prefix('[') {
+        host_start += 1;
         let (host, rest) = s.split_once(']').context("Unclosed destination address")?;
         let port = if rest.is_empty() {
             None
@@ -312,13 +313,16 @@ fn parse_destination(s: String) -> Result<Destination> {
     };
     ensure!(!host.is_empty(), "The destination host is empty");
 
-    let host = if host.len() == s.len() {
-        s
-    } else {
-        host.to_owned()
-    };
+    let host_end = host_start + host.len();
+    s.truncate(host_end);
+    // Keep the caller's buffer when removing the URI/user/address delimiters.
+    drop(s.drain(..host_start));
 
-    Ok(Destination { host, user, port })
+    Ok(Destination {
+        host: s,
+        user,
+        port,
+    })
 }
 
 fn parse_escape(s: &str) -> Result<Option<u8>> {
@@ -331,79 +335,78 @@ fn parse_escape(s: &str) -> Result<Option<u8>> {
     }
 }
 
-fn parse_address(s: &str) -> Result<(&str, u16)> {
-    let (parts, n) = split_forward(s)?;
-    ensure!(n == 2 && !parts[0].is_empty(), "Expected host:port: {s}");
+fn parse_tcp_endpoint(s: &str) -> Result<(&str, u16)> {
+    let (parts, n) = split_tcp_fields(s)?;
+    ensure!(n == 2, "Expected host:port: {s}");
 
     Ok((
-        parts[0],
+        forwarding_host(parts[0])?,
         parts[1].parse().context("Invalid forwarding port")?,
     ))
 }
 
+fn forwarding_host(s: &str) -> Result<&str> {
+    let host = if let Some(host) = s.strip_prefix('[') {
+        host.strip_suffix(']')
+            .context("Invalid bracketed forwarding address")?
+    } else {
+        s
+    };
+    ensure!(!host.is_empty(), "The forwarding host is empty");
+    ensure!(!host.contains('/'), "Invalid forwarding host: {s}");
+
+    Ok(host)
+}
+
 fn parse_forward(s: &str, gateway_ports: bool) -> Result<LocalForward> {
-    let (parts, n) = split_forward(s)?;
-    let tcp_bind = |host: Option<&str>, port| LocalBind::Tcp {
-        host: match host {
-            None if gateway_ports => BindHost::All,
-            None => BindHost::Loopback,
-            Some("" | "*") => BindHost::All,
-            Some(host) => BindHost::Host(host.to_owned()),
-        },
-        port,
-    };
+    // Unix paths are literal filesystem names; brackets have no address meaning.
+    if let Some((bind, target)) = s.split_once(':')
+        && bind.contains('/')
+        && target.contains('/')
+        && !target.contains(':')
+    {
+        return Ok(LocalForward::Unix {
+            bind: bind.into(),
+            target: target.to_owned(),
+        });
+    }
 
-    let tcp_target = |host: &str, port: &str| -> Result<_> {
-        ensure!(!host.is_empty(), "The forwarding host is empty");
-
-        Ok(ForwardTarget::Tcp {
-            host: host.to_owned(),
-            port: port.parse().context("Invalid forwarding target port")?,
-        })
-    };
-
-    let (bind, target) = match &parts[..n] {
-        [port, host, target_port]
-            if !port.contains('/') && !host.contains('/') && !target_port.contains('/') =>
-        {
-            (
-                tcp_bind(None, port.parse().context("Invalid local forwarding port")?),
-                tcp_target(host, target_port)?,
-            )
-        }
-        [bind, port, host, target_port]
-            if !bind.contains('/') && !host.contains('/') && !target_port.contains('/') =>
-        {
-            (
-                tcp_bind(
-                    Some(bind),
-                    port.parse().context("Invalid local forwarding port")?,
-                ),
-                tcp_target(host, target_port)?,
-            )
-        }
-        [socket, target] if socket.contains('/') && target.contains('/') => (
-            LocalBind::Unix((*socket).into()),
-            ForwardTarget::Unix((*target).to_owned()),
-        ),
+    let (parts, n) = split_tcp_fields(s)?;
+    ensure!(
+        parts[..n].iter().all(|part| !part.contains('/')),
+        "Invalid local forwarding specification: {s}"
+    );
+    let (bind, port, host, target_port) = match &parts[..n] {
+        [port, host, target_port] => (None, *port, *host, *target_port),
+        [bind, port, host, target_port] => (Some(*bind), *port, *host, *target_port),
         _ => bail!("Invalid local forwarding specification: {s}"),
     };
 
-    if let LocalBind::Unix(path) = &bind {
-        ensure!(
-            !path.as_os_str().is_empty(),
-            "The local socket path is empty"
-        );
-    }
+    let bind = match bind {
+        Some("") => Some(""),
+        Some(bind) => Some(forwarding_host(bind)?),
+        None => None,
+    };
+    let bind_port = port.parse().context("Invalid local forwarding port")?;
+    let host = forwarding_host(host)?;
+    let target_port = target_port
+        .parse()
+        .context("Invalid forwarding target port")?;
 
-    if let ForwardTarget::Unix(path) = &target {
-        ensure!(!path.is_empty(), "The remote socket path is empty");
-    }
-
-    Ok(LocalForward { bind, target })
+    Ok(LocalForward::Tcp {
+        bind_host: match bind {
+            None if gateway_ports => BindHost::All,
+            None => BindHost::Loopback,
+            Some("" | "*") => BindHost::All,
+            Some(bind) => BindHost::Host(bind.to_owned()),
+        },
+        bind_port,
+        target_host: host.to_owned(),
+        target_port,
+    })
 }
 
-fn split_forward(s: &str) -> Result<([&str; 4], usize)> {
+fn split_tcp_fields(s: &str) -> Result<([&str; 4], usize)> {
     let mut parts = [""; 4];
     let mut n = 0;
     let mut start = 0;
@@ -416,7 +419,10 @@ fn split_forward(s: &str) -> Result<([&str; 4], usize)> {
                 bracket = true;
             }
             b']' => {
-                ensure!(bracket, "Invalid forwarding address: {s}");
+                ensure!(
+                    bracket && (i + 1 == s.len() || s.as_bytes()[i + 1] == b':'),
+                    "Invalid forwarding address: {s}"
+                );
                 bracket = false;
             }
             b':' if !bracket => {
@@ -431,14 +437,6 @@ fn split_forward(s: &str) -> Result<([&str; 4], usize)> {
     ensure!(!bracket, "Unclosed forwarding address: {s}");
     parts[n] = &s[start..];
     n += 1;
-
-    for part in &mut parts[..n] {
-        if let Some(s) = part.strip_prefix('[') {
-            *part = s
-                .strip_suffix(']')
-                .context("Invalid bracketed forwarding address")?;
-        }
-    }
 
     Ok((parts, n))
 }
@@ -493,24 +491,30 @@ mod tests {
             ("github", "github.com", "git", 22, RequestTty::ForShell),
             ("my-host", "example.com", "alice", 2222, RequestTty::IfTty),
         ] {
-            let toml = load(&toml_path, alias)?.chain;
-            let lua = load(&lua_path, alias)?.chain;
+            let toml = load(&toml_path, alias)?.connection;
+            let lua = load(&lua_path, alias)?.connection;
 
-            assert_eq!(toml.target.dest.name, host);
-            assert_eq!(toml.target.dest.user, user);
-            assert_eq!(toml.target.dest.port, port);
+            assert_eq!(toml.chain().target.dest.name, host);
+            assert_eq!(toml.chain().target.dest.user, user);
+            assert_eq!(toml.chain().target.dest.port, port);
             assert_eq!(
-                toml.target.auth.identities.as_deref(),
+                toml.chain().target.auth.identities.as_deref(),
                 Some(std::slice::from_ref(&identity))
             );
-            assert!(toml.target.auth.identities_only);
-            assert_eq!(toml.target.tty, tty);
-            assert!(toml.bastions.is_none());
-            assert!(lua.bastions.is_none());
+            assert!(toml.chain().target.auth.identities_only);
+            assert_eq!(toml.chain().target.tty, tty);
+            assert!(toml.chain().bastions.is_none());
+            assert!(lua.chain().bastions.is_none());
 
-            let mut expected_lua = toml.target;
-            expected_lua.auth.agent = None;
-            assert_eq!(lua.target, expected_lua);
+            let toml = &toml.chain().target;
+            let lua = &lua.chain().target;
+            assert_eq!(lua.dest, toml.dest);
+            assert_eq!(lua.tty, toml.tty);
+            assert_eq!(lua.auth.identities, toml.auth.identities);
+            assert_eq!(lua.auth.cert, toml.auth.cert);
+            assert_eq!(lua.auth.identities_only, toml.auth.identities_only);
+            assert_eq!(lua.auth.includes_none, toml.auth.includes_none);
+            assert!(lua.auth.agent.is_none());
         }
 
         Ok(())
@@ -551,15 +555,15 @@ mod tests {
         ])?
         .build()?;
 
-        assert_eq!(conf.chain.target.dest.name, "target.example");
-        assert_eq!(conf.chain.target.dest.user, "alice");
-        assert_eq!(conf.chain.target.dest.port, 2222);
+        assert_eq!(conf.connection.chain().target.dest.name, "target.example");
+        assert_eq!(conf.connection.chain().target.dest.user, "alice");
+        assert_eq!(conf.connection.chain().target.dest.port, 2222);
         assert_eq!(
-            conf.chain.target.auth.identities,
+            conf.connection.chain().target.auth.identities,
             Some(vec![PathBuf::from("/keys/cli")])
         );
-        assert!(conf.chain.bastions.is_none());
-        assert_eq!(conf.chain.target.tty, RequestTty::Always);
+        assert!(conf.connection.chain().bastions.is_none());
+        assert_eq!(conf.connection.chain().target.tty, RequestTty::Always);
 
         assert!(conf.verbose);
         assert!(conf.stdin_null);
@@ -583,7 +587,7 @@ mod tests {
 
     #[test]
     fn parsing_defers_loading_and_build_errors_retain_log_metadata() -> Result<()> {
-        use openrussh_cli_config::{Error, LogLevel};
+        use openrussh_cli_config::{Error, LogFilter};
 
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("config.toml");
@@ -601,8 +605,8 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(
-            error.downcast_ref::<Error>().and_then(Error::log_level),
-            Some(LogLevel::None)
+            error.downcast_ref::<Error>().and_then(Error::log_filter),
+            Some(LogFilter::Disabled)
         ));
         assert_eq!(
             format!("{error:#}"),
@@ -637,9 +641,19 @@ mod tests {
                 Some(2200),
             ),
             ("ssh://[2001:db8::1]:2200", None, "2001:db8::1", Some(2200)),
+            (
+                "ssh://名@例.example:2200/",
+                Some("名"),
+                "例.example",
+                Some(2200),
+            ),
         ] {
+            let input = s.to_owned();
+            let buffer = input.as_ptr();
+            let destination = parse_destination(input)?;
+            assert_eq!(destination.host.as_ptr(), buffer, "{s}");
             assert_eq!(
-                parse_destination(s.to_owned())?,
+                destination,
                 Destination {
                     host: host.to_owned(),
                     user: user.map(str::to_owned),
@@ -863,18 +877,22 @@ mod tests {
         assert_eq!(forwards.len(), 2);
 
         assert_eq!(
-            forwards[0].target,
-            ForwardTarget::Tcp {
-                host: "db".to_owned(),
-                port: 5432
+            forwards[0],
+            LocalForward::Tcp {
+                bind_host: BindHost::Loopback,
+                bind_port: 8080,
+                target_host: "db".to_owned(),
+                target_port: 5432,
             }
         );
 
         assert_eq!(
-            forwards[1].target,
-            ForwardTarget::Tcp {
-                host: "db".to_owned(),
-                port: 5433
+            forwards[1],
+            LocalForward::Tcp {
+                bind_host: BindHost::Loopback,
+                bind_port: 8081,
+                target_host: "db".to_owned(),
+                target_port: 5433,
             }
         );
 
@@ -935,12 +953,11 @@ mod tests {
         ] {
             assert_eq!(
                 parse_forward(s, gateway)?,
-                LocalForward {
-                    bind: LocalBind::Tcp { host, port: 8080 },
-                    target: ForwardTarget::Tcp {
-                        host: "db".to_owned(),
-                        port: 5432
-                    },
+                LocalForward::Tcp {
+                    bind_host: host,
+                    bind_port: 8080,
+                    target_host: "db".to_owned(),
+                    target_port: 5432,
                 },
                 "{s}"
             );
@@ -948,15 +965,11 @@ mod tests {
 
         assert_eq!(
             parse_forward("[::1]:8080:[2001:db8::2]:5432", false)?,
-            LocalForward {
-                bind: LocalBind::Tcp {
-                    host: BindHost::Host("::1".to_owned()),
-                    port: 8080
-                },
-                target: ForwardTarget::Tcp {
-                    host: "2001:db8::2".to_owned(),
-                    port: 5432
-                },
+            LocalForward::Tcp {
+                bind_host: BindHost::Host("::1".to_owned()),
+                bind_port: 8080,
+                target_host: "2001:db8::2".to_owned(),
+                target_port: 5432,
             }
         );
 
@@ -967,9 +980,24 @@ mod tests {
     fn unix_socket_forwards_preserve_paths() -> Result<()> {
         assert_eq!(
             parse_forward("/tmp/local socket:/tmp/remote socket", false)?,
-            LocalForward {
-                bind: LocalBind::Unix("/tmp/local socket".into()),
-                target: ForwardTarget::Unix("/tmp/remote socket".to_owned()),
+            LocalForward::Unix {
+                bind: "/tmp/local socket".into(),
+                target: "/tmp/remote socket".to_owned(),
+            }
+        );
+
+        assert_eq!(
+            parse_forward("./local[socket]:./remote[socket]", false)?,
+            LocalForward::Unix {
+                bind: "./local[socket]".into(),
+                target: "./remote[socket]".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_forward("[./local]:[./remote]", false)?,
+            LocalForward::Unix {
+                bind: "[./local]".into(),
+                target: "[./remote]".to_owned(),
             }
         );
 
@@ -998,6 +1026,10 @@ mod tests {
             "65536:db:5432",
             "-1:db:5432",
             "port:db:5432",
+            "[8080]:db:5432",
+            "8080:db:[5432]",
+            "[127.0.0.1]:[8080]:db:5432",
+            "8080:[]:5432",
             "65536:/tmp/remote.sock",
             "localhost:65536:/tmp/remote.sock",
             "socket:db:5432",
@@ -1018,8 +1050,11 @@ mod tests {
             "::1:5432",
             "[::1]:",
             "db:5432:extra",
+            "db:[5432]",
+            "[]:5432",
+            "/tmp/socket:5432",
         ] {
-            assert!(parse_address(s).is_err(), "{s}");
+            assert!(parse_tcp_endpoint(s).is_err(), "{s}");
         }
     }
 }

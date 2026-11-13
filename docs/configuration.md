@@ -57,6 +57,11 @@ For example, `Compression`, `Ciphers`, `MACs`, and `LocalForward` in an OpenSSH 
 
 For scalar settings, the first value among matching host blocks wins. `IdentityFile` entries accumulate across matching blocks. CLI user, port, identity, and jump overrides are inserted before file settings; CLI identity entries therefore precede file entries. The final destination's CLI PTY override is applied after host resolution.
 
+The locked dependency does not detect cycles in recursively inherited
+first-entry `ProxyJump` routes. Such an OpenSSH configuration can keep resolving
+and allocating indefinitely. The native cycle check described below applies to
+TOML and Lua only.
+
 The library's path and value behavior is preserved. OpenSSH identity paths may be relative; the native absolute-path requirement is not imposed on them. Tilde expansion supports the current user's home directory, and paths that cannot be expanded are omitted rather than rejected. `IdentityAgent` supports the same whole-value environment references and `SSH_AUTH_SOCK` fallback described for TOML below, while retaining the library's permissive path behavior.
 
 OpenSSH values do not pass through the native boolean conversions. `IdentitiesOnly` is enabled only by the literal string `yes`. `RequestTTY` recognizes `no`, `yes`, and `force` without regard to ASCII case; other values use the default shell-only policy. The application does not prevalidate identity-file contents or replace the library's authentication selection logic.
@@ -396,7 +401,7 @@ For example, if the destination names `["a", "b"]` and `a` itself names `["outer
 local client -> outer -> a -> b -> destination
 ```
 
-Unlike CLI `-J none`, the native file value `proxy_jump = "none"` names a literal host called `none`; it does not clear the list. Use an empty array instead. The current resolver has no cycle detection for recursively inherited first-entry jumps. Configuration must describe an acyclic route; a cycle can prevent resolution from completing.
+Unlike CLI `-J none`, the native file value `proxy_jump = "none"` names a literal host called `none`; it does not clear the list. Use an empty array instead. Native resolution rejects cycles reachable through recursively inherited first-entry jumps with a configuration error before constructing connection hosts. Only traversed first-entry ancestry participates; unused hosts and later entries' own jump lists are not followed. A jump source is identified by its lookup alias, or by its inline Lua record, independently of its network destination, user, and port.
 
 The same nested route can be expressed with inline Lua hosts:
 

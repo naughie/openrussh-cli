@@ -3,7 +3,7 @@
 //! [`Error`] distinguishes source IO and format errors from native path or
 //! algorithm validation. [`Error::OpenConfig`], [`Error::ReadConfig`], and
 //! [`Error::CanonicalizeLua`] add the selected path and operation; [`Error::Native`]
-//! carries a successfully parsed native logging policy. [`Error::log_level()`]
+//! carries a successfully parsed native logging policy. [`Error::log_filter()`]
 //! retrieves that policy through the surrounding file context.
 //!
 //! Ordinary [`std::fmt::Display`] reports the current operation or validation
@@ -29,7 +29,7 @@
 //! );
 //! ```
 
-use crate::LogLevel;
+use crate::LogFilter;
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -39,7 +39,7 @@ use std::path::PathBuf;
 /// The result of a configuration operation, with [`Error`] as its failure type.
 ///
 /// This alias is also re-exported at the crate root. It covers configuration
-/// building, [`crate::Config::preferred()`], [`LogLevel::try_from_filter()`], and
+/// building, [`crate::Config::preferred()`], [`LogFilter::try_from_filter()`], and
 /// algorithm-policy lookup.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -47,7 +47,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// File loading usually adds [`Self::OpenConfig`] or [`Self::ReadConfig`] context
 /// around the underlying cause. Native validation adds [`Self::Native`] context
-/// so a caller can honor [`Self::log_level()`] even when configuration fails.
+/// so a caller can honor [`Self::log_filter()`] even when configuration fails.
 /// The enum is non-exhaustive: downstream matches must include a wildcard arm.
 ///
 /// Match the typed context when an explicitly selected file does not exist:
@@ -73,7 +73,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///     }
 ///     _ => panic!("expected an explicit-file opening failure"),
 /// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// # Ok::<(), openrussh_cli_config::Error>(())
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
@@ -110,7 +110,7 @@ pub enum Error {
         /// The username lookup failure.
         whoami::Error,
     ),
-    /// [`LogLevel::try_from_filter()`] rejected logging filter directives.
+    /// [`LogFilter::try_from_filter()`] rejected logging filter directives.
     ///
     /// Direct calls to that helper return this variant. Invalid filters in
     /// configuration files fail during deserialization and instead surface as
@@ -132,7 +132,7 @@ pub enum Error {
     },
     /// Reading, parsing, executing, or resolving a selected configuration failed.
     ///
-    /// This wrapper retains file context and forwards [`Self::log_level()`] to
+    /// This wrapper retains file context and forwards [`Self::log_filter()`] to
     /// the contained error.
     ReadConfig {
         /// The selected file path.
@@ -154,7 +154,7 @@ pub enum Error {
     /// rejection of inline jump records after deserialization.
     Native {
         /// The parsed log policy, or `None` when the native file omitted it.
-        log_level: Option<LogLevel>,
+        log_filter: Option<LogFilter>,
         /// The validation or resolution failure.
         source: Box<Error>,
     },
@@ -176,6 +176,10 @@ pub enum Error {
     TomlInlineJump,
     /// A selected inline Lua jump has no `host_name` of its own or in defaults.
     InlineJumpMissingHost,
+    /// Native jump-host inheritance revisits the same configured route.
+    ///
+    /// Such a route cannot resolve to a finite connection chain.
+    JumpCycle,
     /// A native KEX/host-key list is empty, or its operation removed every choice.
     EmptyAlgorithmList,
     /// A native algorithm name is empty or uses whitespace, wildcards, or other
@@ -211,7 +215,7 @@ pub enum Error {
     HostCertificateOrder,
     /// Policy lookup received a host reference outside the supplied chain.
     ///
-    /// [`crate::algorithms::Policies::get()`] checks reference identity, so an equal
+    /// [`crate::ConnectionConfig::algorithm_policy()`] checks reference identity, so an equal
     /// cloned host also produces this error.
     HostNotInChain,
     /// A chain's bastion index has no corresponding entry in its policy array.
@@ -222,14 +226,14 @@ impl Error {
     /// Returns a native log policy retained on a later configuration failure.
     ///
     /// This traverses [`Self::ReadConfig`] context to [`Self::Native`]. A supplied
-    /// `LogLevel::None` remains `Some(&LogLevel::None)`, so callers can distinguish
+    /// `LogFilter::Disabled` remains `Some(&LogFilter::Disabled)`, so callers can distinguish
     /// explicit disabling from an omitted policy. Reading, format execution,
     /// deserialization, and invalid-filter failures have no parsed policy;
     /// successful native deserialization preserves it on later path, algorithm,
     /// jump-shape, or host-resolution errors. OpenSSH errors have no native policy.
     ///
     /// ```
-    /// use openrussh_cli_config::{Config, Destination, LogLevel, Session};
+    /// use openrussh_cli_config::{Config, Destination, LogFilter, Session};
     ///
     /// let directory = tempfile::tempdir()?;
     /// let path = directory.path().join("config.toml");
@@ -245,20 +249,34 @@ impl Error {
     ///     )
     ///     .err()
     ///     .expect("relative native identity paths must fail");
-    /// assert!(matches!(error.log_level(), Some(LogLevel::None)));
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// assert!(matches!(error.log_filter(), Some(LogFilter::Disabled)));
+    /// # Ok::<(), openrussh_cli_config::Error>(())
     /// ```
-    pub fn log_level(&self) -> Option<&LogLevel> {
+    pub fn log_filter(&self) -> Option<&LogFilter> {
         match self {
-            Self::Native { log_level, .. } => log_level.as_ref(),
-            Self::ReadConfig { source, .. } => source.log_level(),
+            Self::Native { log_filter, .. } => log_filter.as_ref(),
+            Self::ReadConfig { source, .. } => source.log_filter(),
             _ => None,
         }
     }
 
-    pub(crate) fn with_log_level(self, log_level: Option<LogLevel>) -> Self {
+    /// Takes a retained native log policy, leaving its slot empty.
+    ///
+    /// Like [`Self::log_filter()`], this traverses selected-file context to the
+    /// native policy. The error, filename, and source chain remain intact. A
+    /// second call returns `None`; errors without a native policy also return
+    /// `None`. This transfers ownership without cloning the parsed filter.
+    pub fn take_log_filter(&mut self) -> Option<LogFilter> {
+        match self {
+            Self::Native { log_filter, .. } => log_filter.take(),
+            Self::ReadConfig { source, .. } => source.take_log_filter(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn with_log_filter(self, log_filter: Option<LogFilter>) -> Self {
         Self::Native {
-            log_level,
+            log_filter,
             source: Box::new(self),
         }
     }
@@ -297,6 +315,7 @@ impl fmt::Display for Error {
                 f.write_str("TOML proxy-jump must be a string or an array of strings")
             }
             Self::InlineJumpMissingHost => f.write_str("Inline proxy_jump host requires host_name"),
+            Self::JumpCycle => f.write_str("Proxy jump route contains an inheritance cycle"),
             Self::EmptyAlgorithmList => f.write_str("Algorithm list must not be empty"),
             Self::InvalidAlgorithmName { name } => write!(
                 f,

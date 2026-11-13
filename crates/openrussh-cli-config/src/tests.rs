@@ -5,8 +5,6 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 pub(crate) struct TestConfig {
     builder: ConfigBuilder,
     pub(crate) destination: Destination,
@@ -35,7 +33,7 @@ impl TestConfig {
     }
 
     fn default_config(&self, dir: &Path) -> crate::Result<Resolved> {
-        self.builder.default_config(dir, &self.options())
+        ConfigBuilder::default_config(dir, &self.options())
     }
 
     fn load(self) -> crate::Result<Config> {
@@ -68,11 +66,11 @@ fn config(text: &str) -> Result<(TempDir, TestConfig)> {
 }
 
 #[test]
-fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()> {
-    fn check(level: Option<LogLevel>, expected: Option<&str>) {
+fn native_log_filters_accept_both_spellings_and_preserve_omission() -> Result<()> {
+    fn check(level: Option<LogFilter>, expected: Option<&str>) {
         match (level, expected) {
-            (Some(LogLevel::None), None) => {}
-            (Some(LogLevel::Filter(filter)), Some(expected)) => {
+            (Some(LogFilter::Disabled), None) => {}
+            (Some(LogFilter::Filter(filter)), Some(expected)) => {
                 assert_eq!(filter.to_string(), expected);
             }
             (actual, expected) => {
@@ -99,16 +97,16 @@ fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()>
         ("russh", Some("russh=trace")),
         ("russh::client=info", Some("russh::client=info")),
     ] {
-        check(Some(LogLevel::try_from_filter(name)?), expected);
+        check(Some(LogFilter::try_from_filter(name)?), expected);
 
         for field in ["log-level", "log_level"] {
             let source = format!("[meta]\n{field} = '{name}'");
             let resolved = toml::ParsedConfig::parse(&source)?.resolve(&options.options())?;
-            check(resolved.meta.log_level, expected);
+            check(resolved.meta.log_filter, expected);
 
             let source = format!("return {{meta = {{['{field}'] = '{name}'}}}}");
             let resolved = lua::execute(&source)?.resolve(&options.options())?;
-            check(resolved.meta.log_level, expected);
+            check(resolved.meta.log_filter, expected);
         }
     }
 
@@ -117,7 +115,7 @@ fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()>
             toml::ParsedConfig::parse(source)?
                 .resolve(&options.options())?
                 .meta
-                .log_level
+                .log_filter
                 .is_none()
         );
     }
@@ -126,16 +124,16 @@ fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()>
             lua::execute(source)?
                 .resolve(&options.options())?
                 .meta
-                .log_level
+                .log_filter
                 .is_none()
         );
     }
 
-    assert!(options.resolve()?.meta.log_level.is_none());
+    assert!(options.resolve()?.meta.log_filter.is_none());
     assert!(
         defaults::resolve(&options.options())?
             .meta
-            .log_level
+            .log_filter
             .is_none()
     );
 
@@ -143,18 +141,27 @@ fn native_log_levels_accept_both_spellings_and_preserve_omission() -> Result<()>
 }
 
 #[test]
-fn log_filter_constructor_accepts_owned_inputs_and_returns_typed_failures() -> Result<()> {
+fn log_filter_parsing_accepts_owned_inputs_and_returns_typed_failures() -> Result<()> {
     let directives = String::from("debug,russh=info");
-    let borrowed = LogLevel::try_from_filter(&directives)?;
-    let owned = LogLevel::try_from_filter(directives)?;
-    let (LogLevel::Filter(borrowed), LogLevel::Filter(owned)) = (borrowed, owned) else {
+    let borrowed = LogFilter::try_from_filter(&directives)?;
+    let parsed: LogFilter = directives.parse()?;
+    let owned = LogFilter::try_from_filter(directives)?;
+    let (LogFilter::Filter(borrowed), LogFilter::Filter(owned), LogFilter::Filter(parsed)) =
+        (borrowed, owned, parsed)
+    else {
         panic!("expected explicit filters");
     };
     assert_eq!(borrowed.to_string(), owned.to_string());
+    assert_eq!(borrowed.to_string(), parsed.to_string());
+    assert!(matches!("none".parse::<LogFilter>()?, LogFilter::Disabled));
 
     for directives in ["russh=verbose", "debug,russh=nope", "russh=info=debug"] {
         assert!(matches!(
-            LogLevel::try_from_filter(directives),
+            LogFilter::try_from_filter(directives),
+            Err(Error::InvalidLogFilter(_))
+        ));
+        assert!(matches!(
+            directives.parse::<LogFilter>(),
             Err(Error::InvalidLogFilter(_))
         ));
     }
@@ -163,7 +170,7 @@ fn log_filter_constructor_accepts_owned_inputs_and_returns_typed_failures() -> R
 }
 
 #[test]
-fn native_log_levels_reject_invalid_values_and_host_fields() -> Result<()> {
+fn native_log_filters_reject_invalid_values_and_host_fields() -> Result<()> {
     for value in [
         "'russh=verbose'",
         "'debug,russh=nope'",
@@ -202,7 +209,7 @@ fn native_log_levels_reject_invalid_values_and_host_fields() -> Result<()> {
 }
 
 #[test]
-fn native_resolution_errors_retain_log_level_filename_and_cause() -> Result<()> {
+fn native_resolution_errors_retain_log_filter_filename_and_cause() -> Result<()> {
     for (extension, source, cause) in [
         (
             "toml",
@@ -235,11 +242,17 @@ fn native_resolution_errors_retain_log_level_filename_and_cause() -> Result<()> 
         std::fs::rename(options.config_file.as_ref().unwrap(), &path)?;
         options.config_file = Some(path.clone());
 
-        let error = options.load().err().expect("Expected resolution failure");
-        assert!(matches!(error.log_level(), Some(LogLevel::None)));
+        let mut error = options.load().err().expect("Expected resolution failure");
+        assert!(matches!(error.log_filter(), Some(LogFilter::Disabled)));
+        let message = format!("Could not read SSH config {}: {cause}", path.display());
+        assert_eq!(format!("{error:#}"), message);
+        assert!(matches!(error.take_log_filter(), Some(LogFilter::Disabled)));
+        assert!(error.log_filter().is_none());
+        assert!(error.take_log_filter().is_none());
+        assert_eq!(format!("{error:#}"), message);
         assert_eq!(
-            format!("{error:#}"),
-            format!("Could not read SSH config {}: {cause}", path.display())
+            std::error::Error::source(&error).unwrap().to_string(),
+            cause,
         );
     }
 
@@ -481,17 +494,23 @@ fn both_formats_construct_equivalent_application_configs() -> Result<()> {
         options.compression = true;
         options.ciphers = Some("aes256-ctr".to_owned());
         options.macs = Some("hmac-sha2-256".to_owned());
-        options.local_forwards = Some(vec![LocalForward {
-            bind: LocalBind::Unix("local.sock".into()),
-            target: ForwardTarget::Unix("remote.sock".to_owned()),
+        options.local_forwards = Some(vec![LocalForward::Unix {
+            bind: "local.sock".into(),
+            target: "remote.sock".to_owned(),
         }]);
     }
 
     let openssh = openssh.load()?;
     let toml = toml.load()?;
 
-    assert_eq!(openssh.chain.target, toml.chain.target);
-    assert_eq!(openssh.chain.bastions, toml.chain.bastions);
+    assert_eq!(
+        openssh.connection.chain().target,
+        toml.connection.chain().target
+    );
+    assert_eq!(
+        openssh.connection.chain().bastions,
+        toml.connection.chain().bastions
+    );
     assert!(openssh.verbose);
     assert!(toml.verbose);
     assert_eq!(openssh.session, toml.session);
@@ -527,8 +546,8 @@ fn toml_extension_selects_the_parser_and_preserves_cli_tty() -> Result<()> {
 
     let resolved = conf.load()?;
 
-    assert_eq!(resolved.chain.target.dest.user, "alice");
-    assert_eq!(resolved.chain.target.tty, RequestTty::Never);
+    assert_eq!(resolved.connection.chain().target.dest.user, "alice");
+    assert_eq!(resolved.connection.chain().target.tty, RequestTty::Never);
 
     Ok(())
 }
@@ -590,7 +609,8 @@ fn command_line_values_precede_file_values() -> Result<()> {
     conf.identities = Some(vec!["/keys/first".into(), "/keys/second".into()]);
     conf.tty = Some(RequestTty::Never);
 
-    let chain = conf.load()?.chain;
+    let config = conf.load()?;
+    let chain = config.connection.chain();
 
     assert_eq!(chain.target.dest.user, "alice");
 

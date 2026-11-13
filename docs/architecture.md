@@ -31,10 +31,13 @@ asynchronous input resources. Its Rust crate name is `openrussh_cli_terminal`.
 | `config::toml::profiles::Profiles<'src>` | TOML source representation. | Borrowed or decoded TOML strings, setup metadata, defaults, and exact named hosts. |
 | `config::lua::profiles::Profiles` | Lua source representation. | Owned strings, setup metadata, defaults, named hosts, and named or inline jumps. |
 | `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, and resolved setup `Meta`. |
-| `config::Meta` | Application setup settings for the invocation. | An optional known-host database path and log filter. |
-| `config::algorithms::Policies` | Algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
-| `config::Config` | Final application configuration for one invocation. | The resolved chain, algorithms, and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
-| `config::Error` | Configuration failure with its underlying cause. | Typed error and source chain, with an optional parsed log filter accessible through `log_level()`. |
+| `config::Meta` | Application setup settings for the invocation. | An optional known-host database path and `LogFilter` policy. |
+| `config::LogFilter` | Explicit logging policy, distinct from omission and a single severity level. | `Disabled` or parsed target/span filtering directives. |
+| `config::LocalForward` | One supported local forwarding operation. | A TCP variant with TCP endpoints, or a Unix variant with local and remote socket paths. |
+| `config::ConnectionConfig` | A resolved connection route and the policy for each host in that route. | Private chain and policies; read-only `chain()` and `algorithm_policy(host)` access. |
+| `config::algorithms::Policies` | Private algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
+| `config::Config` | Final application configuration for one invocation. | A `ConnectionConfig` and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
+| `config::Error` | Configuration failure with its underlying cause. | Typed error and source chain, with an optional parsed log filter accessible through `log_filter()`. |
 
 `Config` is a struct, not a configuration-provider trait or a union of file
 formats. It has no Serde implementation, source-text lifetime, Lua value, file
@@ -108,7 +111,8 @@ disables escapes.
 requires both the destination and session at finalization, so a builder cannot
 silently manufacture either. It discovers one source, resolves its connection
 and setup settings into `Resolved`, applies the final-host CLI PTY override,
-and moves the remaining application settings into `Config`.
+seals the chain and policies into `ConnectionConfig`, and moves the remaining
+application settings into `Config`.
 
 File selection is centralized in `ConfigBuilder`. Its finalizer creates a
 private `ResolveOptions` borrowing the destination and any supplied identity
@@ -120,11 +124,13 @@ selected file retain the filename and underlying error; they do not trigger
 fallback to another format. The crate returns its own `Error` and `Result`
 types, with no dependency on `anyhow`. `Error` is a public, non-exhaustive enum
 covering IO, format parsing/execution, path and algorithm validation, and policy
-lookup failures; `Result<T>` aliases `std::result::Result<T, Error>`. `Error::log_level()` retains a successfully
+lookup failures; `Result<T>` aliases `std::result::Result<T, Error>`. `Error::log_filter()` retains a successfully
 parsed native filter on later validation or resolution failures, including
 TOML jump-shape validation. Reading, execution, or deserialization failures
 use the default error filter. The application converts the error at its own
 `anyhow` boundary and uses the preserved source chain for diagnostics.
+`Error::take_log_filter()` transfers the owned logging policy to subscriber
+setup without cloning the filter or consuming the diagnostic.
 
 Each format has an explicit construction step and independently implements the
 private `ResolveConfig` trait's
@@ -200,21 +206,35 @@ from defaults. TOML resolves named targets and contains no Lua inline-host
 model. See the configuration reference for each format's current ordering and
 inheritance behavior. The root `defaults` module constructs an owned `Chain`,
 `Auth`, and `Meta` for the no-file path independently of either native profile
-type.
+type. Each native resolver checks the traversed first-jump ancestry for cycles
+before constructing connection hosts. Two borrowed cursors detect a repeated
+jump source without a heap-allocated visited collection. Named-source identity
+uses the lookup alias; Lua inline-source identity uses the record reference.
+Embedded users, ports, and resolved network names do not identify jump sources.
 
 The resolver compiles each effective native algorithm list into typed transport
 names. Per-host values override defaults; list modifiers use raw transport
 defaults rather than inherited policy lists. `Policies` follows the same target
-and reversed-bastion layout as the resolved `Chain`. The handler factory borrows
-both and identifies each actual `&Host` by reference identity, so two named or
-inline hosts with the same network destination can still have different
-policies. It neither clones hosts nor uses destination names as policy keys.
+and reversed-bastion layout as the resolved `Chain`. `ConnectionConfig` owns
+both behind private fields: callers can neither reorder the chain nor replace
+its policy collection independently. The handler factory borrows this one
+connection configuration, required by its constructor, and asks
+`algorithm_policy(host)` for each actual `&Host` by reference identity. A host from another configuration is rejected,
+even when its connection values are identical. Two named or inline hosts with
+the same network destination can therefore have different policies. Lookup
+neither clones hosts nor uses destination names as policy keys.
 
 `Meta` is invocation setup, outside each format's host/default schema. Metadata
-paths resolve under that format's own rules. Optional log directives use
-`LogLevel::try_from_filter()`, backed by `tracing_subscriber::EnvFilter`, and combine with the CLI
-verbosity flag when configuring the tracing subscriber. An omitted filter means
-error-only logging without `-v` and debug logging with `-v`; an explicit empty
+paths resolve under that format's own rules. The final `Meta::log_filter` holds
+`Option<LogFilter>`: omission selects the CLI default, `Disabled` explicitly
+suppresses diagnostics, and `Filter` contains parsed directives rather than a
+single severity level. Source keys remain `log-level` and `log_level`.
+Optional log directives use
+`LogFilter::try_from_filter()` or its standard `FromStr` implementation, backed
+by `tracing_subscriber::EnvFilter`. Native Serde deserialization parses string
+visitors directly without an intermediate owned string. The directives combine
+with the CLI verbosity flag when configuring the tracing subscriber. An omitted
+filter means error-only logging without `-v` and debug logging with `-v`; an explicit empty
 string means error-only logging in either mode. Non-verbose mode additionally
 caps any filter at errors. OpenSSH resolution and the no-file path produce
 default metadata and omit explicit algorithm policies; the OpenSSH adapter does
@@ -239,7 +259,10 @@ environment resolution instead of expanding every unused host's settings eagerly
 OpenSSH resolution calls the dependency's `Target::query` on its `SshConfig`.
 It retains the dependency's path, authentication-default, host-matching, and
 jump-chain behavior. Native validation is not applied to the OpenSSH parser's
-output.
+output. Its jump-cycle limitation also remains: adding a separate traversal
+through the current dependency's allocating host matcher would increase normal
+resolution allocations. Correcting that path requires a dependency-level change
+or an allocation-free matching API.
 
 Configuration loading does not open identity files to inspect key material or
 connect to an agent. `Connection::connect()` owns those operations and SSH user
@@ -293,6 +316,13 @@ owned connection values it needs, and creates a bastion collection only when
 jump hosts are present. CLI-owned session and forwarding values move into the
 resolved `Config`.
 
+`LocalForward` is a sum of supported operations, not a product of independent
+local and remote transport choices. Its TCP variant carries both TCP endpoints;
+its Unix variant carries a native local `PathBuf` and a remote `String` path.
+Mixed transports cannot be constructed. The runtime preserves this pairing in
+its listener and accepted-stream variants, with owned target names only at
+existing task boundaries.
+
 ## Module layout and regression boundaries
 
 ```text
@@ -304,7 +334,7 @@ src/
 crates/openrussh-cli-config/
     Cargo.toml             Configuration-only dependencies
     src/
-        lib.rs             Config, Meta, public model types, and private resolution inputs
+        lib.rs             Config, ConnectionConfig, Meta, model types, and private resolution inputs
         builder.rs         ConfigBuilder, file discovery, and static source dispatch
         defaults.rs        Independent no-file connection/authentication defaults
         error.rs           Typed configuration errors and source context

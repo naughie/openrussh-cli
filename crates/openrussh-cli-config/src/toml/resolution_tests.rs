@@ -4,8 +4,6 @@ use openrussh_client::config::Target;
 
 use std::path::{Path, PathBuf};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 fn config(host: &str) -> TestConfig {
     TestConfig::new(host)
 }
@@ -134,7 +132,9 @@ fn omitted_and_agent_directives_keep_library_behavior() -> Result<()> {
     ] {
         let openssh = SshConfig::default()
             .parse(&mut openssh.as_bytes(), ParseRule::ALLOW_UNSUPPORTED_FIELDS)?;
-        let expected = Target::parse("sample").query(&openssh)?;
+        let expected = Target::parse("sample")
+            .query(&openssh)
+            .map_err(crate::Error::OpenSshResolve)?;
 
         assert_eq!(
             query(toml, &config("sample").options())?.target,
@@ -224,6 +224,58 @@ host-name = "wrong.example"
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn cyclic_first_jump_routes_are_rejected() {
+    for text in [
+        "[hosts.sample]\nproxy-jump = 'sample'",
+        "[hosts.sample]\nproxy-jump = 'lead'\n[hosts.lead]\nproxy-jump = 'a'\n[hosts.a]\nproxy-jump = 'b'\n[hosts.b]\nproxy-jump = 'a'",
+        "[default]\nproxy-jump = 'gateway'",
+        "[hosts.sample]\nproxy-jump = 'gateway'\n[hosts.gateway]\nproxy-jump = 'another@gateway:2222'",
+    ] {
+        assert!(
+            matches!(
+                query(text, &config("sample").options()),
+                Err(crate::Error::Native { source, .. })
+                    if matches!(source.as_ref(), crate::Error::JumpCycle)
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn jump_cycle_checks_follow_selected_aliases_and_overrides() -> Result<()> {
+    let source = "[hosts.sample]\nproxy-jump = ['A', 'loop']\n[hosts.A]\nhost-name = 'same'\nproxy-jump = 'a'\n[hosts.a]\nhost-name = 'same'\nproxy-jump = []\n[hosts.loop]\nproxy-jump = 'loop'";
+    let chain = query(source, &config("sample").options())?;
+    let bastions = chain.bastions.unwrap();
+    assert_eq!(bastions.len(), 3);
+    assert_eq!(bastions[1].dest.name, bastions[2].dest.name);
+
+    let mut conf = config("sample");
+    conf.proxy_jump = Some(Vec::new());
+    assert!(
+        query("[default]\nproxy-jump = 'loop'", &conf.options())?
+            .bastions
+            .is_none()
+    );
+
+    // The first invocation uses CLI overrides; revisiting its alias uses the
+    // file's route. Those are separate resolution states.
+    conf.proxy_jump = Some(vec!["sample".to_owned()]);
+    assert_eq!(query("", &conf.options())?.bastions.unwrap().len(), 1);
+
+    let error = query(
+        "[meta]\nlog-level = 'none'\n[default]\nproxy-jump = 'loop'",
+        &config("sample").options(),
+    )
+    .expect_err("a cyclic route must fail");
+    assert!(matches!(
+        error.log_filter(),
+        Some(crate::LogFilter::Disabled)
+    ));
     Ok(())
 }
 

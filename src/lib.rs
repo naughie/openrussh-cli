@@ -12,22 +12,28 @@ use openrussh_client::russh::client::Handler;
 
 use anyhow::Result;
 
-pub async fn main_impl() {
-    let conf = cli::parse().and_then(cli::Invocation::build);
-    let (verbose, level) = conf
-        .as_ref()
-        .map(|conf| (conf.verbose, conf.meta.log_level.as_ref()))
-        .unwrap_or_else(|e| {
-            (
-                false,
-                e.downcast_ref::<config::Error>()
-                    .and_then(config::Error::log_level),
-            )
-        });
-    logging::init(verbose, level);
+use std::process::ExitCode;
+
+/// Runs one CLI invocation and returns its process exit code after cleanup.
+///
+/// The caller owns the Tokio runtime and its shutdown policy. Host-key prompts
+/// use blocking tasks, so runtime shutdown must not wait for an interrupted
+/// prompt to receive more terminal input.
+pub async fn run() -> ExitCode {
+    let mut conf = cli::parse().and_then(cli::Invocation::build);
+    let (verbose, log_filter) = match &mut conf {
+        Ok(conf) => (conf.verbose, conf.meta.log_filter.take()),
+        Err(error) => (
+            false,
+            error
+                .downcast_mut::<config::Error>()
+                .and_then(config::Error::take_log_filter),
+        ),
+    };
+    logging::init(verbose, log_filter);
 
     let result = match conf {
-        Ok(conf) => run(conf).await,
+        Ok(conf) => run_with_config(conf).await,
         Err(e) => Err(e),
     };
     let status = match result {
@@ -37,29 +43,28 @@ pub async fn main_impl() {
             255
         }
     };
-    std::process::exit(i32::from(status));
+    ExitCode::from(status)
 }
 
-async fn run(conf: config::Config) -> Result<u8> {
-    use crate::handler::MyMakeHandler;
+async fn run_with_config(conf: config::Config) -> Result<u8> {
+    use crate::handler::ClientHandlerFactory;
     use crate::known_hosts::KnownHostsFile;
     use openrussh_cli_terminal::{Event, Signals};
 
     let preferred = conf.preferred()?;
     let known_hosts = KnownHostsFile::load(conf.meta.known_hosts.as_deref())?;
-    let make_handler =
-        MyMakeHandler::new(preferred, known_hosts).with_algorithms(&conf.chain, &conf.algorithms);
+    let make_handler = ClientHandlerFactory::new(preferred, known_hosts, &conf.connection);
 
     let mut signals = Signals::new()?;
 
     let conn = {
-        let conn = Connection::connect(&conf.chain, &make_handler);
+        let conn = Connection::connect(conf.connection.chain(), &make_handler);
         tokio::pin!(conn);
         let (shutdown, events) = signals.split();
 
         loop {
             tokio::select! {
-                res = &mut conn => break res.map_err(|e| anyhow::anyhow!("{e}"))?,
+                res = &mut conn => break res.map_err(|e| anyhow::anyhow!(e))?,
                 _ = shutdown.recv() => return Ok(255),
                 event = events.recv() => {
                     match event {
@@ -73,9 +78,9 @@ async fn run(conf: config::Config) -> Result<u8> {
 
     tracing::info!(
         "Authenticated to {} (port {}) as '{}'.",
-        conf.chain.target.dest.name,
-        conf.chain.target.dest.port,
-        conf.chain.target.dest.user
+        conf.connection.chain().target.dest.name,
+        conf.connection.chain().target.dest.port,
+        conf.connection.chain().target.dest.user
     );
 
     drop(make_handler);
@@ -113,7 +118,10 @@ where
         let (shutdown, _) = signals.split();
 
         tokio::select! {
-            res = Forwarding::start(&conn, forwards) => res?,
+            res = Forwarding::start(&conn, forwards) => match res {
+                Ok(forwarding) => forwarding,
+                Err(error) => return finish(&conn, Err(error)).await,
+            },
             sig = shutdown.recv() => return finish(&conn, Ok(signal_status(&conf.session, sig))).await,
         }
     };

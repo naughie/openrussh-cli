@@ -2,6 +2,7 @@ use openrussh_client::known_hosts::{KnownHosts, KnownHostsHandler};
 
 use anyhow::{Context as _, Result};
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,21 +15,17 @@ impl KnownHostsFile {
     pub(crate) fn load(path: Option<&Path>) -> Result<Self> {
         use std::io::ErrorKind;
 
-        let selected = path;
-        let path = path.map(Path::to_path_buf).unwrap_or_else(|| {
-            if let Some(mut home) = std::env::home_dir() {
+        let path = path.map(Cow::Borrowed).unwrap_or_else(|| {
+            let path = if let Some(mut home) = std::env::home_dir() {
                 home.push(".ssh/known_hosts");
                 home
             } else {
                 "/etc/ssh/ssh_known_hosts".into()
-            }
+            };
+            Cow::Owned(path)
         });
         tracing::debug!("Loading known hosts from {}.", path.display());
-        let loaded = match selected {
-            Some(path) => KnownHosts::parse_path(path),
-            None => KnownHosts::parse_default_path(),
-        };
-        let known_hosts = match loaded {
+        let known_hosts = match KnownHosts::parse_path(&path) {
             Ok(known_hosts) => known_hosts,
             Err(e) if e.kind() == ErrorKind::NotFound => KnownHosts::parse(""),
             Err(e) => {
@@ -39,7 +36,7 @@ impl KnownHostsFile {
 
         Ok(Self {
             known_hosts,
-            path: path.into(),
+            path: Arc::from(path.as_ref()),
         })
     }
 

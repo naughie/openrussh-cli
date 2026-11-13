@@ -1,7 +1,7 @@
 use crate::known_hosts::KnownHostsFile;
-use openrussh_cli_config::algorithms::Policies;
+use openrussh_cli_config::ConnectionConfig;
 
-use openrussh_client::config::{Chain, Host};
+use openrussh_client::config::Host;
 use openrussh_client::connect::{Context, MakeHandler};
 use openrussh_client::known_hosts::{KnownHostsHandler, MatchResult};
 use openrussh_client::russh::Channel;
@@ -15,55 +15,50 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) struct MyMakeHandler<'a> {
+pub(crate) struct ClientHandlerFactory<'a> {
     known_hosts: KnownHostsFile,
     preferred: Preferred,
-    algorithms: Option<(&'a Chain, &'a Policies)>,
+    connection: &'a ConnectionConfig,
 }
 
-impl<'a> MyMakeHandler<'a> {
-    pub(crate) fn new(preferred: Preferred, known_hosts: KnownHostsFile) -> Self {
+impl<'a> ClientHandlerFactory<'a> {
+    pub(crate) fn new(
+        preferred: Preferred,
+        known_hosts: KnownHostsFile,
+        connection: &'a ConnectionConfig,
+    ) -> Self {
         Self {
             known_hosts,
             preferred,
-            algorithms: None,
+            connection,
         }
-    }
-
-    pub(crate) fn with_algorithms(mut self, chain: &'a Chain, algorithms: &'a Policies) -> Self {
-        self.algorithms = Some((chain, algorithms));
-        self
     }
 }
 
-impl MakeHandler for MyMakeHandler<'_> {
-    type Handler = MyHandler;
+impl MakeHandler for ClientHandlerFactory<'_> {
+    type Handler = ClientHandler;
     type Error = anyhow::Error;
 
     fn make_handler(&self, host: &Host) -> Result<Context<Self::Handler>, Self::Error> {
+        let algorithms = self.connection.algorithm_policy(host)?;
         tracing::debug!("Connecting to {} port {}.", host.dest.name, host.dest.port);
-        let known_hosts = self.known_hosts.handler(&host.dest.name, host.dest.port);
-        let algorithms = self
-            .algorithms
-            .map(|(chain, policies)| policies.get(chain, host))
-            .transpose()?;
+        let host_name = known_host_name(&host.dest.name).to_ascii_lowercase();
+        let known_hosts = self.known_hosts.handler(&host_name, host.dest.port);
 
         let mut conf = Config {
             preferred: self.preferred.clone(),
             ..Default::default()
         };
-        if !algorithms.is_some_and(|algorithms| algorithms.has_host_keys()) {
+        if !algorithms.has_host_keys() {
             known_hosts.update_preferred_config(&mut conf.preferred);
         }
-        if let Some(algorithms) = algorithms {
-            algorithms.apply(&mut conf.preferred);
-        }
+        algorithms.apply(&mut conf.preferred);
 
-        let handler = MyHandler {
+        let handler = ClientHandler {
             known_hosts,
-            save_path: self.known_hosts.save_path().clone(),
+            save_path: Arc::clone(self.known_hosts.save_path()),
             accepted: None,
-            host: host.dest.name.to_ascii_lowercase(),
+            host: host_name,
             port: host.dest.port,
         };
 
@@ -71,7 +66,7 @@ impl MakeHandler for MyMakeHandler<'_> {
     }
 }
 
-pub(crate) struct MyHandler {
+pub(crate) struct ClientHandler {
     known_hosts: KnownHostsHandler,
     save_path: Arc<Path>,
     accepted: Option<PublicKey>,
@@ -79,7 +74,7 @@ pub(crate) struct MyHandler {
     port: u16,
 }
 
-impl Handler for MyHandler {
+impl Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn auth_banner(&mut self, banner: &str, _session: &mut Session) -> Result<()> {
@@ -89,26 +84,22 @@ impl Handler for MyHandler {
     }
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
+        use openrussh_client::russh::keys::ssh_key::{Fingerprint, HashAlg};
+
         let mut matched = self.known_hosts.check_server_key(key);
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            use openrussh_client::russh::keys::ssh_key::HashAlg;
-
-            let key = key.public_key();
-            tracing::debug!(
-                "Server host key: {} {}",
-                key.algorithm(),
-                key.fingerprint(HashAlg::Sha256)
-            );
-        }
+        let data = match key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key.key_data(),
+            PublicKeyOrCertificate::Certificate(cert) => cert.public_key(),
+        };
+        tracing::debug!(
+            "Server host key: {} {}",
+            data.algorithm(),
+            Fingerprint::new(HashAlg::Sha256, data)
+        );
 
         if matched == MatchResult::NotFound
             && let Some(accepted) = &self.accepted
         {
-            let data = match key {
-                PublicKeyOrCertificate::PublicKey { key, .. } => key.key_data(),
-                PublicKeyOrCertificate::Certificate(cert) => cert.public_key(),
-            };
             matched = if data == accepted.key_data() {
                 MatchResult::Found
             } else {
@@ -127,7 +118,7 @@ impl Handler for MyHandler {
             MatchResult::NotFound => {
                 let host = self.host.clone();
                 let port = self.port;
-                let save_path = self.save_path.clone();
+                let save_path = Arc::clone(&self.save_path);
                 let key = key.public_key();
                 let accepted = tokio::task::spawn_blocking(move || {
                     let confirmed = confirm_key(&save_path, &host, port, &key)?;
@@ -276,6 +267,16 @@ impl Handler for MyHandler {
     }
 }
 
+fn known_host_name(host: &str) -> &str {
+    // Match KnownHostsHandler's principal normalization so lookup and saving
+    // address the same host. The separately supplied port is authoritative.
+    let host = host.trim_start_matches('[');
+    host.find("]:")
+        .map(|index| &host[..index])
+        .unwrap_or(host)
+        .trim_end_matches(']')
+}
+
 fn host_port(host: &str, port: u16) -> impl std::fmt::Display + '_ {
     use std::fmt;
 
@@ -414,14 +415,30 @@ mod tests {
         }
     }
 
-    fn handler(hosts: &str) -> MyHandler {
-        MyHandler {
+    fn handler(hosts: &str) -> ClientHandler {
+        ClientHandler {
             known_hosts: KnownHosts::parse(hosts).handler("server.example", 22),
             save_path: Path::new("/unused-known-hosts").into(),
             accepted: None,
             host: "server.example".to_owned(),
             port: 22,
         }
+    }
+
+    fn connection(host: &str, port: u16) -> Result<ConnectionConfig> {
+        use openrussh_cli_config::{Config, Destination, Session};
+
+        Ok(Config::builder()
+            .config_file("none")
+            .build(
+                Destination {
+                    host: host.to_owned(),
+                    user: Some("alice".to_owned()),
+                    port: Some(port),
+                },
+                Session::None,
+            )?
+            .connection)
     }
 
     #[test]
@@ -491,32 +508,23 @@ mod tests {
 
     #[test]
     fn factory_keeps_client_preferences_and_normalizes_the_host() {
-        use openrussh_client::config::{Dest, Host};
         use openrussh_client::russh::cipher;
 
         use std::borrow::Cow;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("selected_hosts");
-        let maker = MyMakeHandler::new(
+        let connection = connection("SERVER.Example", 2222).unwrap();
+        let maker = ClientHandlerFactory::new(
             Preferred {
                 cipher: Cow::Borrowed(&[cipher::AES_256_CTR]),
                 ..Default::default()
             },
             KnownHostsFile::load(Some(&path)).unwrap(),
+            &connection,
         );
-
-        let host = Host {
-            dest: Dest {
-                name: "SERVER.Example".to_owned(),
-                port: 2222,
-                user: "alice".to_owned(),
-            },
-            auth: Default::default(),
-            tty: Default::default(),
-        };
-
-        let (handler, conf) = maker.make_handler(&host).unwrap().into_inner();
+        let host = &connection.chain().target;
+        let (handler, conf) = maker.make_handler(host).unwrap().into_inner();
 
         assert_eq!(handler.host, "server.example");
 
@@ -529,6 +537,41 @@ mod tests {
         assert_eq!(conf.preferred.cipher.as_ref(), &[cipher::AES_256_CTR]);
 
         assert!(!conf.preferred.host_key_certificates.is_empty());
+
+        assert!(maker.make_handler(&host.clone()).is_err());
+    }
+
+    #[test]
+    fn lookup_and_persistence_use_the_same_normalized_host() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("known_hosts");
+        let key = key();
+
+        for (name, expected) in [
+            ("SERVER.Example", "server.example"),
+            ("[SERVER.Example]:9999", "server.example"),
+            ("[::1]", "::1"),
+        ] {
+            let connection = connection(name, 2222)?;
+            let maker = ClientHandlerFactory::new(
+                Preferred::default(),
+                KnownHostsFile::load(Some(&path))?,
+                &connection,
+            );
+            let host = &connection.chain().target;
+            let (handler, _) = maker.make_handler(host)?.into_inner();
+            assert_eq!(handler.host, expected);
+
+            save_key_at(&path, &handler.host, handler.port, key.public_key())?;
+            assert_eq!(
+                KnownHostsFile::load(Some(&path))?
+                    .handler(name, host.dest.port)
+                    .check_public_key(key.public_key()),
+                MatchResult::Found
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -558,10 +601,13 @@ mod tests {
             &path,
             format!("server.example {}\n", key.public_key().to_openssh()?),
         )?;
-        let maker = MyMakeHandler::new(Preferred::default(), KnownHostsFile::load(Some(&path))?)
-            .with_algorithms(&resolved.chain, &resolved.algorithms);
+        let maker = ClientHandlerFactory::new(
+            Preferred::default(),
+            KnownHostsFile::load(Some(&path))?,
+            &resolved.connection,
+        );
         let (_, client) = maker
-            .make_handler(&resolved.chain.target)
+            .make_handler(&resolved.connection.chain().target)
             .unwrap()
             .into_inner();
 
@@ -572,7 +618,11 @@ mod tests {
             }]
         );
         assert!(client.preferred.host_key_certificates.is_empty());
-        assert!(maker.make_handler(&resolved.chain.target.clone()).is_err());
+        assert!(
+            maker
+                .make_handler(&resolved.connection.chain().target.clone())
+                .is_err()
+        );
 
         Ok(())
     }

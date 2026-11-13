@@ -1,8 +1,6 @@
 use super::*;
 use crate::tests::TestConfig;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 fn options(host: &str) -> TestConfig {
     TestConfig::new(host)
 }
@@ -276,6 +274,61 @@ hosts = {
         ["last.example", "two", "one", "outer", "alias.example"]
     );
 
+    Ok(())
+}
+
+#[test]
+fn cyclic_named_and_inherited_inline_jump_routes_are_rejected() {
+    for source in [
+        "return {hosts = {target = {proxy_jump = 'target'}}}",
+        "return {hosts = {target = {proxy_jump = 'lead'}, lead = {proxy_jump = 'a'}, a = {proxy_jump = 'b'}, b = {proxy_jump = 'a'}}}",
+        "return {default = {proxy_jump = 'gateway'}}",
+        "return {hosts = {target = {proxy_jump = 'gateway'}, gateway = {proxy_jump = 'another@gateway:2222'}}}",
+        "return {default = {proxy_jump = {host_name = 'relay'}}}",
+        "return {hosts = {target = {proxy_jump = {host_name = 'relay', proxy_jump = 'bridge'}}, bridge = {proxy_jump = 'target'}}}",
+    ] {
+        assert!(
+            matches!(
+                query(source, &options("target").options()),
+                Err(Error::Native { source, .. })
+                    if matches!(source.as_ref(), Error::JumpCycle)
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn jump_cycle_checks_keep_inline_identity_and_override_scope() -> Result<()> {
+    let source = "return {hosts = {target = {proxy_jump = {{host_name = 'same', proxy_jump = {host_name = 'same', proxy_jump = {}}}, 'loop'}}, loop = {proxy_jump = 'loop'}}}";
+    let chain = query(source, &options("target").options())?;
+    let bastions = chain.bastions.unwrap();
+    assert_eq!(bastions.len(), 3);
+    assert_eq!(bastions[1].dest.name, bastions[2].dest.name);
+
+    let mut conf = options("target");
+    conf.proxy_jump = Some(Vec::new());
+    assert!(
+        query("return {default = {proxy_jump = 'loop'}}", &conf.options())?
+            .bastions
+            .is_none()
+    );
+
+    conf.proxy_jump = Some(vec!["target".to_owned()]);
+    assert_eq!(
+        query("return {}", &conf.options())?.bastions.unwrap().len(),
+        1
+    );
+
+    let error = query(
+        "return {meta = {log_level = 'none'}, default = {proxy_jump = 'loop'}}",
+        &options("target").options(),
+    )
+    .expect_err("a cyclic route must fail");
+    assert!(matches!(
+        error.log_filter(),
+        Some(crate::LogFilter::Disabled)
+    ));
     Ok(())
 }
 

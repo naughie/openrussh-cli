@@ -30,8 +30,8 @@
 //!         Session::Exec { command: "uname -a".into() },
 //!     )?;
 //!
-//! assert_eq!(config.chain.target.dest.name, "example.com");
-//! assert_eq!(config.chain.target.dest.port, 2222);
+//! assert_eq!(config.connection.chain().target.dest.name, "example.com");
+//! assert_eq!(config.connection.chain().target.dest.port, 2222);
 //! let preferred = config.preferred()?;
 //! # let _ = preferred;
 //! # Ok::<(), openrussh_cli_config::Error>(())
@@ -101,7 +101,7 @@
 //!     Destination { host: "work".into(), user: None, port: None },
 //!     Session::Shell,
 //! )?;
-//! assert_eq!(config.chain.target.dest.name, "work.example.com");
+//! assert_eq!(config.connection.chain().target.dest.name, "work.example.com");
 //! # Ok::<(), openrussh_cli_config::Error>(())
 //! ```
 //!
@@ -138,14 +138,14 @@
 //!
 //! # Consume the result
 //!
-//! [`Config::chain`] supplies the dependency's connection configuration.
-//! [`Config::preferred()`] produces base transport preferences, while
-//! [`Config::algorithms`] supplies each host's policy. Keep the policy collection
-//! paired with its original chain: [`algorithms::Policies::get()`] identifies hosts
-//! by reference identity. [`Config::meta`] provides setup metadata; errors can
-//! retain parsed logging settings through [`Error::log_level()`].
+//! [`Config::connection`] owns the dependency's connection chain together with
+//! its per-host algorithm policies. [`ConnectionConfig::chain()`] borrows the
+//! chain and [`ConnectionConfig::algorithm_policy()`] looks up each member's
+//! policy by reference identity. [`Config::preferred()`] produces base transport
+//! preferences. [`Config::meta`] provides setup metadata; errors can retain
+//! parsed logging settings through [`Error::log_filter()`].
 
-use openrussh_client::config::Chain;
+use openrussh_client::config::{Chain, Host};
 use openrussh_client::russh::Preferred;
 
 use std::path::PathBuf;
@@ -161,7 +161,7 @@ mod builder;
 pub use builder::ConfigBuilder;
 
 pub mod error;
-use algorithms::Policies;
+use algorithms::{Algorithms, Policies};
 pub use error::{Error, Result};
 
 /// Owned connection settings and application choices for one invocation.
@@ -171,13 +171,8 @@ pub use error::{Error, Result};
 /// fields describe work for the caller; constructing it performs no SSH or
 /// application setup. See the [crate-level example](crate) for construction.
 pub struct Config {
-    /// Resolved target and optional jump hosts for `Connection::connect()`.
-    ///
-    /// Bastions use the dependency's reverse connection order. Keep this chain
-    /// paired with [`Self::algorithms`] when looking up per-host policies.
-    pub chain: Chain,
-    /// Per-host transport policies aligned with [`Self::chain`].
-    pub algorithms: Policies,
+    /// Resolved connection chain and the policies associated with its hosts.
+    pub connection: ConnectionConfig,
     /// Invocation-wide logging and known-host setup metadata.
     pub meta: Meta,
     /// Whether the application should enable its configured verbose diagnostics.
@@ -208,6 +203,60 @@ pub struct Config {
     pub macs: Option<String>,
 }
 
+/// A resolved connection chain with its associated per-host algorithm policies.
+///
+/// Obtained through [`Config::connection`]. The chain and policy collection remain
+/// owned together, and the chain can only be borrowed immutably. This preserves
+/// their positional association even when hosts have equal network destinations.
+#[derive(Debug)]
+pub struct ConnectionConfig {
+    chain: Chain,
+    policies: Policies,
+}
+
+impl ConnectionConfig {
+    /// Borrows the target and optional jump hosts for `Connection::connect()`.
+    ///
+    /// Bastions use the dependency's reverse connection order. The borrowed
+    /// chain cannot be reordered or replaced independently of its policies.
+    pub fn chain(&self) -> &Chain {
+        &self.chain
+    }
+
+    /// Finds the policy associated with an actual host in this connection chain.
+    ///
+    /// The host must be borrowed from [`Self::chain()`]. Matching uses reference
+    /// identity, so equal cloned hosts and hosts from another configuration are
+    /// rejected. A host without configured algorithms receives an unconfigured
+    /// policy that preserves the supplied transport preferences.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::HostNotInChain`] for a host outside this chain, or
+    /// [`Error::MissingAlgorithmPolicy`] for inconsistent internal policy data.
+    ///
+    /// ```
+    /// use openrussh_cli_config::{Config, Destination, Error, Session};
+    ///
+    /// let config = Config::builder().config_file("none").build(
+    ///     Destination { host: "server".into(), user: Some("demo".into()), port: None },
+    ///     Session::None,
+    /// )?;
+    /// let connection = &config.connection;
+    /// let target = &connection.chain().target;
+    /// assert!(!connection.algorithm_policy(target)?.has_host_keys());
+    /// let cloned_target = target.clone();
+    /// assert!(matches!(
+    ///     connection.algorithm_policy(&cloned_target),
+    ///     Err(Error::HostNotInChain),
+    /// ));
+    /// # Ok::<(), openrussh_cli_config::Error>(())
+    /// ```
+    pub fn algorithm_policy(&self, host: &Host) -> Result<&Algorithms> {
+        self.policies.get(&self.chain, host)
+    }
+}
+
 /// Setup settings shared by the target and all jump hosts in an invocation.
 ///
 /// Native configuration supplies these through its top-level `meta` record,
@@ -221,14 +270,16 @@ pub struct Meta {
     /// `~/.ssh/known_hosts`, or `/etc/ssh/ssh_known_hosts` without a home directory.
     /// This crate neither loads the database nor saves accepted host keys.
     pub known_hosts: Option<PathBuf>,
-    /// Parsed native logging policy; omission differs from [`LogLevel::None`].
+    /// Parsed native logging policy; omission differs from [`LogFilter::Disabled`].
     ///
     /// The CLI uses error-level diagnostics when omitted, or debug-level
     /// diagnostics when omitted with [`Config::verbose`] enabled.
-    pub log_level: Option<LogLevel>,
+    pub log_filter: Option<LogFilter>,
 }
 
 /// An explicit native logging choice, distinct from an omitted setting.
+///
+/// Parse a string with [`str::parse()`] or [`Self::try_from_filter()`].
 ///
 /// [`Self::try_from_filter()`] and deserialization accept the exact string
 /// `"none"` to disable logging.
@@ -238,24 +289,24 @@ pub struct Meta {
 ///
 /// The CLI applies this filter together with [`Config::verbose`]: without
 /// verbosity it caps emitted events at errors; with verbosity it uses the
-/// configured directives. An absent `Option<LogLevel>` lets the CLI choose its
-/// default, whereas `Some(LogLevel::None)` explicitly disables diagnostics.
+/// configured directives. An absent `Option<LogFilter>` lets the CLI choose its
+/// default, whereas `Some(LogFilter::Disabled)` explicitly disables diagnostics.
 ///
 /// ```
-/// use openrussh_cli_config::LogLevel;
+/// use openrussh_cli_config::LogFilter;
 ///
-/// let automatic: Option<LogLevel> = None;
-/// let disabled = Some(LogLevel::try_from_filter("none")?);
-/// let configured = LogLevel::try_from_filter("debug,russh=info")?;
+/// let automatic: Option<LogFilter> = None;
+/// let disabled = Some(LogFilter::try_from_filter("none")?);
+/// let configured = LogFilter::try_from_filter("debug,russh=info")?;
 /// assert!(automatic.is_none());
-/// assert!(matches!(disabled, Some(LogLevel::None)));
-/// assert!(matches!(configured, LogLevel::Filter(_)));
+/// assert!(matches!(disabled, Some(LogFilter::Disabled)));
+/// assert!(matches!(configured, LogFilter::Filter(_)));
 /// # Ok::<(), openrussh_cli_config::Error>(())
 /// ```
 #[derive(Clone, Debug)]
-pub enum LogLevel {
+pub enum LogFilter {
     /// Disable client log diagnostics, regardless of the verbosity flag.
-    None,
+    Disabled,
     /// Use explicit target/module filtering directives.
     Filter(
         /// The parsed filter; cloning the logging policy also clones this filter.
@@ -263,10 +314,10 @@ pub enum LogLevel {
     ),
 }
 
-impl LogLevel {
+impl LogFilter {
     /// Parses a logging filter using the same rules as native configuration.
     ///
-    /// The exact string `"none"` returns [`Self::None`]. Other strings use
+    /// The exact string `"none"` returns [`Self::Disabled`]. Other strings use
     /// [`tracing_subscriber::EnvFilter`] directives: an empty string defaults to
     /// `error`, and target directives may be combined with a global level, as in
     /// `"debug,russh=info"`. The `RUST_LOG` environment variable is not read.
@@ -276,13 +327,13 @@ impl LogLevel {
     /// Returns [`Error::InvalidLogFilter`] for invalid filter directives.
     ///
     /// ```
-    /// use openrussh_cli_config::{Error, LogLevel};
+    /// use openrussh_cli_config::{Error, LogFilter};
     ///
-    /// let level = LogLevel::try_from_filter("debug,russh=info")?;
-    /// assert!(matches!(level, LogLevel::Filter(_)));
-    /// assert!(matches!(LogLevel::try_from_filter("none")?, LogLevel::None));
+    /// let filter = LogFilter::try_from_filter("debug,russh=info")?;
+    /// assert!(matches!(filter, LogFilter::Filter(_)));
+    /// assert!(matches!(LogFilter::try_from_filter("none")?, LogFilter::Disabled));
     /// assert!(matches!(
-    ///     LogLevel::try_from_filter("russh=invalid-level"),
+    ///     LogFilter::try_from_filter("russh=invalid-level"),
     ///     Err(Error::InvalidLogFilter(_)),
     /// ));
     /// # Ok::<(), Error>(())
@@ -291,11 +342,19 @@ impl LogLevel {
     where
         S: AsRef<str>,
     {
+        filter.as_ref().parse()
+    }
+}
+
+impl std::str::FromStr for LogFilter {
+    type Err = Error;
+
+    /// Parses native logging directives without reading environment variables.
+    fn from_str(filter: &str) -> Result<Self> {
         use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
-        let filter = filter.as_ref();
         if filter == "none" {
-            return Ok(Self::None);
+            return Ok(Self::Disabled);
         }
 
         EnvFilter::builder()
@@ -306,11 +365,28 @@ impl LogLevel {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for LogLevel {
+impl<'de> serde::Deserialize<'de> for LogFilter {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        Self::try_from_filter(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        struct LogFilterVisitor;
+
+        impl serde::de::Visitor<'_> for LogFilterVisitor {
+            type Value = LogFilter;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a logging filter string")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<LogFilter, E> {
+                value.parse().map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(LogFilterVisitor)
     }
 }
 
@@ -402,59 +478,55 @@ pub enum Session {
     },
 }
 
-/// One local listener and the endpoint to reach through the SSH connection.
+/// One local listener and the matching endpoint reached through SSH.
 ///
-/// Supply these through [`ConfigBuilder::local_forwards()`]. The application
-/// supports TCP-to-TCP and Unix-to-Unix pairs; mixed transports are rejected by
-/// the forwarding runtime, not by configuration building. Socket paths here do
-/// not have the absolute-path requirement of native identity-file settings.
+/// Supply these through [`ConfigBuilder::local_forwards()`]. Each variant pairs
+/// a local listener with a destination using the same transport. Unix socket
+/// paths here do not have the absolute-path requirement of native identity-file
+/// settings. Construction records the request without binding a listener.
 ///
 /// ```
-/// use openrussh_cli_config::{BindHost, ForwardTarget, LocalBind, LocalForward};
+/// use openrussh_cli_config::{BindHost, LocalForward};
 ///
-/// let database = LocalForward {
-///     bind: LocalBind::Tcp { host: BindHost::Loopback, port: 15432 },
-///     target: ForwardTarget::Tcp { host: "database.internal".into(), port: 5432 },
+/// let database = LocalForward::Tcp {
+///     bind_host: BindHost::Loopback,
+///     bind_port: 15432,
+///     target_host: "database.internal".into(),
+///     target_port: 5432,
 /// };
-/// let socket = LocalForward {
-///     bind: LocalBind::Unix("./local.sock".into()),
-///     target: ForwardTarget::Unix("/run/service.sock".into()),
+/// let socket = LocalForward::Unix {
+///     bind: "./local.sock".into(),
+///     target: "/run/service.sock".into(),
 /// };
 /// # let _ = (database, socket);
 /// ```
 #[derive(Debug, PartialEq, Eq)]
-pub struct LocalForward {
-    /// Local TCP address or Unix socket path to bind.
-    pub bind: LocalBind,
-    /// Server-side TCP address or Unix socket path to connect to.
-    pub target: ForwardTarget,
-}
-
-/// Where the application should bind a local forwarding listener.
-///
-/// See [`LocalForward`] for paired TCP and Unix examples. Construction only
-/// records the endpoint; binding and path cleanup belong to the application.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LocalBind {
-    /// Listen on a TCP port at the selected local interfaces.
+pub enum LocalForward {
+    /// Listen on TCP and connect to a TCP endpoint from the SSH server.
     Tcp {
         /// Local interface/address selection.
-        host: BindHost,
-        /// Local port; `0` lets the OS choose an available port at bind time.
-        port: u16,
+        bind_host: BindHost,
+        /// Local port; `0` lets the OS choose a port at bind time.
+        bind_port: u16,
+        /// Destination hostname or unbracketed IP address, resolved remotely.
+        target_host: String,
+        /// Destination TCP port on the remote side.
+        target_port: u16,
     },
-    /// Listen on a local Unix-domain socket path.
-    Unix(
+    /// Listen on a Unix-domain socket and connect to a remote Unix-domain socket.
+    Unix {
         /// Native local filesystem path, which may be relative.
-        PathBuf,
-    ),
+        bind: PathBuf,
+        /// Socket path interpreted by the SSH server, rather than locally.
+        target: String,
+    },
 }
 
-/// Local interface selection for [`LocalBind::Tcp`].
+/// Local interface selection for [`LocalForward::Tcp`].
 ///
-/// This is separate from the remote endpoint in [`ForwardTarget`]. The CLI
-/// normally chooses loopback for an omitted bind address, or all interfaces
-/// with `-g`; explicit names remain explicit. See [`LocalForward`] for usage.
+/// The CLI normally chooses loopback for an omitted bind address, or all
+/// interfaces with `-g`; explicit names remain explicit. See [`LocalForward`]
+/// for usage.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BindHost {
     /// Try IPv4 and IPv6 loopback addresses (`127.0.0.1` and `::1`).
@@ -464,28 +536,6 @@ pub enum BindHost {
     /// Resolve and bind an explicit local hostname or IP address.
     Host(
         /// Hostname or unbracketed address; the port is supplied separately.
-        String,
-    ),
-}
-
-/// A forwarding destination reached from the SSH server.
-///
-/// TCP hostnames are interpreted on the remote side. Unix paths are remote
-/// strings, not local filesystem paths. Pair the transport with [`LocalBind`]
-/// as shown in [`LocalForward`]. Cloning lets the runtime own the target in
-/// forwarding tasks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ForwardTarget {
-    /// Connect to a remote-side TCP endpoint.
-    Tcp {
-        /// Destination hostname or unbracketed IP address.
-        host: String,
-        /// Destination TCP port.
-        port: u16,
-    },
-    /// Connect to a remote-side Unix-domain socket.
-    Unix(
-        /// Socket path interpreted by the remote server.
         String,
     ),
 }

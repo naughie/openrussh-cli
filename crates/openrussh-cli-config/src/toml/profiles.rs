@@ -3,7 +3,7 @@ use super::paths;
 use super::values::{Strings, Text};
 
 use crate::algorithms::{AlgorithmList, Algorithms, Policies};
-use crate::{Error, LogLevel, Meta, ResolveOptions, Resolved, Result};
+use crate::{Error, LogFilter, Meta, ResolveOptions, Resolved, Result};
 
 use openrussh_client::config::{Auth, Chain, Dest, Host, RequestTty, Target};
 
@@ -26,8 +26,8 @@ pub(super) struct Profiles<'src> {
 struct MetaFields<'src> {
     #[serde(borrow, alias = "known_hosts")]
     known_hosts: Option<Text<'src>>,
-    #[serde(alias = "log_level")]
-    log_level: Option<LogLevel>,
+    #[serde(rename = "log-level", alias = "log_level")]
+    log_filter: Option<LogFilter>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -64,8 +64,8 @@ pub(super) struct HostFields<'src> {
 }
 
 impl Profiles<'_> {
-    pub(super) fn log_level(&self) -> Option<LogLevel> {
-        self.meta.log_level.clone()
+    pub(super) fn log_filter(&self) -> Option<LogFilter> {
+        self.meta.log_filter.clone()
     }
 
     pub(super) fn require_named_jumps(&self) -> Result<()> {
@@ -85,7 +85,7 @@ impl Profiles<'_> {
 
     pub(super) fn resolve(&self, options: &ResolveOptions<'_>) -> Result<Resolved> {
         self.resolve_inner(options)
-            .map_err(|error| error.with_log_level(self.meta.log_level.clone()))
+            .map_err(|error| error.with_log_filter(self.meta.log_filter.clone()))
     }
 
     fn resolve_inner(&self, options: &ResolveOptions<'_>) -> Result<Resolved> {
@@ -98,6 +98,7 @@ impl Profiles<'_> {
             user: options.destination.user.as_deref(),
             port: options.destination.port,
         };
+        require_acyclic_jump_route(target, self, options)?;
         let (target_host, target_algorithms) = resolve_host(target, self, Some(options))?;
         let mut pending = jumps(target, self, Some(options));
         let mut bastions: Option<Vec<Host>> = None;
@@ -125,7 +126,7 @@ impl Profiles<'_> {
                 bastions: bastion_algorithms.map(Vec::into_boxed_slice),
             },
             meta: Meta {
-                log_level: self.meta.log_level.clone(),
+                log_filter: self.meta.log_filter.clone(),
                 known_hosts: self
                     .meta
                     .known_hosts
@@ -137,13 +138,36 @@ impl Profiles<'_> {
     }
 }
 
+fn require_acyclic_jump_route<'a>(
+    target: Target<'a>,
+    profiles: &'a Profiles<'_>,
+    overrides: &'a ResolveOptions<'_>,
+) -> Result<()> {
+    // Only the first jump contributes ancestors. Its successor depends on the
+    // lookup alias, not on embedded user/port values or the resolved host_name.
+    let next = |target| jumps(target, profiles, None).next();
+    let first = jumps(target, profiles, Some(overrides)).next();
+    let mut slow = first;
+    let mut fast = first.and_then(next);
+
+    while let (Some(left), Some(right)) = (slow, fast) {
+        if left.host == right.host {
+            return Err(Error::JumpCycle);
+        }
+        slow = next(left);
+        fast = next(right).and_then(next);
+    }
+
+    Ok(())
+}
+
 impl HostFields<'_> {
     fn validate(&self) -> Result<()> {
         if let Some(names) = &self.kex_algorithms {
-            names.validate_kex()?;
+            names.validate_kex_names()?;
         }
         if let Some(names) = &self.host_key_algorithms {
-            names.validate_host_keys()?;
+            names.validate_host_key_names()?;
         }
 
         for path in self

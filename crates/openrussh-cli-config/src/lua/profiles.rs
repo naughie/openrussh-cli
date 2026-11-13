@@ -1,5 +1,5 @@
 use crate::algorithms::{AlgorithmList, Algorithms, Policies};
-use crate::{Error, LogLevel, Meta, ResolveOptions, Resolved, Result};
+use crate::{Error, LogFilter, Meta, ResolveOptions, Resolved, Result};
 
 use openrussh_client::config::{Auth, Chain, Dest, Host, RequestTty, Target};
 
@@ -24,8 +24,8 @@ pub(super) struct Profiles {
 struct MetaFields {
     #[serde(alias = "known_hosts")]
     known_hosts: Option<String>,
-    #[serde(alias = "log_level")]
-    log_level: Option<LogLevel>,
+    #[serde(rename = "log-level", alias = "log_level")]
+    log_filter: Option<LogFilter>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -60,7 +60,7 @@ pub(super) struct HostFields {
 impl Profiles {
     pub(super) fn resolve(&self, conf: &ResolveOptions<'_>) -> Result<Resolved> {
         self.resolve_inner(conf)
-            .map_err(|error| error.with_log_level(self.meta.log_level.clone()))
+            .map_err(|error| error.with_log_filter(self.meta.log_filter.clone()))
     }
 
     fn resolve_inner(&self, conf: &ResolveOptions<'_>) -> Result<Resolved> {
@@ -74,6 +74,7 @@ impl Profiles {
             user: conf.destination.user.as_deref(),
             port: conf.destination.port,
         });
+        require_acyclic_jump_route(target, doc, conf)?;
         let (target_host, target_algorithms) = resolve_host(target, doc, Some(conf))?;
         let mut pending = jumps(target, doc, Some(conf));
         let mut bastions: Option<Vec<Host>> = None;
@@ -101,7 +102,7 @@ impl Profiles {
                 bastions: bastion_algorithms.map(Vec::into_boxed_slice),
             },
             meta: Meta {
-                log_level: self.meta.log_level.clone(),
+                log_filter: self.meta.log_filter.clone(),
                 known_hosts: self
                     .meta
                     .known_hosts
@@ -116,10 +117,10 @@ impl Profiles {
 impl HostFields {
     fn validate(&self) -> Result<()> {
         if let Some(names) = &self.kex_algorithms {
-            names.validate_kex()?;
+            names.validate_kex_names()?;
         }
         if let Some(names) = &self.host_key_algorithms {
-            names.validate_host_keys()?;
+            names.validate_host_key_names()?;
         }
 
         for path in self
@@ -172,6 +173,39 @@ impl<'a> HostRef<'a> {
             Self::Inline(_) => None,
         }
     }
+
+    fn same_jump_source(self, other: Self) -> bool {
+        match (self, other) {
+            // Only the alias selects the record; network names, embedded users,
+            // and ports do not affect the inherited jump list.
+            (Self::Named(left), Self::Named(right)) => left.host == right.host,
+            (Self::Inline(left), Self::Inline(right)) => std::ptr::eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+fn require_acyclic_jump_route<'a>(
+    target: HostRef<'a>,
+    profiles: &'a Profiles,
+    overrides: &'a ResolveOptions<'_>,
+) -> Result<()> {
+    // Follow the first-entry relation with two cursors, without allocating a
+    // visited set or resolving hosts along a route that may never terminate.
+    let next = |target| jumps(target, profiles, None).next();
+    let first = jumps(target, profiles, Some(overrides)).next();
+    let mut slow = first;
+    let mut fast = first.and_then(next);
+
+    while let (Some(left), Some(right)) = (slow, fast) {
+        if left.same_jump_source(right) {
+            return Err(Error::JumpCycle);
+        }
+        slow = next(left);
+        fast = next(right).and_then(next);
+    }
+
+    Ok(())
 }
 
 fn push_host<'a>(

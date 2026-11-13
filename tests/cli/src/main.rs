@@ -47,10 +47,7 @@ fn main() {
             assert_eq!(output.stdout, b"default");
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains("debug1: Connecting to "), "{stderr}");
-            assert!(
-                stderr.contains("debug1: Entering interactive session."),
-                "{stderr}"
-            );
+            assert!(stderr.contains("debug1: Entering session."), "{stderr}");
             assert!(!stderr.contains("debug2: "), "{stderr}");
 
             let output = client.run(&["-p", "1", "target", "true"], b"").await?;
@@ -133,7 +130,7 @@ fn main() {
                         "{filter}: {stderr}"
                     );
                     assert!(
-                        stderr.contains("debug1: Entering interactive session."),
+                        stderr.contains("debug1: Entering session."),
                         "{filter}: {stderr}"
                     );
                     // russh emits this for every handshake, before key exchange.

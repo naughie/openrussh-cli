@@ -1,7 +1,7 @@
 //! Compiled key-exchange and server host-key preferences for a connection chain.
 //!
-//! [`crate::ConfigBuilder::build()`] produces [`Policies`] alongside
-//! [`crate::Config::chain`]. Native TOML and Lua host/default records configure
+//! [`crate::ConfigBuilder::build()`] produces a [`crate::ConnectionConfig`] owning
+//! the connection chain and its policies. Native TOML and Lua host/default records configure
 //! them with `kex-algorithms` / `kex_algorithms` and `host-key-algorithms` /
 //! `host_key_algorithms`. Each setting accepts a comma-separated string or an
 //! array of names. A host's value replaces the default record's entire value.
@@ -42,7 +42,8 @@
 //!     Destination { host: "server".into(), user: None, port: None },
 //!     Session::None,
 //! )?;
-//! let policy = config.algorithms.get(&config.chain, &config.chain.target)?;
+//! let connection = &config.connection;
+//! let policy = connection.algorithm_policy(&connection.chain().target)?;
 //! assert!(policy.has_host_keys());
 //!
 //! let mut preferred: Preferred = config.preferred()?;
@@ -50,7 +51,7 @@
 //! assert_eq!(preferred.kex[0], kex::CURVE25519);
 //! assert_eq!(preferred.key.as_ref(), &[Algorithm::Ed25519]);
 //! assert_eq!(preferred.host_key_certificates.as_ref(), &[Algorithm::Ed25519]);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # Ok::<(), openrussh_cli_config::Error>(())
 //! ```
 
 use openrussh_client::config::{Chain, Host};
@@ -66,12 +67,12 @@ use crate::{Error, Result};
 pub(crate) trait AlgorithmList {
     fn algorithm_names(&self) -> impl Iterator<Item = &str> + Clone;
 
-    fn validate_kex(&self) -> Result<()> {
-        validate_kex(self.algorithm_names())
+    fn validate_kex_names(&self) -> Result<()> {
+        validate_kex_names(self.algorithm_names())
     }
 
-    fn validate_host_keys(&self) -> Result<()> {
-        validate_host_keys(self.algorithm_names())
+    fn validate_host_key_names(&self) -> Result<()> {
+        validate_host_key_names(self.algorithm_names())
     }
 
     fn kex(&self) -> Result<Box<[kex::Name]>> {
@@ -85,7 +86,8 @@ pub(crate) trait AlgorithmList {
 
 /// Opaque, compiled algorithm overrides for one destination or jump host.
 ///
-/// Obtain configured values from [`Policies::get()`]. [`Self::default()`] represents
+/// Obtain configured values from [`crate::ConnectionConfig::algorithm_policy()`].
+/// [`Self::default()`] represents
 /// no overrides: [`Self::has_host_keys()`] returns `false`, and [`Self::apply()`]
 /// leaves its argument untouched. This differs from an explicit native list,
 /// even when that list happens to equal the transport's defaults.
@@ -95,70 +97,16 @@ pub struct Algorithms {
     pub(super) host_keys: Option<HostKeys>,
 }
 
-/// Per-host algorithm overrides paired with a resolved [`Chain`].
-///
-/// [`crate::Config::algorithms`] and [`crate::Config::chain`] are built together.
-/// Keep them paired and preserve the chain's host order when using [`Self::get()`]:
-/// target and bastion policies are associated with positions in that chain,
-/// rather than network names. Hosts with identical connection settings can
-/// therefore have distinct policies.
-///
-/// [`Self::default()`] supplies an unconfigured policy for every member of a
-/// supplied chain. Its lookups still require actual references into that chain.
+/// Positional algorithm policies held privately alongside a resolved chain.
 #[derive(Debug, Default)]
-pub struct Policies {
+pub(crate) struct Policies {
     pub(super) target: Algorithms,
     pub(super) bastions: Option<Box<[Algorithms]>>,
 }
 
 impl Policies {
-    /// Finds the policy for an actual host reference in the associated chain.
-    ///
-    /// `host` must refer to `chain.target` or an element of `chain.bastions`.
-    /// Membership is checked by pointer identity, so a cloned or otherwise equal
-    /// host is rejected. The returned policy borrows `self`.
-    ///
-    /// Pass the chain originally built alongside these policies, with its host
-    /// order intact. This method checks membership in the supplied chain; it
-    /// cannot establish that the chain belongs to this [`Policies`] instance.
-    /// A bastion with no explicit policy receives an unconfigured policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::HostNotInChain`] if `host` is not an actual member of
-    /// `chain`. Returns [`Error::MissingAlgorithmPolicy`] if a bastion policy
-    /// array exists but lacks the matched host's index, indicating inconsistent
-    /// chain/policy alignment.
-    ///
-    /// # Example
-    ///
-    /// Both destination and jump hosts must be borrowed from the paired chain:
-    ///
-    /// ```
-    /// use openrussh_cli_config::{Config, Destination, Error, Session};
-    ///
-    /// let config = Config::builder()
-    ///     .config_file("none")
-    ///     .proxy_jump(["demo@jump.example"])
-    ///     .build(
-    ///         Destination {
-    ///             host: "server.example".into(), user: Some("demo".into()), port: None,
-    ///         },
-    ///         Session::None,
-    ///     )?;
-    /// let target = &config.chain.target;
-    /// let jump = &config.chain.bastions.as_deref().unwrap()[0];
-    /// assert!(!config.algorithms.get(&config.chain, target)?.has_host_keys());
-    /// assert!(!config.algorithms.get(&config.chain, jump)?.has_host_keys());
-    ///
-    /// let cloned_target = target.clone();
-    /// assert!(matches!(
-    ///     config.algorithms.get(&config.chain, &cloned_target),
-    ///     Err(Error::HostNotInChain),
-    /// ));
-    /// # Ok::<(), openrussh_cli_config::Error>(())
-    /// ```
-    pub fn get(&self, chain: &Chain, host: &Host) -> Result<&Algorithms> {
+    /// Internal lookup for the chain owned alongside this collection.
+    pub(crate) fn get(&self, chain: &Chain, host: &Host) -> Result<&Algorithms> {
         static EMPTY: Algorithms = Algorithms {
             kex: None,
             host_keys: None,
@@ -314,7 +262,7 @@ where
     Ok((mode, std::iter::once(first).chain(names)))
 }
 
-fn validate<'a, T, I>(names: I, parse: fn(&str) -> Result<T>) -> Result<()>
+fn validate_names<'a, T, I>(names: I, parse: fn(&str) -> Result<T>) -> Result<()>
 where
     I: Iterator<Item = &'a str> + Clone,
 {
@@ -418,18 +366,18 @@ fn host_key_name(name: &str) -> Result<HostKey> {
     })
 }
 
-fn validate_kex<'a, I>(names: I) -> Result<()>
+fn validate_kex_names<'a, I>(names: I) -> Result<()>
 where
     I: Iterator<Item = &'a str> + Clone,
 {
-    validate(names, kex_name)
+    validate_names(names, kex_name)
 }
 
-fn validate_host_keys<'a, I>(names: I) -> Result<()>
+fn validate_host_key_names<'a, I>(names: I) -> Result<()>
 where
     I: Iterator<Item = &'a str> + Clone,
 {
-    validate(names, host_key_name)
+    validate_names(names, host_key_name)
 }
 
 fn kex<'a, I>(names: I) -> Result<Box<[kex::Name]>>
