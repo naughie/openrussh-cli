@@ -26,15 +26,15 @@ asynchronous input resources. Its Rust crate name is `openrussh_cli_terminal`.
 | `config::ResolveOptions<'a>` | Private borrowed inputs used during source resolution. | A destination reference and optional identity/jump slices borrowed for resolution; not part of the crate API. |
 | `config::ResolveConfig` | Private statically dispatched source-resolution protocol. | Each format's `ParsedConfig` implements `resolve()` independently and returns `Resolved`. |
 | `config::toml::ParsedConfig<'src>` | The result of parsing a TOML document. | Native profiles that can borrow from the source text. |
-| `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles, independent of the Lua VM and source text. |
+| `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles and an optional temporary-directory owner, independent of the Lua VM and source text. |
 | `config::openssh::ParsedConfig` | The result of parsing OpenSSH syntax with the CLI override prefix. | The dependency's `SshConfig`. |
 | `config::toml::profiles::Profiles<'src>` | TOML source representation. | Borrowed or decoded TOML strings, setup metadata, defaults, and exact named hosts. |
 | `config::lua::profiles::Profiles` | Lua source representation. | Owned strings, setup metadata, defaults, named hosts, and named or inline jumps. |
-| `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, and resolved setup `Meta`. |
+| `config::Resolved` | Format-independent result of resolving one source. | A connection `Chain`, per-host algorithm policies, resolved setup `Meta`, and an optional temporary-directory owner. |
 | `config::Meta` | Application setup settings for the invocation. | An optional known-host database path and `LogFilter` policy. |
 | `config::LogFilter` | Explicit logging policy, distinct from omission and a single severity level. | `Disabled` or parsed target/span filtering directives. |
 | `config::LocalForward` | One supported local forwarding operation. | A TCP variant with TCP endpoints, or a Unix variant with local and remote socket paths. |
-| `config::ConnectionConfig` | A resolved connection route and the policy for each host in that route. | Private chain and policies; read-only `chain()` and `algorithm_policy(host)` access. |
+| `config::ConnectionConfig` | A resolved connection route and the policy for each host in that route. | Private chain, policies, and an optional temporary-directory owner; read-only `chain()` and `algorithm_policy(host)` access. |
 | `config::algorithms::Policies` | Private algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
 | `config::Config` | Final application configuration for one invocation. | A `ConnectionConfig` and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
 | `config::Error` | Configuration failure with its underlying cause. | Typed error and source chain, with an optional parsed log filter accessible through `log_filter()`. |
@@ -166,6 +166,13 @@ when there is no higher parent. Before executing the chunk, the adapter prepends
 existing path as a fallback. Lua's normal file searcher can therefore load user
 modules under that root, independently of the process working directory.
 
+This combined path is the application's default. If `SSH_LUA_PACKAGE_PATH` is
+present, its native-byte value replaces `package.path`; the first `;;` expands
+to that complete default at the chosen position. An absent variable preserves
+the default, while an empty value produces an empty path. This follows Lua's
+`LUA_PATH` replacement convention and leaves `package.cpath` and the preload
+searcher unchanged. Relative templates retain Lua's working-directory semantics.
+
 The adapter registers a `package.preload["cli"]` provider for Lua's normal
 `require` and `package.loaded` behavior. Its `user_name`, `home_dir`, and `host_name`
 functions call `whoami::username`, `std::env::home_dir`, and `gethostname(2)`
@@ -183,6 +190,14 @@ The module's `debug(v, indent)` helper uses `mlua`'s pretty debug formatting for
 arbitrary values, including nested tables and cyclic references, and adjusts
 the indentation width (default 2 spaces). It returns a Lua string without printing
 or appending a newline; callers choose how to display or use the result.
+
+The `temp_file(fname)` helper returns a path within one lazily created
+`tempfile::TempDir`, without creating a file. Its first call registers
+`Option<Arc<TempDir>>` in Lua application data: `Some` owns the private directory,
+and `None` remembers a creation failure. Later calls read this state without
+replacing it. An omitted filename is random; a supplied filename must remain
+inside the temporary directory. `Builder::permissions` sets mode `0700` when
+creating the directory, before it can contain caller-written secrets.
 
 ## Resolution and validation boundaries
 
@@ -305,6 +320,22 @@ source-text lifetime. The Lua VM is dropped before `execute()` returns. Resolvin
 reruns the chunk nor keeps Lua resources alive. The loader is synchronous and
 uses no Lua async runtime or shared Lua state.
 
+After successful Lua execution and deserialization, the adapter removes any
+temporary-directory owner from application data and moves it into `ParsedConfig`.
+Each resolution clones its optional `Arc` into `Resolved`; loading moves that
+owner into `ConnectionConfig`. The owner follows the connection settings even
+when they are moved out of `Config`, keeping files available through
+authentication, the session, and disconnect. Ordinary Rust ownership and scopes
+remove the directory when the last owner ends. Execution, deserialization, resolution, and connection
+errors also release their owners through the same scopes; cleanup needs no
+explicit `drop()` calls.
+
+OpenSSH, TOML, and built-in defaults carry inline `None` for this resource and
+perform no additional heap allocation for temporary-file support. Lua also
+allocates no temporary-resource state or `Arc` until `temp_file` is first called.
+After the initial call, generating more paths does not create another directory
+or replace the stored owner. Returning path strings still allocates their values.
+
 File descriptors are scoped to reading/parsing. The OpenSSH adapter drops its
 buffered reader after parsing; native source files are closed after reading the
 text. No configuration file is held open for the network session.
@@ -355,6 +386,7 @@ crates/openrussh-cli-config/
             values.rs      Owned Lua strings and scalar/list visitors
             paths.rs       Literal Lua paths and explicit agent settings
             cli.rs         Built-in Lua cli module
+            temp.rs        Lazy temporary-directory state and contained paths
             tests.rs       Lua execution and resolution tests
     tests/builder.rs       External public-builder API tests
 crates/openrussh-cli-terminal/

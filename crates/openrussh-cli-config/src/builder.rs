@@ -398,6 +398,7 @@ impl ConfigBuilder {
     /// not fall back to another format or configuration file.
     pub fn build(self, destination: Destination, session: Session) -> Result<Config> {
         let Resolved {
+            temp_dir,
             mut chain,
             algorithms,
             meta,
@@ -411,6 +412,7 @@ impl ConfigBuilder {
             connection: ConnectionConfig {
                 chain,
                 policies: algorithms,
+                _temp_dir: temp_dir,
             },
             meta,
             verbose: self.verbose,

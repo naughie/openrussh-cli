@@ -137,6 +137,7 @@ Lua configuration can load the built-in `cli` module with
 | `cli.home_dir()` | Current user's home directory, or `nil` if unavailable. |
 | `cli.host_name()` | Local machine hostname, or `nil` if unavailable. |
 | `cli.debug(v, indent)` | Return a pretty-formatted string for any Lua value; indentation defaults to 2 spaces per level. |
+| `cli.temp_file(fname)` | Path inside this configuration's temporary directory, or `nil` if unavailable; omitting `fname` uses a random filename. |
 | `cli.__file__` | Absolute, canonical path of the selected Lua configuration file. |
 | `cli.__dir__` | Directory containing that canonical file. |
 | `cli.__root__` | Parent of `__dir__` when the canonical filename is `init.lua`; otherwise `__dir__`. |
@@ -157,18 +158,37 @@ inspect a value with four-space indentation. `cli.debug` returns the formatted
 string without printing or appending a newline. Omit `indent` or pass `nil` for the default;
 zero is also accepted.
 
+`cli.temp_file()` creates one private temporary directory on its first call and
+returns a path inside it. It does not create the file. Use `io.open(path, "w")`
+to write generated keys or other temporary configuration resources. Passing
+`fname` uses that relative filename instead of a random name. The directory
+survives configuration loading and the SSH session, then is removed automatically.
+If its initial creation fails, that call and all later calls return `nil`.
+
 File metadata resolves relative components and symbolic links in the selected
 path; a canonicalization failure stops configuration loading. It can locate a
 resource beside the configuration, for example
 `known_hosts = cli.__dir__ .. "/known_hosts"` inside `meta`.
 
-Lua modules under `cli.__root__` are available through `require`. The client
-prepends `ROOT/?.lua` and `ROOT/?/init.lua` to `package.path`, where `ROOT` is
+By default, Lua modules under `cli.__root__` are available through `require`.
+The client prepends `ROOT/?.lua` and `ROOT/?/init.lua` to `package.path`, where `ROOT` is
 `cli.__root__`. For example, `require("another.module")` loads
 `ROOT/another/module.lua`, and `require("config.some.module")` loads
 `ROOT/config/some/module/init.lua`. Selecting `ROOT/config.lua` or
 `ROOT/config/init.lua` gives the same module root. The existing search paths
 remain as fallbacks, and modules use Lua's normal `package.loaded` cache.
+
+Set `SSH_LUA_PACKAGE_PATH` to override the Lua search templates for one invocation:
+
+```sh
+SSH_LUA_PACKAGE_PATH='/opt/modules/?.lua;/opt/modules/?/init.lua;;' ssh my-host
+```
+
+As with Lua's `LUA_PATH`, the first `;;` inserts the default search path. Put it
+after custom templates to search those first, or before them to search them last.
+Without `;;`, the supplied value replaces the entire path; an empty value disables
+Lua file searching. Entries are Lua filename templates, rather than bare directory
+names. The built-in `cli` module remains available.
 
 ### Boolean and TTY values
 

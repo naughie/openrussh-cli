@@ -74,6 +74,12 @@ helper with static dispatch to add selected-file error context. The private
 format-owned string iteration. Neither trait provides a shared native schema,
 value/path parser, or host/jump resolver, and neither uses trait objects.
 
+Lua may also contribute a temporary-directory owner through `cli.temp_file`.
+Keep this owner in `ConnectionConfig` through connection teardown and release
+it through types and scopes. OpenSSH, TOML, built-in defaults, and Lua
+configurations that never call the helper must not allocate temporary-resource
+state or an `Arc`.
+
 ## Dependencies and build contract
 
 The project uses Rust edition 2024 and major/minor dependency requirements in manifests. The lockfile records the resolved dependency versions; the current SSH implementation is `openrussh-client` 0.4.6. Its enabled features select AWS-LC cryptography, RSA support, compression, the OpenSSH config parser, known hosts, process operations, and local TCP/Unix-domain forwarding. Disabling an unused feature is preferable to retaining an unnecessary implementation dependency.
@@ -98,6 +104,11 @@ library needs the compression constants when compiling `Config::preferred()`
 and builds independently.
 
 `mlua` enables `vendored`, `lua54`, `serde`, and `error-send`, with default features disabled. Lua 5.4 is built from bundled source and linked into the executable, so release users do not install Lua separately. Configuration is evaluated synchronously once; the Lua async feature is deliberately absent. `error-send` allows errors to cross the application's error boundary without making the Lua state an asynchronous shared service. Serde performs native configuration deserialization, with `toml` handling TOML syntax. Do not introduce a manual TOML or Lua configuration parser.
+
+`tempfile` supplies the lazily owned temporary directory for Lua-generated
+resources, and `rand` supplies random filenames. Both are runtime dependencies
+of the configuration package. The directory is created with private Unix permissions before its path is
+exposed to Lua; callers create and write files themselves.
 
 Client diagnostics use `tracing` with `tracing-subscriber` for initialization
 and formatting, including its bridge for dependency `log` records. Keep the

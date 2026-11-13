@@ -149,6 +149,9 @@ use openrussh_client::config::{Chain, Host};
 use openrussh_client::russh::Preferred;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use tempfile::TempDir;
 
 mod defaults;
 mod lua;
@@ -208,10 +211,15 @@ pub struct Config {
 /// Obtained through [`Config::connection`]. The chain and policy collection remain
 /// owned together, and the chain can only be borrowed immutably. This preserves
 /// their positional association even when hosts have equal network destinations.
+/// Lua-created temporary files also remain alive until this value is dropped,
+/// including when it is moved out of [`Config`]. Keep it through session cleanup
+/// if those files are needed by the connection or session.
 #[derive(Debug)]
 pub struct ConnectionConfig {
     chain: Chain,
     policies: Policies,
+    // Keep Lua-created files alive with the connection settings that use them.
+    _temp_dir: Option<Arc<TempDir>>,
 }
 
 impl ConnectionConfig {
@@ -392,6 +400,7 @@ impl<'de> serde::Deserialize<'de> for LogFilter {
 
 #[derive(Debug)]
 struct Resolved {
+    pub temp_dir: Option<Arc<TempDir>>,
     pub chain: Chain,
     pub algorithms: Policies,
     pub meta: Meta,
@@ -400,6 +409,7 @@ struct Resolved {
 impl From<Chain> for Resolved {
     fn from(chain: Chain) -> Self {
         Self {
+            temp_dir: None,
             chain,
             algorithms: Policies::default(),
             meta: Meta::default(),

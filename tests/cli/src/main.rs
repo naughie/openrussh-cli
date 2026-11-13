@@ -517,6 +517,164 @@ return {
     );
 
     rt.register(
+        "Lua temporary identities survive authentication and session cleanup",
+        async || {
+            use std::os::unix::fs::PermissionsExt as _;
+            use std::path::PathBuf;
+            use t::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            use t::tokio::time::{Duration, timeout};
+
+            let dir = t::tempdir()?;
+            let manifest = dir.path().join("paths");
+            let client = t::Client::lua(&format!(
+                r#"
+local cli = require('cli')
+local named = assert(cli.temp_file('identity'))
+assert(cli.temp_file('identity') == named)
+local random = assert(cli.temp_file())
+local other = assert(cli.temp_file(nil))
+assert(random ~= other and random ~= named and other ~= named)
+local source = assert(io.open('/home/alice/.ssh/id_ed25519', 'r'))
+local key = assert(source:read('*a'))
+source:close()
+local identity = assert(io.open(named, 'w'))
+assert(identity:write(key))
+identity:close()
+local manifest = assert(io.open('{manifest}', 'w'))
+assert(manifest:write(named, '\n', random, '\n', other, '\n'))
+manifest:close()
+return {{hosts = {{target = {{
+    host_name = '127.0.0.1', user = 'bob', port = 2222,
+    identity_file = named, request_tty = false,
+}}}}}}
+"#,
+                manifest = manifest.to_str().unwrap(),
+            ))?;
+            let mut child = client
+                .command(&["target", "printf 'ready\\n'; read continue; printf done"])
+                .spawn()?;
+            let mut ready = [0_u8; 6];
+            timeout(
+                Duration::from_secs(15),
+                child.stdout.as_mut().unwrap().read_exact(&mut ready),
+            )
+            .await??;
+            assert_eq!(&ready, b"ready\n");
+            assert!(child.try_wait()?.is_none());
+
+            let paths = std::fs::read_to_string(&manifest)?
+                .lines()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            assert_eq!(paths.len(), 3);
+            let parent = paths[0].parent().unwrap();
+            assert_eq!(paths[0].file_name().unwrap(), "identity");
+            assert!(paths.iter().all(|path| path.parent() == Some(parent)));
+            assert_eq!(
+                std::fs::metadata(parent)?.permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::read(&paths[0])?,
+                std::fs::read("/home/alice/.ssh/id_ed25519")?
+            );
+
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"continue\n")
+                .await?;
+            let output = timeout(Duration::from_secs(15), child.wait_with_output()).await??;
+            t::expect(&output, 0, b"done", b"");
+            assert!(!parent.exists());
+            assert!(paths.iter().all(|path| !path.exists()));
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "Lua temporary files are removed after configuration and connection failures",
+        async || {
+            use std::path::PathBuf;
+
+            let dir = t::tempdir()?;
+            for (index, ending) in [
+                "error('intentional failure after temp_file')",
+                "return {unknown = true}",
+                "return {hosts = {target = {identity_file = path, kex_algorithms = 'invalid-algorithm'}}}",
+                "return {hosts = {target = {host_name = '127.0.0.1', port = 1, identity_file = path}}}",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let manifest = dir.path().join(format!("path-{index}"));
+                let client = t::Client::lua(&format!(
+                    r#"
+local path = assert(require('cli').temp_file('secret'))
+local secret = assert(io.open(path, 'w'))
+assert(secret:write('private contents'))
+secret:close()
+local manifest = assert(io.open('{manifest}', 'w'))
+assert(manifest:write(path))
+manifest:close()
+{ending}
+"#,
+                    manifest = manifest.to_str().unwrap(),
+                ))?;
+                let output = client.run(&["target", "true"], b"").await?;
+                assert_eq!(output.status.code(), Some(255));
+                assert!(output.stdout.is_empty());
+                assert!(!output.stderr.is_empty());
+                let path = PathBuf::from(std::fs::read_to_string(&manifest)?);
+                assert!(!path.exists(), "{ending}");
+                assert!(!path.parent().unwrap().exists(), "{ending}");
+            }
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "Lua temp_file caches failure even after its temporary directory becomes usable",
+        async || {
+            use t::tokio::time::{Duration, timeout};
+
+            let dir = t::tempdir()?;
+            let ready = dir.path().join("ready");
+            std::fs::create_dir(&ready)?;
+            let client = t::Client::lua(
+                r#"
+local cli = require('cli')
+assert(cli.temp_file() == nil)
+local temp_dir = assert(os.getenv('TMPDIR'))
+assert(os.rename(assert(os.getenv('OPENRUSSH_TEMP_FILE_READY')), temp_dir))
+local probe = assert(io.open(temp_dir .. '/probe', 'w'))
+probe:close()
+assert(cli.temp_file('after-failure') == nil)
+return {hosts = {target = {
+    host_name = '127.0.0.1', user = 'bob', port = 2222,
+    identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false,
+}}}
+"#,
+            )?;
+            let output = timeout(
+                Duration::from_secs(15),
+                client
+                    .command(&["target", "printf", "nil"])
+                    .env("TMPDIR", dir.path().join("missing"))
+                    .env("OPENRUSSH_TEMP_FILE_READY", &ready)
+                    .output(),
+            )
+            .await??;
+            t::expect(&output, 0, b"nil", b"");
+
+            Ok(())
+        },
+    );
+
+    rt.register(
         "Lua cli debug returns formatted strings for explicit printing",
         async || {
             let client = t::Client::lua(
@@ -667,6 +825,102 @@ return {{
 
             assert_eq!(std::fs::read(actual.join("known_hosts"))?, known_hosts);
             assert!(std::fs::read("/home/alice/.ssh/known_hosts")?.is_empty());
+
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "SSH_LUA_PACKAGE_PATH replaces paths and expands default search paths",
+        async || {
+            use std::process::Stdio;
+            use t::tokio::time::{Duration, timeout};
+
+            let dir = t::tempdir()?;
+            let root = dir.path().join("config");
+            let external_files = dir.path().join("external-files");
+            let external_dirs = dir.path().join("external-directories");
+            let work = dir.path().join("work");
+            std::fs::create_dir(&root)?;
+            std::fs::create_dir(&external_files)?;
+            std::fs::create_dir_all(external_dirs.join("identity"))?;
+            std::fs::create_dir(&work)?;
+            std::fs::write(root.join("shared.lua"), "return 'root'")?;
+            std::fs::write(root.join("local_only.lua"), "return 'local'")?;
+            std::fs::write(external_files.join("shared.lua"), "return 'external'")?;
+            std::fs::write(
+                external_files.join("target.lua"),
+                "return {host_name = '127.0.0.1', user = 'bob', port = 2222, request_tty = false}",
+            )?;
+            std::fs::write(
+                external_dirs.join("identity/init.lua"),
+                "return '/home/alice/.ssh/id_ed25519'",
+            )?;
+            let custom = format!(
+                "{};{}",
+                external_files.join("?.lua").display(),
+                external_dirs.join("?/init.lua").display()
+            );
+            let client = t::Client::default_config()?;
+            let config = root.join("config.lua");
+
+            for (path, expected, local, external) in [
+                (None, "root", true, false),
+                (Some(custom.clone()), "external", false, true),
+                (Some(format!("{custom};;")), "external", true, true),
+                (Some(format!(";;{custom}")), "root", true, true),
+                (Some(String::new()), "", false, false),
+            ] {
+                std::fs::write(
+                    &config,
+                    format!(
+                        r#"
+local cli = require('cli')
+assert(type(cli.home_dir) == 'function')
+if '{expected}' == '' then
+    assert(package.path == '')
+    assert(not pcall(require, 'shared'))
+else
+    assert(require('shared') == '{expected}')
+end
+if {local} then
+    assert(require('local_only') == 'local')
+else
+    assert(not pcall(require, 'local_only'))
+end
+local target
+if {external} then
+    target = require('target')
+    target.identity_file = require('identity')
+else
+    assert(not pcall(require, 'target'))
+    target = {{host_name = '127.0.0.1', user = 'bob', port = 2222,
+        identity_file = '/home/alice/.ssh/id_ed25519', request_tty = false}}
+end
+return {{hosts = {{target = target}}}}
+"#,
+                    ),
+                )?;
+                let mut command = client.command(&[
+                    "-F",
+                    config.to_str().unwrap(),
+                    "target",
+                    "printf",
+                    "modules",
+                ]);
+                command
+                    .current_dir(&work)
+                    .stdin(Stdio::null())
+                    .env_remove("LUA_PATH")
+                    .env_remove("LUA_PATH_5_4");
+                if let Some(path) = path {
+                    command.env("SSH_LUA_PACKAGE_PATH", path);
+                } else {
+                    command.env_remove("SSH_LUA_PACKAGE_PATH");
+                }
+                let output = timeout(Duration::from_secs(15), command.output()).await??;
+                t::expect(&output, 0, b"modules", b"");
+            }
 
             Ok(())
         },

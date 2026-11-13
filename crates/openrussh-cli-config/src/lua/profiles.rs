@@ -93,6 +93,7 @@ impl Profiles {
         }
 
         Ok(Resolved {
+            temp_dir: None,
             chain: Chain {
                 target: target_host,
                 bastions: bastions.map(Vec::into_boxed_slice),

@@ -7,18 +7,24 @@ use mlua::serde::Deserializer;
 use mlua::{DeserializeOptions, Lua, Table, Value};
 use serde::Deserialize as _;
 
+use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
+
+use tempfile::TempDir;
 
 mod cli;
 mod jumps;
 mod paths;
 mod profiles;
+mod temp;
 mod values;
 
 use profiles::Profiles;
 
 pub(super) struct ParsedConfig {
     profiles: Profiles,
+    temp_dir: Option<Arc<TempDir>>,
 }
 
 impl ParsedConfig {
@@ -29,25 +35,29 @@ impl ParsedConfig {
                 path: path.to_owned(),
                 source,
             })?;
-        let profiles = {
+        let (profiles, temp_dir) = {
             let lua = Lua::new();
             let name = format!("@{}", path.display());
-            add_module_path(&lua, root_dir(&path)?)?;
+            let package_path = std::env::var_os("SSH_LUA_PACKAGE_PATH");
+            add_module_path(&lua, root_dir(&path)?, package_path.as_deref())?;
             cli::preload(&lua, path)?;
             let value = lua.load(text).set_name(name).eval::<Value>()?;
             let options = DeserializeOptions::new()
                 .encode_empty_tables_as_array(true)
                 .detect_mixed_tables(true);
-            Profiles::deserialize(Deserializer::new_with_options(value, options))?
+            let profiles = Profiles::deserialize(Deserializer::new_with_options(value, options))?;
+            (profiles, temp::take(&lua))
         };
 
-        Ok(Self { profiles })
+        Ok(Self { profiles, temp_dir })
     }
 }
 
 impl ResolveConfig for ParsedConfig {
     fn resolve(&self, options: &ResolveOptions<'_>) -> Result<Resolved> {
-        self.profiles.resolve(options)
+        let mut resolved = self.profiles.resolve(options)?;
+        resolved.temp_dir = self.temp_dir.clone();
+        Ok(resolved)
     }
 }
 
@@ -62,12 +72,18 @@ fn root_dir(path: &Path) -> mlua::Result<&Path> {
     }
 }
 
-fn add_module_path(lua: &Lua, root: &Path) -> mlua::Result<()> {
+fn add_module_path(lua: &Lua, root: &Path, configured: Option<&OsStr>) -> mlua::Result<()> {
     let package = lua.globals().get::<Table>("package")?;
+    let configured = configured.map(OsStr::as_encoded_bytes);
+    let insertion = configured.and_then(|path| path.windows(2).position(|part| part == b";;"));
+    if let (Some(configured), None) = (configured, insertion) {
+        return package.set("path", lua.create_string(configured)?);
+    }
+
     let original = package.get::<mlua::String>("path")?;
     let module = root.join("?.lua");
     let init = root.join("?/init.lua");
-    let search_path = [
+    let default = [
         module.as_os_str().as_encoded_bytes(),
         b";",
         init.as_os_str().as_encoded_bytes(),
@@ -75,6 +91,21 @@ fn add_module_path(lua: &Lua, root: &Path) -> mlua::Result<()> {
         original.as_bytes().as_ref(),
     ]
     .concat();
+    let search_path = if let (Some(configured), Some(insertion)) = (configured, insertion) {
+        let prefix = &configured[..insertion];
+        let suffix = &configured[insertion + 2..];
+        // Lua expands only the first double separator in its path environment variables.
+        [
+            prefix,
+            if prefix.is_empty() { b"" } else { b";" },
+            &default,
+            if suffix.is_empty() { b"" } else { b";" },
+            suffix,
+        ]
+        .concat()
+    } else {
+        default
+    };
     package.set("path", lua.create_string(search_path)?)
 }
 

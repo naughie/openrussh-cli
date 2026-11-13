@@ -30,6 +30,7 @@ pub(super) fn resolve(options: &ResolveOptions<'_>) -> Result<Resolved> {
         .transpose()?;
 
     Ok(Resolved {
+        temp_dir: None,
         chain: Chain { target, bastions },
         algorithms: Policies::default(),
         meta: Meta::default(),

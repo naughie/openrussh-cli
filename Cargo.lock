@@ -1280,6 +1280,7 @@ dependencies = [
  "mlua",
  "nix",
  "openrussh-client",
+ "rand",
  "serde",
  "tempfile",
  "toml",

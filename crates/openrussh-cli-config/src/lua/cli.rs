@@ -22,7 +22,7 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
     constants.set("arch", std::env::consts::ARCH)?;
     constants.set("os_family", std::env::consts::FAMILY)?;
 
-    let module = lua.create_table_with_capacity(0, 4)?;
+    let module = lua.create_table_with_capacity(0, 5)?;
     module.set(
         "user_name",
         lookup(lua, || whoami::username().ok().map(OsString::from))?,
@@ -36,6 +36,7 @@ fn module(lua: &Lua, path: &Path) -> Result<Table> {
         lookup(lua, || nix::unistd::gethostname().ok())?,
     )?;
     module.set("debug", lua.create_function(debug)?)?;
+    module.set("temp_file", lua.create_function(super::temp::file)?)?;
 
     // Constants stay outside the module so assignments to them invoke __newindex.
     let metatable = lua.create_table_with_capacity(0, 3)?;

@@ -66,6 +66,21 @@ fn config(text: &str) -> Result<(TempDir, TestConfig)> {
 }
 
 #[test]
+fn non_lua_configs_have_no_temporary_storage() -> Result<()> {
+    let (_directory, options) = config("Host sample\n HostName example.com\n")?;
+    assert!(options.resolve()?.temp_dir.is_none());
+    assert!(
+        toml::ParsedConfig::parse("")?
+            .resolve(&options.options())?
+            .temp_dir
+            .is_none()
+    );
+    assert!(defaults::resolve(&options.options())?.temp_dir.is_none());
+    assert!(options.load()?.connection._temp_dir.is_none());
+    Ok(())
+}
+
+#[test]
 fn native_log_filters_accept_both_spellings_and_preserve_omission() -> Result<()> {
     fn check(level: Option<LogFilter>, expected: Option<&str>) {
         match (level, expected) {

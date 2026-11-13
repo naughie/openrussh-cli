@@ -33,6 +33,57 @@ fn source_paths_are_canonical_and_outlive_the_lua_state() -> Result<()> {
 }
 
 #[test]
+fn temporary_files_outlive_the_vm_and_parsed_config_and_all_resolved_owners() -> Result<()> {
+    let path;
+    let directory;
+    {
+        let (first, second) = {
+            let parsed = execute(
+                r#"
+local path = assert(require('cli').temp_file('private-key'))
+local file = assert(io.open(path, 'w'))
+assert(file:write('secret'))
+assert(file:close())
+return {hosts = {sample = {identity_file = path}}}
+"#,
+            )?;
+            let first = parsed.resolve(&options("sample").options())?;
+            let second = parsed.resolve(&options("sample").options())?;
+            assert!(Arc::ptr_eq(
+                first.temp_dir.as_ref().unwrap(),
+                second.temp_dir.as_ref().unwrap()
+            ));
+            (first, second)
+        };
+        path = first.chain.target.auth.identities.as_ref().unwrap()[0].clone();
+        directory = path.parent().unwrap().to_owned();
+        assert_eq!(std::fs::read_to_string(&path)?, "secret");
+        {
+            let _first = first;
+            assert!(path.exists());
+        }
+        assert!(path.exists());
+        assert!(second.temp_dir.is_some());
+    }
+    assert!(!path.exists());
+    assert!(!directory.exists());
+    Ok(())
+}
+
+#[test]
+fn unused_temporary_storage_stays_absent_in_lua() -> Result<()> {
+    let parsed = execute("local cli = require('cli'); return {}")?;
+    assert!(parsed.temp_dir.is_none());
+    assert!(
+        parsed
+            .resolve(&options("sample").options())?
+            .temp_dir
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn modules_load_from_the_config_root_with_native_path_bytes() -> Result<()> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt as _;
@@ -97,7 +148,7 @@ fn config_modules_precede_existing_paths_and_keep_fallbacks() -> Result<()> {
     let lua = Lua::new();
     let package = lua.globals().get::<Table>("package")?;
     package.set("path", fallback.join("?.lua").as_os_str())?;
-    add_module_path(&lua, &config)?;
+    add_module_path(&lua, &config, None)?;
     lua.load(
         r#"
 assert(require('shared') == 'config file')
@@ -106,6 +157,72 @@ assert(require('other') == 'fallback other')
     )
     .exec()?;
 
+    Ok(())
+}
+
+#[test]
+fn configured_module_paths_follow_lua_environment_semantics() -> Result<()> {
+    const DEFAULT: &str = "/configuration/?.lua;/configuration/?/init.lua;original/?.lua";
+    for (configured, expected) in [
+        (None, DEFAULT.to_owned()),
+        (Some(""), String::new()),
+        (Some("custom/?.lua"), "custom/?.lua".to_owned()),
+        (Some(";;"), DEFAULT.to_owned()),
+        (Some("custom/?.lua;;"), format!("custom/?.lua;{DEFAULT}")),
+        (Some(";;custom/?.lua"), format!("{DEFAULT};custom/?.lua")),
+        (
+            Some("before/?.lua;;after/?.lua"),
+            format!("before/?.lua;{DEFAULT};after/?.lua"),
+        ),
+        (
+            Some("before/?.lua;;middle/?.lua;;after/?.lua"),
+            format!("before/?.lua;{DEFAULT};middle/?.lua;;after/?.lua"),
+        ),
+    ] {
+        let lua = Lua::new();
+        let package = lua.globals().get::<Table>("package")?;
+        package.set("path", "original/?.lua")?;
+        let cpath = package.get::<mlua::String>("cpath")?;
+        add_module_path(
+            &lua,
+            Path::new("/configuration"),
+            configured.map(OsStr::new),
+        )?;
+
+        assert_eq!(package.get::<String>("path")?, expected, "{configured:?}");
+        assert_eq!(package.get::<mlua::String>("cpath")?, cpath);
+    }
+    Ok(())
+}
+
+#[test]
+fn configured_module_paths_preserve_native_bytes() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for configured in [b"/modules/\xff/?.lua".as_slice(), b"/modules/\xff/?.lua;;"] {
+        let lua = Lua::new();
+        let package = lua.globals().get::<Table>("package")?;
+        package.set("path", "original/?.lua")?;
+        add_module_path(
+            &lua,
+            Path::new("/configuration"),
+            Some(OsStr::from_bytes(configured)),
+        )?;
+        let expected = if configured.ends_with(b";;") {
+            [
+                &configured[..configured.len() - 1],
+                b"/configuration/?.lua;/configuration/?/init.lua;original/?.lua",
+            ]
+            .concat()
+        } else {
+            configured.to_vec()
+        };
+
+        assert_eq!(
+            package.get::<mlua::String>("path")?.as_bytes().as_ref(),
+            expected
+        );
+    }
     Ok(())
 }
 

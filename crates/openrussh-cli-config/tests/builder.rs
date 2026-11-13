@@ -196,3 +196,33 @@ fn connection_policy_lookup_keeps_equal_hosts_bound_to_their_configuration() -> 
     ));
     Ok(())
 }
+
+#[test]
+fn lua_temporary_files_follow_connection_settings_moved_out_of_config() -> Result<()> {
+    let connection = {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.lua");
+        std::fs::write(
+            &path,
+            r#"
+local path = assert(require('cli').temp_file('identity'))
+local file = assert(io.open(path, 'w'))
+assert(file:write('private contents'))
+assert(file:close())
+return {hosts = {['target.example'] = {identity_file = path}}}
+"#,
+        )?;
+        let config = Config::builder()
+            .config_file(path)
+            .build(destination(), Session::None)?;
+        config.connection
+    };
+    let path = connection.chain().target.auth.identities.as_ref().unwrap()[0].clone();
+    let directory = path.parent().unwrap().to_owned();
+    assert_eq!(std::fs::read_to_string(&path)?, "private contents");
+
+    drop(connection);
+    assert!(!path.exists());
+    assert!(!directory.exists());
+    Ok(())
+}

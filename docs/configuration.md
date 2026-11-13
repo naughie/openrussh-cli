@@ -435,13 +435,36 @@ errors retain the selected configuration file's error context.
 
 ### Lua modules
 
-Before executing the selected configuration, the client prepends
+By default, the client prepends
 `ROOT/?.lua` and `ROOT/?/init.lua`, in that order, to `package.path`. `ROOT` is
 `cli.__root__`: the parent of `cli.__dir__` when the canonical configuration
 filename is exactly `init.lua`, and `cli.__dir__` otherwise. If `__dir__` is the
 filesystem root `/`, `__root__` remains `/`. The root is determined after
 resolving relative paths and symbolic links. The existing `package.path` entries
 remain available after these two patterns.
+
+`SSH_LUA_PACKAGE_PATH` overrides this complete default path for an invocation.
+Its value is a semicolon-separated list of Lua search templates, following the
+[`LUA_PATH` convention](https://lua.org/manual/5.4/manual.html#pdf-package.path).
+The first `;;` in the value is replaced by the complete default path described
+above, including the `ROOT` templates and Lua's initial `package.path`. That
+initial Lua path already reflects `LUA_PATH_5_4` or `LUA_PATH` when set.
+
+```sh
+# Search custom modules before the default paths.
+SSH_LUA_PACKAGE_PATH='/opt/modules/?.lua;/opt/modules/?/init.lua;;' ssh my-host
+
+# Search custom modules after the default paths.
+SSH_LUA_PACKAGE_PATH=';;/opt/modules/?.lua;/opt/modules/?/init.lua' ssh my-host
+```
+
+When the variable is absent, the default path is used unchanged. A value without
+`;;` replaces the whole path, and an explicitly empty value sets `package.path`
+to an empty string. A value of `;;` alone restores the complete default path.
+Only the first `;;` is expanded; later occurrences remain ordinary separators.
+The value is used as Lua search templates without expanding bare directories,
+tildes, or environment references. Relative templates resolve from the process
+working directory, as in ordinary Lua. `package.cpath` is unchanged.
 
 For example, this layout supports both file and directory modules:
 
@@ -468,12 +491,14 @@ ROOT/another/module.lua
 
 These modules follow Lua's normal `require` and `package.loaded` caching rules.
 The built-in `cli` module remains registered through `package.preload` and takes
-precedence over a local `cli.lua` file.
+precedence over a local `cli.lua` file, even when the environment override makes
+`package.path` empty.
 
 ### Lua `cli` module
 
 `local cli = require("cli")` loads a built-in module supplied by the client.
-It provides three lookup functions, a debug formatter, and six string constants:
+It provides three lookup functions, a debug formatter, a temporary-path helper,
+and six string constants:
 
 | Member | Type | Meaning |
 | --- | --- | --- |
@@ -481,6 +506,7 @@ It provides three lookup functions, a debug formatter, and six string constants:
 | `home_dir()` | String or `nil` | Current user's home directory, obtained through `std::env::home_dir`. |
 | `host_name()` | String or `nil` | Local machine hostname, obtained through `gethostname(2)`. |
 | `debug(v, indent)` | String | Return a pretty-formatted representation of any Lua value; indentation defaults to 2 spaces per nesting level. |
+| `temp_file(fname)` | String or `nil` | Path inside this configuration's temporary directory; omitted or `nil` `fname` selects a random filename. |
 | `__file__` | String | Absolute, canonical path of the selected Lua configuration file. |
 | `__dir__` | String | Parent directory of `__file__`. |
 | `__root__` | String | Parent of `__dir__` when the canonical filename is `init.lua`; otherwise `__dir__`. The filesystem root remains `/`. |
@@ -518,6 +544,40 @@ print(cli.debug({ host = "example.com", ports = { 22, 2222 } }))
 print(cli.debug({ host = "example.com", ports = { 22, 2222 } }, 4))
 ```
 
+`cli.temp_file(fname)` lazily creates one temporary directory for this Lua
+configuration execution. The directory has Unix mode `0700`. All successful
+calls return paths inside that same directory; the helper does not create files
+or parent directories. Omitting `fname`, or passing `nil`, selects a random
+filename. A supplied `fname` is relative to the temporary directory; absolute
+paths and names that escape it through `..` return `nil`.
+Empty names, embedded NUL bytes, names resolving to the directory itself, and
+non-string values other than `nil` also return `nil`. Path checks are lexical;
+nested parent directories are not created.
+
+Directory creation is attempted only on the first call. If it fails, the failure
+is remembered and every later call also returns `nil`. Requiring `cli` without
+calling `temp_file` creates no temporary directory or temporary-resource state.
+
+The directory remains alive after the Lua VM is destroyed, while the resolved
+configuration and SSH session use its files. It is removed automatically after
+the session and disconnect finish, or when configuration loading or connection
+setup fails. This permits writing an identity from Lua before authentication:
+
+```lua
+local cli = require("cli")
+local private_key = assert(os.getenv("MY_SSH_PRIVATE_KEY"))
+local temp_path = assert(cli.temp_file("identity"))
+local file = assert(io.open(temp_path, "w"))
+assert(file:write(private_key))
+assert(file:close())
+
+return {
+    hosts = {
+        ["my-host"] = { identity_file = temp_path },
+    },
+}
+```
+
 File metadata is available as soon as the module is required. It describes the
 actual selected file, including a file selected through `-F`, after resolving
 relative components and symbolic links. The metadata and Lua error chunk names
@@ -525,9 +585,9 @@ therefore use the same canonical source path. The module follows Lua's normal
 `package.loaded` caching behavior within this configuration execution; cached
 module access does not cache the functions' return values.
 
-Lua strings preserve native Unix bytes for the file metadata, home directory,
-and hostname. Using such a value as a configuration string remains subject to
-the normal UTF-8 requirements during deserialization. Diagnostic chunk names
+Lua strings preserve native Unix bytes for the file metadata, temporary paths,
+home directory, and hostname. Using such a value as a configuration string
+remains subject to the normal UTF-8 requirements during deserialization. Diagnostic chunk names
 use a display representation for non-UTF-8 paths.
 
 For example, place the known-host database beside the configuration file:
