@@ -1,9 +1,13 @@
-use openrussh_cli_config::{BindHost, Config, Destination, LocalForward, Session};
+use openrussh_cli_config::{
+    AddressFamily, BindHost, Config, Destination, HostOverrides, LocalForward, Session,
+};
 use openrussh_client::config::RequestTty;
 
 use anyhow::{Context as _, Result, bail, ensure};
 
 use std::path::PathBuf;
+
+mod options;
 
 #[derive(clap::Parser)]
 #[command(
@@ -12,6 +16,19 @@ use std::path::PathBuf;
     about = "SSH client powered by openrussh-client"
 )]
 struct Args {
+    #[arg(short = '4', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", help = "Use IPv4 addresses only")]
+    ipv4: Vec<bool>,
+
+    #[arg(short = '6', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", help = "Use IPv6 addresses only")]
+    ipv6: Vec<bool>,
+
+    #[arg(
+        short = 'o',
+        value_name = "OPTION",
+        help = "Set an OpenSSH-style option (repeatable, independent of config format)"
+    )]
+    options: Vec<String>,
+
     #[arg(
         short = 'v',
         overrides_with = "verbose",
@@ -27,21 +44,11 @@ struct Args {
     )]
     config: Option<PathBuf>,
 
-    #[arg(
-        short = 'p',
-        value_name = "PORT",
-        overrides_with = "port",
-        help = "Connect to this port"
-    )]
-    port: Option<u16>,
+    #[arg(short = 'p', value_name = "PORT", help = "Connect to this port")]
+    port: Option<Vec<u16>>,
 
-    #[arg(
-        short = 'l',
-        value_name = "USER",
-        overrides_with = "user",
-        help = "Log in as this user"
-    )]
-    user: Option<String>,
+    #[arg(short = 'l', value_name = "USER", help = "Log in as this user")]
+    user: Option<Vec<String>>,
 
     #[arg(
         short = 'i',
@@ -53,20 +60,19 @@ struct Args {
     #[arg(
         short = 'J',
         value_name = "JUMP",
-        overrides_with = "jump",
         help = "Connect through comma-separated jump hosts"
     )]
-    jump: Option<String>,
+    jump: Option<Vec<String>>,
 
-    #[arg(short = 't', action = clap::ArgAction::Count, overrides_with = "no_tty", help = "Request a terminal (-tt forces allocation)")]
-    tty: u8,
+    #[arg(short = 't', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", help = "Request a terminal (-tt forces allocation)")]
+    tty: Vec<bool>,
 
     #[arg(
         short = 'T',
-        overrides_with = "tty",
+        action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true",
         help = "Disable terminal allocation"
     )]
-    no_tty: bool,
+    no_tty: Vec<bool>,
 
     #[arg(short = 'n', help = "Read no input from stdin")]
     stdin_null: bool,
@@ -146,21 +152,31 @@ pub(crate) struct Invocation {
     compression: bool,
     ciphers: Option<String>,
     macs: Option<String>,
+    host_overrides: HostOverrides,
+    address_family: AddressFamily,
+    send_env: Option<Vec<String>>,
+    remote_command: Option<String>,
 }
 
 impl Invocation {
-    pub(crate) fn build(self) -> Result<Config> {
+    pub(crate) fn build(mut self) -> Result<Config> {
+        self.host_overrides.identity_files = self.identities;
         let mut builder = Config::builder()
             .verbose(self.verbose)
             .stdin_null(self.stdin_null)
             .escape_char(self.escape_char)
-            .compression(self.compression);
+            .compression(self.compression)
+            .host_overrides(self.host_overrides)
+            .address_family(self.address_family);
 
         if let Some(path) = self.config_file {
             builder = builder.config_file(path);
         }
-        if let Some(identities) = self.identities {
-            builder = builder.identities(identities);
+        if let Some(patterns) = self.send_env {
+            builder = builder.send_env(patterns);
+        }
+        if let Some(command) = self.remote_command {
+            builder = builder.remote_command(command);
         }
         if let Some(jumps) = self.proxy_jump {
             builder = builder.proxy_jump(jumps);
@@ -183,22 +199,31 @@ impl Invocation {
 }
 
 pub(crate) fn parse() -> Result<Invocation> {
-    use clap::Parser as _;
+    use clap::{CommandFactory as _, FromArgMatches as _};
 
-    Args::parse().into_invocation()
+    let matches = Args::command().get_matches();
+    Args::from_arg_matches(&matches)?.into_invocation(&matches)
 }
 
 impl Args {
-    fn into_invocation(self) -> Result<Invocation> {
-        let args = self;
+    fn into_invocation(self, matches: &clap::ArgMatches) -> Result<Invocation> {
+        let mut args = self;
+        let mut options = options::Options::from_args(&mut args, matches)?;
+        if args.verbose && options.host.log_filter.is_some() {
+            options.host.log_filter =
+                Some(openrussh_cli_config::LogFilter::try_from_filter("debug")?);
+        }
 
+        let remote_command = options
+            .remote_command
+            .filter(|command| !command.eq_ignore_ascii_case("none"));
         let mut destination = parse_destination(args.destination)?;
 
-        if let Some(user) = args.user {
+        if let Some(user) = options.user {
             destination.user = Some(user);
         }
 
-        if let Some(port) = args.port {
+        if let Some(port) = options.port {
             destination.port = Some(port);
         }
 
@@ -210,7 +235,13 @@ impl Args {
                 host: host.to_owned(),
                 port,
             }
+        } else if options.no_session.unwrap_or(false) {
+            Session::None
         } else if let Some(command) = args.command {
+            ensure!(
+                remote_command.is_none(),
+                "Cannot execute a command-line command and RemoteCommand"
+            );
             let mut words = command.into_iter();
             let mut command = words.next().unwrap_or_default();
             command.reserve(words.as_slice().iter().map(|word| word.len() + 1).sum());
@@ -229,47 +260,49 @@ impl Args {
             Session::Shell
         };
 
-        let tty = if args.no_tty || matches!(session, Session::Forward { .. } | Session::None) {
+        let tty = if matches!(session, Session::Forward { .. } | Session::None) {
             Some(RequestTty::Never)
         } else {
-            match args.tty {
-                0 => None,
-                1 => Some(RequestTty::IfTty),
-                _ => Some(RequestTty::Always),
-            }
+            options.tty
         };
 
-        let local_forwards = args
+        let local_forwards = options
             .forwards
             .map(|v| {
                 v.iter()
-                    .map(|s| parse_forward(s, args.gateway_ports))
+                    .map(|s| {
+                        parse_forward(
+                            s,
+                            args.gateway_ports || options.gateway_ports.unwrap_or(false),
+                        )
+                    })
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
 
-        let proxy_jump = args.jump.map(|s| {
-            if s.eq_ignore_ascii_case("none") {
-                Vec::new()
-            } else {
-                s.split(',').map(str::to_owned).collect()
-            }
-        });
-
         Ok(Invocation {
             destination,
             config_file: args.config,
-            identities: args.identities,
-            proxy_jump,
+            identities: options.identities,
+            proxy_jump: options.proxy_jump,
             tty,
-            verbose: args.verbose,
+            verbose: args.verbose || options.verbose,
             session,
-            stdin_null: args.stdin_null,
-            escape_char: parse_escape(args.escape.as_deref().unwrap_or("~"))?,
+            stdin_null: args.stdin_null || options.stdin_null.unwrap_or(false),
+            escape_char: parse_escape(
+                args.escape
+                    .as_deref()
+                    .or(options.escape.as_deref())
+                    .unwrap_or("~"),
+            )?,
             local_forwards,
-            compression: args.compression,
-            ciphers: args.ciphers,
-            macs: args.macs,
+            compression: args.compression || options.compression.unwrap_or(false),
+            ciphers: args.ciphers.or(options.ciphers),
+            macs: args.macs.or(options.macs),
+            host_overrides: options.host,
+            address_family: options.address_family.unwrap_or_default(),
+            send_env: options.send_env,
+            remote_command,
         })
     }
 }
@@ -446,9 +479,11 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Invocation> {
-        use clap::Parser as _;
+        use clap::{CommandFactory as _, FromArgMatches as _};
 
-        Args::try_parse_from(std::iter::once("ssh").chain(args.iter().copied()))?.into_invocation()
+        let matches = Args::command()
+            .try_get_matches_from(std::iter::once("ssh").chain(args.iter().copied()))?;
+        Args::from_arg_matches(&matches)?.into_invocation(&matches)
     }
 
     #[test]
@@ -466,7 +501,7 @@ mod tests {
             Ok(code)
         }
 
-        let readme = include_str!("../README.md");
+        let readme = include_str!("../../README.md");
         let dir = tempfile::tempdir()?;
         let toml_path = dir.path().join("config.toml");
         let lua_path = dir.path().join("config.lua");
@@ -780,10 +815,10 @@ mod tests {
     }
 
     #[test]
-    fn last_scalar_option_wins() -> Result<()> {
+    fn scalar_flags_follow_openssh_precedence() -> Result<()> {
         let conf = parse(&[
             "-F", "first", "-F", "second", "-l", "alice", "-l", "bob", "-p", "2200", "-p", "2222",
-            "-J", "first", "-J", "none", "-e", "!", "-e", "none", "server",
+            "-J", "none", "-e", "!", "-e", "none", "server",
         ])?;
 
         assert_eq!(
@@ -791,14 +826,263 @@ mod tests {
             Some(std::path::Path::new("second"))
         );
 
-        assert_eq!(conf.destination.user.as_deref(), Some("bob"));
+        assert_eq!(conf.destination.user.as_deref(), Some("alice"));
 
-        assert_eq!(conf.destination.port, Some(2222));
+        assert_eq!(conf.destination.port, Some(2200));
 
         assert_eq!(conf.proxy_jump, Some(Vec::new()));
 
         assert_eq!(conf.escape_char, None);
 
+        Ok(())
+    }
+
+    #[test]
+    fn options_override_every_configuration_format_without_changing_alias_lookup() -> Result<()> {
+        use openrussh_cli_config::LogFilter;
+
+        let dir = tempfile::tempdir()?;
+        for (name, source) in [
+            (
+                "config",
+                "Host alias\n HostName file.example\n User file-user\n Port 2200\n IdentityFile /keys/file\n CertificateFile /keys/file-cert\n IdentityAgent /sockets/file\n IdentitiesOnly no\n RequestTTY force\n",
+            ),
+            (
+                "config.toml",
+                "[hosts.alias]\nhost-name='file.example'\nuser='file-user'\nport=2200\nidentity-file='/keys/file'\ncertificate-file='/keys/file-cert'\nidentity-agent='/sockets/file'\nidentities-only=false\nrequest-tty='force'\n",
+            ),
+            (
+                "config.lua",
+                "return {hosts={alias={host_name='file.example',user='file-user',port=2200,identity_file='/keys/file',certificate_file='/keys/file-cert',identity_agent='/sockets/file',identities_only=false,request_tty='force'}}}",
+            ),
+            ("none", ""),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source)?;
+            let config = if name == "none" {
+                "none"
+            } else {
+                path.to_str().unwrap()
+            };
+            let conf = parse(&[
+                "-F",
+                config,
+                "-o",
+                "hOsTnAmE = cli.example",
+                "-o",
+                "User cli-user",
+                "-o",
+                "Port=2222",
+                "-o",
+                "IdentityFile='relative cli key'",
+                "-o",
+                "CertificateFile=relative-cert",
+                "-o",
+                "IdentityAgent=none",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "RequestTTY=no",
+                "-o",
+                "KexAlgorithms=curve25519-sha256",
+                "-o",
+                "HostKeyAlgorithms=ssh-ed25519",
+                "-o",
+                "UserKnownHostsFile=relative-known-hosts",
+                "-o",
+                "LogLevel=QUIET",
+                "alias",
+            ])?
+            .build()?;
+            let host = &conf.connection.chain().target;
+            assert_eq!(host.dest.name, "cli.example", "{name}");
+            assert_eq!(host.dest.user, "cli-user", "{name}");
+            assert_eq!(host.dest.port, 2222, "{name}");
+            let mut identities = vec![PathBuf::from("relative cli key")];
+            if name != "none" {
+                identities.push("/keys/file".into());
+            }
+            assert_eq!(host.auth.identities.as_ref(), Some(&identities), "{name}");
+            assert_eq!(
+                host.auth.cert.as_deref(),
+                Some(std::path::Path::new("relative-cert"))
+            );
+            assert!(host.auth.agent.is_none());
+            assert!(host.auth.identities_only);
+            assert_eq!(host.tty, RequestTty::Never);
+            assert!(conf.connection.algorithm_policy(host)?.has_host_keys());
+            assert_eq!(
+                conf.meta.known_hosts.as_deref(),
+                Some(std::path::Path::new("relative-known-hosts"))
+            );
+            assert!(matches!(conf.meta.log_filter, Some(LogFilter::Disabled)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn options_and_dedicated_flags_obey_order_and_accumulation_rules() -> Result<()> {
+        let conf = parse(&[
+            "-o",
+            "User=first",
+            "-l",
+            "second",
+            "-o",
+            "User=third",
+            "-o",
+            "Port=2201",
+            "-p",
+            "2202",
+            "-o",
+            "Port=2203",
+            "-i",
+            "first",
+            "-o",
+            "IdentityFile=second",
+            "-i",
+            "first",
+            "-o",
+            "IdentityFile=third",
+            "-6",
+            "-o",
+            "AddressFamily=any",
+            "-4",
+            "-o",
+            "Compression=no",
+            "-C",
+            "-o",
+            "Compression=no",
+            "-o",
+            "Ciphers=aes128-ctr",
+            "-c",
+            "aes256-ctr",
+            "-o",
+            "MACs=hmac-sha2-512",
+            "-m",
+            "hmac-sha2-256",
+            "-o",
+            "EscapeChar=!",
+            "-e",
+            "none",
+            "explicit@alias:2204",
+        ])?;
+        assert_eq!(conf.destination.user.as_deref(), Some("first"));
+        assert_eq!(conf.destination.port, Some(2201));
+        assert_eq!(
+            conf.identities,
+            Some(vec!["first".into(), "second".into(), "third".into()])
+        );
+        assert_eq!(conf.address_family, AddressFamily::Inet);
+        assert!(conf.compression);
+        assert_eq!(conf.ciphers.as_deref(), Some("aes256-ctr"));
+        assert_eq!(conf.macs.as_deref(), Some("hmac-sha2-256"));
+        assert_eq!(conf.escape_char, None);
+
+        for (args, tty) in [
+            (vec!["-oRequestTTY=yes", "-t", "alias"], RequestTty::Always),
+            (vec!["-t", "-oRequestTTY=force", "alias"], RequestTty::IfTty),
+            (vec!["-oRequestTTY=force", "-t", "alias"], RequestTty::IfTty),
+            (
+                vec!["-T", "-oRequestTTY=yes", "-t", "alias"],
+                RequestTty::IfTty,
+            ),
+            (vec!["-oRequestTTY=force", "-T", "alias"], RequestTty::Never),
+            (vec!["-oRequestTTY=force", "-N", "alias"], RequestTty::Never),
+        ] {
+            assert_eq!(parse(&args)?.tty, Some(tty), "{args:?}");
+        }
+        assert!(parse(&["-oProxyJump=first", "-J", "second", "alias"]).is_err());
+        assert!(parse(&["-J", "first", "-J", "second", "alias"]).is_err());
+        assert_eq!(
+            parse(&["-J", "first", "-oProxyJump=second", "alias"])?.proxy_jump,
+            Some(vec!["first".into()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn application_options_are_typed_and_remote_commands_keep_shell_syntax() -> Result<()> {
+        let conf = parse(&[
+            "-F",
+            "none",
+            "-oSendEnv=LANG LC_*",
+            "-oSendEnv=-LC_PRIVATE* TEST_?",
+            "-oStdinNull=yes",
+            "-oGatewayPorts=yes",
+            "-oLocalForward=8080 db:5432",
+            "-oRemoteCommand=printf '%%s' 'a b' | cat",
+            "alias",
+        ])?;
+        assert_eq!(
+            conf.send_env,
+            Some(vec![
+                "LANG".into(),
+                "LC_*".into(),
+                "-LC_PRIVATE*".into(),
+                "TEST_?".into()
+            ])
+        );
+        assert!(conf.stdin_null);
+        assert!(matches!(
+            conf.local_forwards.as_ref().unwrap()[0],
+            LocalForward::Tcp {
+                bind_host: BindHost::All,
+                ..
+            }
+        ));
+        assert_eq!(
+            conf.remote_command.as_deref(),
+            Some("printf '%%s' 'a b' | cat")
+        );
+        assert_eq!(
+            parse(&["-oSessionType=none", "alias"])?.session,
+            Session::None
+        );
+        assert_eq!(
+            parse(&["-oSessionType=none", "-W", "db:5432", "alias"])?.session,
+            Session::Forward {
+                host: "db".into(),
+                port: 5432
+            }
+        );
+        assert_eq!(
+            parse(&["-oRemoteCommand=\"\"", "alias"])?
+                .remote_command
+                .as_deref(),
+            Some("\"\"")
+        );
+        assert_eq!(
+            parse(&["-oRemoteCommand=none", "alias", "true"])?.session,
+            Session::Exec {
+                command: "true".into()
+            }
+        );
+        assert_eq!(
+            parse(&["-oRemoteCommand=#comment", "alias"])?
+                .remote_command
+                .as_deref(),
+            Some("#comment")
+        );
+        assert!(parse(&["-oSessionType=default", "-N", "alias"]).is_err());
+        assert_eq!(
+            parse(&["-N", "-oSessionType=default", "alias"])?.session,
+            Session::None
+        );
+        assert!(parse(&["-oRemoteCommand=true", "alias", "false"]).is_err());
+        for option in [
+            "HostName",
+            "User=one two",
+            "Port=0",
+            "Port=65536",
+            "Port=no",
+            "RequestTTY=bad",
+            "AddressFamily=bad",
+            "Compression=maybe",
+            "Unknown=yes",
+            "IdentityFile='unterminated",
+        ] {
+            assert!(parse(&["-o", option, "alias"]).is_err(), "{option}");
+        }
         Ok(())
     }
 

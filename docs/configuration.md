@@ -32,6 +32,75 @@ resolving relative components and symbolic links. This path supplies the
 to canonicalize the source stops loading with the selected filename in the
 error context.
 
+## Command-line options
+
+`-o KEY=value` and `-o 'KEY value'` use the same supported invocation options
+with OpenSSH, TOML, Lua, and `-F none`. Keywords are case-insensitive. Quoted
+values, backslash escapes, and comments follow OpenSSH's option tokenizer.
+Unknown or unsupported options fail rather than being silently ignored.
+
+| Options | Effect |
+| --- | --- |
+| `HostName`, `User`, `Port` | Override the final target's network name, account, and TCP port. |
+| `IdentityFile` | Append a CLI identity path; repeatable, preceding file identities. |
+| `IdentityAgent`, `CertificateFile`, `IdentitiesOnly` | Override the target's agent, certificate, and identity-filtering policy. |
+| `RequestTTY` | Select `no`, `yes`, `force`, or `auto`. |
+| `ProxyJump` | Override the jump route; `none` clears it. |
+| `AddressFamily` | Select `any`, `inet`, or `inet6`, corresponding to the default, `-4`, and `-6`. |
+| `SendEnv` | Select local environment names using space-separated patterns; repeatable. |
+| `Compression`, `Ciphers`, `MACs` | Set transport preferences, as with `-C`, `-c`, and `-m`. |
+| `KexAlgorithms`, `HostKeyAlgorithms` | Apply the native algorithm-list rules to the final host. |
+| `UserKnownHostsFile` | Select the known-host database; `none` uses `/dev/null`. |
+| `LogLevel` | Select `QUIET`, `FATAL`, `ERROR`, `INFO`, `VERBOSE`, or `DEBUG`/`DEBUG1`/`DEBUG2`/`DEBUG3`. |
+| `StdinNull`, `EscapeChar` | Set stdin and escape policy, as with `-n` and `-e`. |
+| `LocalForward`, `GatewayPorts` | Configure local listeners, as with `-L` and `-g`. |
+| `SessionType` | Select `default` or `none`; subsystem sessions remain unsupported. |
+| `RemoteCommand` | Supply a raw remote shell command when no positional command is supplied; unquoted `none` disables it. |
+
+The first scalar value normally wins, including mixed `-l`/`-o User` and
+`-p`/`-o Port` arguments; explicit command-line values precede an embedded
+destination user/port and file values. `-i` and `IdentityFile` accumulate in
+argument order, deduplicating identical CLI paths. The current authentication
+API supports one certificate: a second distinct CLI `CertificateFile` is an
+error. `UserKnownHostsFile` likewise accepts one filename.
+
+Dedicated `-4`/`-6`, `-c`, `-m`, and `-e` flags override their `-o` equivalents;
+the last dedicated flag wins. `-C`, `-n`, and `-g` enable their policy even if
+`-o` disabled it. `-t` and `-T` act in command-line order alongside `RequestTTY`.
+Duplicate `-J` values, including an earlier `-o ProxyJump` followed by `-J`, are
+errors. `-J` followed by `-o ProxyJump` keeps the earlier route. An earlier
+`SessionType` followed by `-N` is an error; `-N` followed by `SessionType` retains
+the no-session policy.
+
+The requested alias selects source records and jump hosts before `HostName`
+replaces the final network name. Target authentication and algorithm overrides
+do not propagate to jump hosts. Native files retain their own schema validation,
+including validation of unused records.
+
+CLI paths may be relative. Current-user tildes, `${VARIABLE}`, and the percent
+tokens `%%`, `%d`, `%h`, `%k`, `%L`, `%l`, `%n`, `%p`, `%r`, and `%u` expand
+under the same rules for every format. Other percent tokens fail explicitly.
+`IdentityAgent=none` disables agent use; `SSH_AUTH_SOCK` and whole-value `$VAR`
+select environment variables. `CertificateFile=none` clears the certificate.
+`IdentityFile=none` suppresses implicit default identities while preserving
+other explicitly configured identity files.
+
+`RemoteCommand` preserves its quotes and shell syntax and expands the supported
+percent tokens after resolving the final target. Use `%%` for a literal percent,
+such as `RemoteCommand=printf '%%s' hello`. Positional remote commands keep all
+percent characters unchanged and conflict with an active `RemoteCommand`.
+
+`SendEnv` uses `*` and `?` to match local environment names. A leading `-`
+removes previously configured matching pattern strings; it does not directly
+exclude environment values. The server must permit each name through
+`AcceptEnv`. Environment requests precede shell/exec startup, and rejected
+variables do not fail the session. No variables are sent by default. Non-UTF-8
+names or values are omitted because the SSH session API accepts strings.
+
+CLI `LogLevel` replaces native metadata and also governs source-loading
+failures. An explicit `-v` overrides a CLI `LogLevel` with debug logging; without
+`-o LogLevel`, the existing native filter and verbosity rules still apply.
+
 ## OpenSSH format
 
 OpenSSH files are parsed and queried through the library's `ssh2-config` integration using `ParseRule::ALLOW_UNSUPPORTED_FIELDS`. Host matching, negation, matching-block order, `Include`, parsing rules, and include scope follow that implementation. Native TOML/Lua validation rules do not apply to OpenSSH files.
@@ -55,7 +124,7 @@ Recognized directives outside this effective set may be parsed or retained by `s
 
 For example, `Compression`, `Ciphers`, `MACs`, and `LocalForward` in an OpenSSH file do not configure this client's transport preferences or local listeners. Their corresponding supported command-line options are application settings. `KexAlgorithms` and `HostKeyAlgorithms` also retain their existing parser behavior without affecting negotiation; the native fields below provide that configuration. `UserKnownHostsFile` does not change this client's host-key database; see [host-key verification](runtime.md).
 
-For scalar settings, the first value among matching host blocks wins. `IdentityFile` entries accumulate across matching blocks. CLI user, port, identity, and jump overrides are inserted before file settings; CLI identity entries therefore precede file entries. The final destination's CLI PTY override is applied after host resolution.
+For scalar settings, the first value among matching host blocks wins. `IdentityFile` entries accumulate across matching blocks. CLI user, port, and jump inputs participate in file resolution. Invocation identity paths are prepended to the resolved file entries. Target authentication, hostname, algorithm, metadata, and PTY overrides apply after host resolution.
 
 The locked dependency does not detect cycles in recursively inherited
 first-entry `ProxyJump` routes. Such an OpenSSH configuration can keep resolving

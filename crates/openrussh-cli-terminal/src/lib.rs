@@ -197,6 +197,36 @@ pub struct Terminal<'fd> {
     saved: Option<Termios>,
 }
 
+/// Current terminal control characters and input/output behavior.
+///
+/// [`Terminal::attributes()`] reads this snapshot without changing local modes.
+/// Callers can translate it into a remote terminal protocol's own representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attributes {
+    /// Interrupt control character (`VINTR`).
+    pub interrupt: u8,
+    /// Quit control character (`VQUIT`).
+    pub quit: u8,
+    /// Erase control character (`VERASE`).
+    pub erase: u8,
+    /// Erase-line control character (`VKILL`).
+    pub kill_line: u8,
+    /// End-of-file control character (`VEOF`).
+    pub end_of_file: u8,
+    /// Echo input (`ECHO`).
+    pub echo: bool,
+    /// Process input in canonical line mode (`ICANON`).
+    pub canonical_input: bool,
+    /// Generate signals from control characters (`ISIG`).
+    pub signals: bool,
+    /// Map input carriage returns to newlines (`ICRNL`).
+    pub map_carriage_return: bool,
+    /// Enable software output flow control (`IXON`).
+    pub software_flow_control: bool,
+    /// Apply terminal output processing (`OPOST`).
+    pub postprocess_output: bool,
+}
+
 impl<'fd> Terminal<'fd> {
     /// Borrows `fd`, saves its attributes when enabled, and enters raw mode.
     ///
@@ -272,6 +302,34 @@ impl<'fd> Terminal<'fd> {
     /// nonterminal descriptor. This method also works when raw mode is disabled.
     pub fn size(&self) -> (u32, u32) {
         size(self.fd)
+    }
+
+    /// Reads the descriptor's current terminal attributes without changing them.
+    ///
+    /// This reads current modes rather than the guard's saved restoration state,
+    /// and is available when raw-mode handling is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the descriptor is not a terminal or reading fails.
+    pub fn attributes(&self) -> io::Result<Attributes> {
+        use termios::{InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices as Character};
+
+        let attributes = attrs(self.fd)?;
+        let characters = attributes.control_chars;
+        Ok(Attributes {
+            interrupt: characters[Character::VINTR as usize],
+            quit: characters[Character::VQUIT as usize],
+            erase: characters[Character::VERASE as usize],
+            kill_line: characters[Character::VKILL as usize],
+            end_of_file: characters[Character::VEOF as usize],
+            echo: attributes.local_flags.contains(LocalFlags::ECHO),
+            canonical_input: attributes.local_flags.contains(LocalFlags::ICANON),
+            signals: attributes.local_flags.contains(LocalFlags::ISIG),
+            map_carriage_return: attributes.input_flags.contains(InputFlags::ICRNL),
+            software_flow_control: attributes.input_flags.contains(InputFlags::IXON),
+            postprocess_output: attributes.output_flags.contains(OutputFlags::OPOST),
+        })
     }
 }
 
@@ -604,6 +662,23 @@ mod tests {
     }
 
     #[test]
+    fn attribute_snapshots_read_current_modes_without_changing_them() {
+        let pty = pty();
+        let observer = Terminal::new(pty.slave.as_fd(), false).unwrap();
+        let initial = observer.attributes().unwrap();
+        assert!(initial.echo && initial.canonical_input && initial.signals);
+
+        {
+            let _raw = Terminal::new(pty.slave.as_fd(), true).unwrap();
+            let current = observer.attributes().unwrap();
+            assert!(!current.echo && !current.canonical_input && !current.signals);
+            assert_eq!(observer.attributes().unwrap(), current);
+        }
+
+        assert_eq!(observer.attributes().unwrap(), initial);
+    }
+
+    #[test]
     fn terminal_can_restore_and_reenter_raw_mode() {
         let pty = pty();
         let saved = attrs(pty.slave.as_fd()).unwrap();
@@ -649,9 +724,10 @@ mod tests {
     #[test]
     fn nonterminal_input_keeps_default_size() {
         let (r, _w) = pipe().unwrap();
-        let _term = Terminal::new(r.as_fd(), true).unwrap();
+        let term = Terminal::new(r.as_fd(), true).unwrap();
 
         assert_eq!(size(r.as_fd()), (80, 24));
+        assert!(term.attributes().is_err());
     }
 
     #[test]

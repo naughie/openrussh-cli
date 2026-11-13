@@ -1,13 +1,14 @@
 mod cli;
+mod connection;
 mod forwarding;
 mod handler;
 mod known_hosts;
 mod logging;
 mod session;
 
+use crate::connection::Connection;
 use openrussh_cli_config as config;
 use openrussh_cli_terminal as terminal;
-use openrussh_client::connect::Connection;
 use openrussh_client::russh::client::Handler;
 
 use anyhow::Result;
@@ -58,7 +59,7 @@ async fn run_with_config(conf: config::Config) -> Result<u8> {
     let mut signals = Signals::new()?;
 
     let conn = {
-        let conn = Connection::connect(conf.connection.chain(), &make_handler);
+        let conn = Connection::connect(conf.connection.chain(), &make_handler, conf.address_family);
         tokio::pin!(conn);
         let (shutdown, events) = signals.split();
 
@@ -105,6 +106,7 @@ where
             conf.session,
             conf.stdin_null,
             conf.escape_char,
+            conf.send_env.as_deref(),
             signals,
         )
         .await;
@@ -118,7 +120,7 @@ where
         let (shutdown, _) = signals.split();
 
         tokio::select! {
-            res = Forwarding::start(&conn, forwards) => match res {
+            res = Forwarding::start(&conn, forwards, conf.address_family) => match res {
                 Ok(forwarding) => forwarding,
                 Err(error) => return finish(&conn, Err(error)).await,
             },
@@ -127,7 +129,7 @@ where
     };
 
     let res = tokio::select! {
-        res = run_session(&conn, conf.session, conf.stdin_null, conf.escape_char, signals) => res,
+        res = run_session(&conn, conf.session, conf.stdin_null, conf.escape_char, conf.send_env.as_deref(), signals) => res,
         res = forwarding.wait() => match res {
             Ok(never) => match never {},
             Err(e) => Err(e),
@@ -143,13 +145,14 @@ async fn run_session<H: Handler>(
     session: config::Session,
     stdin_null: bool,
     escape_char: Option<u8>,
+    send_env: Option<&[String]>,
     signals: &mut terminal::Signals,
 ) -> Result<u8> {
     let (shutdown, events) = signals.split();
     let sigterm_status = signal_status(&session, libc::SIGTERM);
 
     tokio::select! {
-        res = session::run(conn, session, stdin_null, escape_char, events) => res,
+        res = session::run(conn, session, stdin_null, escape_char, send_env, events) => res,
         sig = shutdown.recv() => Ok(if sig == libc::SIGTERM { sigterm_status } else { 255 }),
     }
 }

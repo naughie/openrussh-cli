@@ -15,6 +15,7 @@ pub(super) fn resolve(options: &ResolveOptions<'_>) -> Result<Resolved> {
             port: options.destination.port,
         },
         options.identities,
+        options.identity_agent.is_none(),
     )?;
     let bastions = options
         .proxy_jump
@@ -23,7 +24,7 @@ pub(super) fn resolve(options: &ResolveOptions<'_>) -> Result<Resolved> {
             jumps
                 .iter()
                 .rev()
-                .map(|jump| host(Target::parse(jump), None))
+                .map(|jump| host(Target::parse(jump), None, true))
                 .collect::<Result<Vec<_>>>()
                 .map(Vec::into_boxed_slice)
         })
@@ -37,7 +38,7 @@ pub(super) fn resolve(options: &ResolveOptions<'_>) -> Result<Resolved> {
     })
 }
 
-fn host(target: Target<'_>, identities: Option<&[PathBuf]>) -> Result<Host> {
+fn host(target: Target<'_>, identities: Option<&[PathBuf]>, inherit_agent: bool) -> Result<Host> {
     let user = match target.user {
         Some(user) => user.to_owned(),
         None => whoami::username()?,
@@ -52,7 +53,7 @@ fn host(target: Target<'_>, identities: Option<&[PathBuf]>) -> Result<Host> {
         auth: Auth {
             identities: identities
                 .map(|paths| paths.iter().filter_map(|path| cli_path(path)).collect()),
-            agent: agent()?,
+            agent: if inherit_agent { agent()? } else { None },
             ..Auth::default()
         },
         tty: Default::default(),
@@ -117,6 +118,59 @@ fn cli_path(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::tests::TestConfig;
+
+    #[test]
+    fn explicit_agent_selection_does_not_read_the_unused_environment_default() -> Result<()> {
+        const CHILD: &str = "OPENRUSSH_TEST_EXPLICIT_AGENT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "defaults::tests::explicit_agent_selection_does_not_read_the_unused_environment_default",
+                ])
+                .env(CHILD, "1")
+                .env("SSH_AUTH_SOCK", "invalid-relative-default")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        use crate::{Config, Destination, HostOverrides, IdentityAgent, Session};
+
+        let destination = || Destination {
+            host: "target.example".into(),
+            user: Some("user".into()),
+            port: None,
+        };
+        assert!(
+            Config::builder()
+                .config_file("none")
+                .build(destination(), Session::None)
+                .is_err()
+        );
+        for selection in [
+            IdentityAgent::Disabled,
+            IdentityAgent::Socket("/sockets/override".into()),
+        ] {
+            let expected = match &selection {
+                IdentityAgent::Disabled => None,
+                IdentityAgent::Socket(path) => Some(path.clone()),
+            };
+            let config = Config::builder()
+                .config_file("none")
+                .host_overrides(HostOverrides {
+                    identity_agent: Some(selection),
+                    ..HostOverrides::default()
+                })
+                .build(destination(), Session::None)?;
+            assert_eq!(config.connection.chain().target.auth.agent, expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn defaults_resolve_cli_jump_hosts_without_profiles() -> Result<()> {

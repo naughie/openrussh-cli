@@ -163,6 +163,9 @@ pub mod algorithms;
 mod builder;
 pub use builder::ConfigBuilder;
 
+mod overrides;
+pub use overrides::{AddressFamily, HostOverrides, IdentityAgent};
+
 pub mod error;
 use algorithms::{Algorithms, Policies};
 pub use error::{Error, Result};
@@ -204,6 +207,12 @@ pub struct Config {
     pub ciphers: Option<String>,
     /// Optional comma-separated MAC list, validated by [`Self::preferred()`].
     pub macs: Option<String>,
+    /// Address family for direct target sockets and local TCP listeners.
+    ///
+    /// Defaults to both families; jump connections keep their own policy.
+    pub address_family: AddressFamily,
+    /// Ordered environment-variable patterns requested for remote sessions.
+    pub send_env: Option<Vec<String>>,
 }
 
 /// A resolved connection chain with its associated per-host algorithm policies.
@@ -268,8 +277,9 @@ impl ConnectionConfig {
 /// Setup settings shared by the target and all jump hosts in an invocation.
 ///
 /// Native configuration supplies these through its top-level `meta` record,
-/// outside host/default inheritance. OpenSSH and no-file loading leave both
-/// fields absent. [`Meta::default()`] also leaves both fields absent.
+/// outside host/default inheritance. OpenSSH and no-file sources leave both
+/// fields absent; invocation overrides may supply them for any source format.
+/// [`Meta::default()`] also leaves both fields absent.
 #[derive(Debug, Default)]
 pub struct Meta {
     /// Selected known-host database path, already resolved under native path rules.
@@ -421,6 +431,7 @@ struct ResolveOptions<'a> {
     destination: &'a Destination,
     identities: Option<&'a [PathBuf]>,
     proxy_jump: Option<&'a [String]>,
+    identity_agent: Option<&'a IdentityAgent>,
 }
 
 /// The final resolution boundary, implemented independently by each source format.

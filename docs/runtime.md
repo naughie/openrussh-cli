@@ -12,6 +12,8 @@ ssh [OPTIONS] DESTINATION [COMMAND [ARGUMENT ...]]
 
 | Option | Meaning |
 | --- | --- |
+| `-4`, `-6` | Restrict direct target sockets and local TCP listeners to IPv4 or IPv6. |
+| `-o OPTION` | Supply a supported OpenSSH-style invocation option, independent of the selected file format. |
 | `-F CONFIG` | Select a configuration file by its filename extension; `none` disables configuration files. |
 | `-l USER`, `-p PORT` | Override the destination user and port. |
 | `-i IDENTITY` | Supply a user identity file; repeatable, preserving order. |
@@ -29,11 +31,20 @@ ssh [OPTIONS] DESTINATION [COMMAND [ARGUMENT ...]]
 | `-v` | Enable logging with the native `meta.log_level` filter. |
 | `-V`, `-h`, `--help` | Print the version or usage. |
 
-Repeated scalar options use the last occurrence. `-t` and `-T` follow command-line order: a later `-T` cancels earlier `-t` occurrences, and a later `-t` cancels `-T`. More than one active `-t` forces allocation. `-N` and `-W` select distinct session modes, conflict with each other and a remote command, and disable the remote PTY.
+Repeated `-l` and `-p` values keep the first occurrence, as do their `-o`
+equivalents. `-F`, `-4`/`-6`, `-c`, `-m`, and `-e` keep the last dedicated flag.
+`-t` and `-T` follow command-line order: `-T` disables the PTY, while `-t`
+requests one and promotes an existing `yes` policy to `force`. `-N` and `-W`
+select distinct session modes, conflict with each other and a positional remote
+command, and disable the remote PTY. See the [option precedence reference](configuration.md#command-line-options).
 
 Omitting `COMMAND` starts a remote shell. When a command is supplied, the CLI joins `COMMAND` and every following argument with one ASCII space into a remote command string, following OpenSSH CLI semantics. It adds no quoting or escaping. An empty resulting string also starts a shell. Tokens following `COMMAND`, including tokens beginning with `-`, belong to that command string. CLI connection settings take precedence over file settings; details of file selection, host matching, defaults, and list merging belong to the configuration reference.
 
-The CLI does not expose arbitrary `-o` settings, subsystem requests, remote forwarding (`-R`), dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), or X11 forwarding (`-X`). Parsing a directive in an OpenSSH configuration file does not itself add an application feature or extend the dependency's implementation.
+The CLI accepts the [documented `-o` settings](configuration.md#command-line-options)
+and rejects unsupported keywords. Subsystem requests, remote forwarding (`-R`),
+dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), and X11 forwarding
+(`-X`) remain unsupported. Parsing a directive in an OpenSSH configuration file
+does not itself add an application feature.
 
 ## Logging
 
@@ -63,8 +74,8 @@ variable is not read.
 Without `-v`, an error-only limit is applied in addition to the configured
 filter; target-specific disabling still suppresses matching errors. Repeating
 `-v` does not increase the level. Invalid directives and non-string values are
-configuration errors. OpenSSH `LogLevel` does not select this native
-application setting.
+configuration errors. An OpenSSH-file `LogLevel` does not select this native
+application setting; CLI `-o LogLevel=...` overrides it for all formats.
 Logs follow the OpenSSH client style: errors start with `ssh: `, debug messages
 start with `debug1: `, trace messages start with `debug2: `, and warnings and
 informational messages have no level prefix. They contain no timestamps, ANSI
@@ -82,9 +93,18 @@ separately.
 
 ## Connection, authentication, and commands
 
-The application calls `Connection::connect()` with the resolved destination/jump chain and its handler factory. The dependency owns connection establishment, SSH algorithm negotiation, and user authentication. The configuration layer supplies identity paths, user certificates, and agent sockets according to the selected format's rules. The dependency uses those resolved settings for authentication; the CLI does not reproduce that state machine or add authentication methods.
+The connection adapter retains dependency-owned SSH negotiation, authentication,
+and jump handling. For a direct target, `-4`/`-6` filters DNS results before
+connecting while preserving the original hostname for host-key verification.
+Local TCP listeners use the same family policy. As with OpenSSH's implicit
+ProxyJump command, the target's family flag is not propagated to jump connections;
+forwarding destination names remain resolved by the forwarding server.
 
-The application uses `Connection::shell()` for shells. For commands, it calls the dependency's safe `process::cmd::exec()` helper with the connection handle, the command string, and the connection's PTY policy. This is the same helper used by `Connection::exec()`, without the literal-argument quoting performed by its `Command` builder. The CLI does not use `Command::new_unchecked()` or add an explicit shell wrapper.
+Ordinary shells and commands use the dependency's safe process helpers. When
+`SendEnv` selects variables, the application opens a session channel, requests
+any configured PTY, sends SSH environment requests, then starts the shell or raw
+exec command on that channel. It uses no shell assignments or command rewriting.
+Server `AcceptEnv` policy controls whether variables are accepted.
 
 An SSH `exec` request carries one command string, rather than an operating-system argument vector. The remote user's shell interprets that string, including operators, quotes, and expansions. The local shell first processes the invocation's own quoting; quote the remote expression locally to preserve the text that the remote shell should receive:
 
@@ -116,7 +136,7 @@ When a connected operation ends, including a local-listener setup failure, the a
 
 ## PTYs, local terminal state, and escapes
 
-The remote PTY policy comes from the resolved configuration: `Never` disables it, `Always` requests it, `IfTty` checks local stdin, and `ForShell` requests it for a shell session. The dependency makes the actual PTY request. A remote PTY and a local terminal are separate resources: local raw mode is entered only for an interactive session whose stdin is a terminal and whose input is enabled.
+The remote PTY policy comes from the resolved configuration: `Never` disables it, `Always` requests it, `IfTty` checks local stdin, and `ForShell` requests it for a shell session. Session startup makes the PTY request before shell/exec startup. A remote PTY and a local terminal are separate resources: local raw mode is entered only for an interactive session whose stdin is a terminal and whose input is enabled.
 
 The local terminal guard saves termios attributes, enters raw mode with
 `TCSADRAIN`, and restores the saved attributes on drop. Terminal size comes from
@@ -164,14 +184,20 @@ local_socket_path:remote_socket_path
 
 TCP address parsing supports bracketed IPv6 addresses. Brackets delimit host fields only; bracketed ports and empty bracketed hosts are rejected. Ports must fit `u16`, and the target host cannot be empty. Both paths in the Unix-domain form must contain `/`; brackets in those paths are literal filename characters. The forwarding syntax does not impose the absolute-path rule used for native configuration identity paths. TCP-to-Unix and Unix-to-TCP combinations are rejected by the CLI and are unrepresentable in the resolved `LocalForward` type.
 
-An unspecified TCP bind address means loopback, or all interfaces with `-g`. An explicit empty bind address or `*` means all interfaces. An explicit address remains explicit regardless of `-g`. Loopback and wildcard bindings try both IPv4 and IPv6; IPv6 sockets use `IPV6_V6ONLY` so each listener has a distinct address family. An explicit hostname is resolved to its socket addresses. A forwarding specification succeeds if at least one of its addresses can be bound, and fails if none can be bound.
+An unspecified TCP bind address means loopback, or all interfaces with `-g`. An explicit empty bind address or `*` means all interfaces. An explicit address remains explicit regardless of `-g`. Bindings try IPv4 and IPv6 unless `-4`/`-6` restricts the family; IPv6 sockets use `IPV6_V6ONLY` so each listener has a distinct address family. An explicit hostname is resolved and filtered under the same family policy. A forwarding specification succeeds if at least one of its addresses can be bound, and fails if none can be bound.
 
 All requested local listeners are bound before accepting connections. If a later specification fails, earlier bindings are dropped. A Unix-domain listener never removes an existing path to make room. Its cleanup guard records the created socket's device and inode and removes the path only if that same filesystem object is still present, preserving replacements and symlinks. If the initial metadata lookup fails,
 the listener is closed and that error is returned; the path may remain because
 its ownership could not be established.
 
 One supervisor polls all listeners in rotation and owns the tasks for accepted
-connections. Listeners do not run in separate tasks. TCP-to-TCP forwarding uses `Connection::forward_local_tcp()` and supplies the local peer address as the originator. Unix-to-Unix forwarding uses `Connection::forward_local_uds()`. Both wait for the library forwarding handle. Failure of one accepted stream is logged as an error and leaves the listeners running; listener failure or a task panic ends the forwarding operation. Ending the session releases listener bindings and cancels and joins all accepted-stream tasks before disconnecting the SSH connection.
+connections. Listeners do not run in separate tasks. TCP-to-TCP and Unix-to-Unix
+forwarding use the dependency's handle-based forwarding helpers. TCP forwarding
+supplies the local peer address as the originator. Both wait for the library
+forwarding handle. Failure of one accepted stream is logged as an error and
+leaves the listeners running; listener failure or a task panic ends forwarding.
+Ending the session releases listener bindings and cancels and joins all
+accepted-stream tasks before disconnecting the SSH connection.
 
 `-W HOST:PORT` has no local listener. It opens an SSH `direct-tcpip` channel with originator `127.0.0.1:0`, wraps that channel in the dependency's `Child`, and uses the standard-stream pump. This lower-level channel opening is necessary because the dependency's local forwarding helpers take a network stream. It does not add a subsystem or a second forwarding implementation.
 
@@ -184,7 +210,8 @@ fallback. This one resource supplies trust checks for the destination and every
 jump host. A missing file starts with an empty set without creating a file;
 other file-read failures propagate with the selected path. Entry parsing
 follows the dependency, which ignores malformed entries. OpenSSH
-`UserKnownHostsFile` remains ineffective.
+`UserKnownHostsFile` in a configuration file remains ineffective;
+`-o UserKnownHostsFile=...` selects the resource for any format.
 
 The handler delegates known-host matching and host-certificate validation to `KnownHosts`. `Found` accepts the key; `NotFound` starts a trust prompt. Key mismatch, revocation, certificate principal mismatch, critical certificate options, and the dependency's `CertNotVerified` result fail without prompting. The dependency checks host-certificate type, principals, revocation, and CA trust. Its current policy falls back to ordinary public-key matching if a certificate from a trusted CA fails signature or validity-period validation; the application preserves that result.
 

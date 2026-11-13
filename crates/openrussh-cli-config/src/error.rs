@@ -80,6 +80,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// Automatic configuration discovery could not determine the home directory.
     HomeDirectory,
+    /// An invocation override could not be expanded or validated.
+    InvalidOverride {
+        /// The affected setting, independent of the CLI spelling.
+        field: &'static str,
+        /// A diagnostic explaining the rejected value.
+        reason: String,
+    },
     /// An IO failure without a more specific operation/path wrapper.
     Io(
         /// The underlying IO error.
@@ -147,7 +154,7 @@ pub enum Error {
         /// The filesystem failure.
         source: io::Error,
     },
-    /// Native validation/resolution failed after the profiles were deserialized.
+    /// Native resolution or invocation-override validation failed after loading.
     ///
     /// This transparent context preserves log metadata while delegating display
     /// and causal traversal to the wrapped failure. It also covers TOML's
@@ -223,14 +230,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns a native log policy retained on a later configuration failure.
+    /// Returns a logging policy retained on a later configuration failure.
     ///
     /// This traverses [`Self::ReadConfig`] context to [`Self::Native`]. A supplied
     /// `LogFilter::Disabled` remains `Some(&LogFilter::Disabled)`, so callers can distinguish
     /// explicit disabling from an omitted policy. Reading, format execution,
-    /// deserialization, and invalid-filter failures have no parsed policy;
-    /// successful native deserialization preserves it on later path, algorithm,
-    /// jump-shape, or host-resolution errors. OpenSSH errors have no native policy.
+    /// deserialization, and invalid-filter failures have no source policy;
+    /// an explicit invocation logging override can still be retained on them.
+    /// Successful native deserialization preserves it on later path, algorithm,
+    /// jump-shape, or host-resolution errors. Invocation-override validation also
+    /// retains the selected policy. OpenSSH parsing does not supply a log policy.
     ///
     /// ```
     /// use openrussh_cli_config::{Config, Destination, LogFilter, Session};
@@ -286,6 +295,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HomeDirectory => f.write_str("Could not find the home directory"),
+            Self::InvalidOverride { field, reason } => {
+                write!(f, "Invalid {field} override: {reason}")
+            }
             Self::Io(error) => fmt::Display::fmt(error, f),
             Self::Toml(error) => fmt::Display::fmt(error, f),
             Self::Lua(error) => fmt::Display::fmt(error, f),

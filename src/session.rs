@@ -1,9 +1,9 @@
 use openrussh_cli_config::Session;
 use openrussh_cli_terminal::{self as terminal, Event, Events, Input, InputMode, Terminal};
 
+use crate::connection::Connection;
 use openrussh_client::config::RequestTty;
-use openrussh_client::connect::Connection;
-use openrussh_client::process::{Child, ChildIn, ChildOut, Chunk, cmd};
+use openrussh_client::process::{Child, ChildIn, ChildOut, Chunk, cmd, shell};
 use openrussh_client::russh::client::Handler;
 
 use anyhow::{Context as _, Result};
@@ -13,6 +13,7 @@ pub(crate) async fn run<H: Handler>(
     session: Session,
     stdin_null: bool,
     escape_char: Option<u8>,
+    send_env: Option<&[String]>,
     events: &mut Events,
 ) -> Result<u8> {
     use std::os::fd::AsFd as _;
@@ -47,14 +48,18 @@ pub(crate) async fn run<H: Handler>(
     };
 
     let stdio_forwarding = matches!(session, Session::Forward { .. });
+    let environment = send_env
+        .filter(|patterns| !patterns.is_empty() && !stdio_forwarding)
+        .map(|patterns| selected_environment(patterns, std::env::vars_os()))
+        .unwrap_or_default();
     let mut child = match session {
         Session::Shell => {
             tracing::debug!("Requesting shell.");
-            conn.shell().await?
+            start_process(conn, None, request_pty, &environment).await?
         }
         Session::Exec { command } => {
             tracing::debug!("Sending command: {command}");
-            cmd::exec(conn.handle(), command, conn.request_tty()).await?
+            start_process(conn, Some(command), request_pty, &environment).await?
         }
         Session::Forward { host, port } => {
             tracing::debug!("Opening stdio forwarding to {host} port {port}.");
@@ -138,6 +143,126 @@ pub(crate) async fn run<H: Handler>(
     }
 
     Ok(u8::try_from(child.status().code().unwrap_or(255)).unwrap_or(255))
+}
+
+async fn start_process<H: Handler>(
+    conn: &Connection<H>,
+    command: Option<String>,
+    request_pty: bool,
+    environment: &[(String, String)],
+) -> Result<Child> {
+    if environment.is_empty() {
+        return match command {
+            Some(command) => Ok(cmd::exec(conn.handle(), command, conn.request_tty()).await?),
+            None => Ok(shell::shell(conn.handle(), conn.request_tty()).await?),
+        };
+    }
+
+    // The dependency's process helpers open and execute a channel in one step.
+    // SendEnv needs protocol requests on that channel before shell/exec starts.
+    let channel = conn.handle().channel_open_session().await?;
+    if request_pty {
+        use std::io::IsTerminal as _;
+        use std::os::fd::AsFd as _;
+
+        let stdin = std::io::stdin();
+        let ((columns, rows), modes) = if stdin.is_terminal() {
+            let terminal = Terminal::new(stdin.as_fd(), false)?;
+            (
+                terminal.size(),
+                terminal.attributes().ok().map(terminal_modes),
+            )
+        } else {
+            ((80, 24), None)
+        };
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_owned());
+        let modes = modes.as_ref().map_or(&[][..], |modes| modes.as_slice());
+        channel
+            .request_pty(true, &term, columns, rows, 0, 0, modes)
+            .await?;
+    }
+    for (name, value) in environment {
+        // Like OpenSSH, let server AcceptEnv policy silently refuse variables.
+        channel.set_env(false, name, value).await?;
+    }
+    match command {
+        Some(command) => channel.exec(true, command).await?,
+        None => channel.request_shell(true).await?,
+    }
+    Ok(Child::new(channel))
+}
+
+fn terminal_modes(attributes: terminal::Attributes) -> [(openrussh_client::russh::Pty, u32); 11] {
+    use openrussh_client::russh::Pty;
+    [
+        (Pty::VINTR, u32::from(attributes.interrupt)),
+        (Pty::VQUIT, u32::from(attributes.quit)),
+        (Pty::VERASE, u32::from(attributes.erase)),
+        (Pty::VKILL, u32::from(attributes.kill_line)),
+        (Pty::VEOF, u32::from(attributes.end_of_file)),
+        (Pty::ECHO, u32::from(attributes.echo)),
+        (Pty::ICANON, u32::from(attributes.canonical_input)),
+        (Pty::ISIG, u32::from(attributes.signals)),
+        (Pty::ICRNL, u32::from(attributes.map_carriage_return)),
+        (Pty::IXON, u32::from(attributes.software_flow_control)),
+        (Pty::OPOST, u32::from(attributes.postprocess_output)),
+    ]
+}
+
+fn selected_environment(
+    patterns: &[String],
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    let mut selected: Vec<&str> = Vec::new();
+    for pattern in patterns {
+        if let Some(remove) = pattern.strip_prefix('-') {
+            selected.retain(|pattern| !wildcard_matches(remove.as_bytes(), pattern.as_bytes()));
+        } else {
+            selected.push(pattern);
+        }
+    }
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    variables
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| {
+            selected
+                .iter()
+                .any(|pattern| wildcard_matches(pattern.as_bytes(), name.as_bytes()))
+        })
+        .collect()
+}
+
+fn wildcard_matches(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut pattern_index, mut name_index) = (0, 0);
+    let mut star = None;
+    while name_index < name.len() {
+        match pattern.get(pattern_index) {
+            Some(b'?') => {
+                pattern_index += 1;
+                name_index += 1;
+            }
+            Some(b'*') => {
+                star = Some((pattern_index, name_index));
+                pattern_index += 1;
+            }
+            Some(byte) if *byte == name[name_index] => {
+                pattern_index += 1;
+                name_index += 1;
+            }
+            _ => {
+                let Some((star_index, consumed)) = star else {
+                    return false;
+                };
+                name_index = consumed + 1;
+                pattern_index = star_index + 1;
+                star = Some((star_index, name_index));
+            }
+        }
+    }
+    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
 }
 
 enum InputEnd {
@@ -410,11 +535,204 @@ fn escape_help(key: u8) -> impl std::fmt::Display {
 
 #[cfg(test)]
 mod tests {
-    use super::{Escape, Escapes, escape_help, escape_key, input_closed};
+    use super::{Escape, Escapes, escape_help, escape_key, input_closed, selected_environment};
 
     use openrussh_client::russh::Error;
 
     use std::io::{self, ErrorKind};
+
+    #[test]
+    fn send_env_matches_names_and_removes_previously_configured_patterns() {
+        let variables = || {
+            [
+                ("LANG", "ja_JP.UTF-8"),
+                ("LC_TIME", "C"),
+                ("LC_X", "one"),
+                ("LC_XX", "two"),
+                ("SECRET", "private"),
+            ]
+            .map(|(name, value)| (name.into(), value.into()))
+        };
+        let patterns = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected_environment(&[], variables()),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            selected_environment(&patterns(&["LANG", "LC_*", "-LC_*", "LC_?"]), variables()),
+            [
+                ("LANG".into(), "ja_JP.UTF-8".into()),
+                ("LC_X".into(), "one".into())
+            ]
+        );
+        // Removal matches stored patterns rather than subtracting variables
+        // covered by an earlier wildcard, matching OpenSSH's SendEnv parsing.
+        assert_eq!(
+            selected_environment(&patterns(&["LC_*", "-LC_TIME"]), variables()).len(),
+            3
+        );
+        assert_eq!(
+            selected_environment(&patterns(&["LANG", "LANG"]), variables()),
+            [("LANG".into(), "ja_JP.UTF-8".into())]
+        );
+    }
+
+    #[test]
+    fn send_env_preserves_values_and_skips_non_utf8_without_mutating_the_environment() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        let value = "quotes ' \" $(touch /tmp/never)\nsecond line";
+        let variables = [
+            (OsString::from("SELECTED"), OsString::from(value)),
+            (OsString::from_vec(b"BAD\xff".to_vec()), "name".into()),
+            ("BAD_VALUE".into(), OsString::from_vec(b"\xff".to_vec())),
+        ];
+        assert_eq!(
+            selected_environment(&["*".into()], variables),
+            [("SELECTED".into(), value.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_requests_precede_shell_and_raw_exec_without_requiring_acceptance()
+    -> anyhow::Result<()> {
+        use super::start_process;
+        use crate::connection::Connection;
+        use openrussh_client::config::RequestTty;
+        use openrussh_client::russh::{self, Channel, ChannelId, client, server};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio::time::{Duration, timeout};
+
+        struct Client;
+        impl client::Handler for Client {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _: &russh::keys::PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+        struct Server(mpsc::UnboundedSender<Vec<String>>);
+        impl server::Handler for Server {
+            type Error = russh::Error;
+
+            async fn auth_none(&mut self, _: &str) -> Result<server::Auth, Self::Error> {
+                Ok(server::Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                _: Channel<server::Msg>,
+                reply: server::ChannelOpenHandle,
+                _: &mut server::Session,
+            ) -> Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+
+            async fn env_request(
+                &mut self,
+                channel: ChannelId,
+                name: &str,
+                value: &str,
+                session: &mut server::Session,
+            ) -> Result<(), Self::Error> {
+                self.0
+                    .send(vec!["env".into(), name.into(), value.into()])
+                    .unwrap();
+                session.channel_failure(channel)
+            }
+
+            async fn shell_request(
+                &mut self,
+                channel: ChannelId,
+                session: &mut server::Session,
+            ) -> Result<(), Self::Error> {
+                self.0.send(vec!["shell".into()]).unwrap();
+                session.channel_success(channel)
+            }
+
+            async fn exec_request(
+                &mut self,
+                channel: ChannelId,
+                command: &[u8],
+                session: &mut server::Session,
+            ) -> Result<(), Self::Error> {
+                self.0
+                    .send(vec![
+                        "exec".into(),
+                        String::from_utf8(command.to_vec()).unwrap(),
+                    ])
+                    .unwrap();
+                session.channel_success(channel)
+            }
+        }
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+        let server = tokio::spawn(async move {
+            server::run_stream(
+                Arc::new(server::Config {
+                    keys: vec![key],
+                    ..Default::default()
+                }),
+                server_stream,
+                Server(sender),
+            )
+            .await?
+            .await
+        });
+        let mut handle =
+            client::connect_stream(Arc::new(client::Config::default()), client_stream, Client)
+                .await?;
+        assert!(handle.authenticate_none("test").await?.success());
+        let connection = Connection::Direct {
+            handle,
+            tty: RequestTty::Never,
+        };
+        let environment = [(
+            "SELECTED".to_owned(),
+            "quotes ' \"\n$(no shell expansion)".to_owned(),
+        )];
+        let command = "printf '%s\\n' \"$SELECTED\"; printf raw";
+        for operation in [Some(command.to_owned()), None] {
+            let expected = match &operation {
+                Some(command) => vec!["exec".to_owned(), command.clone()],
+                None => vec!["shell".to_owned()],
+            };
+            let _child = start_process(&connection, operation, false, &environment).await?;
+            assert_eq!(
+                timeout(Duration::from_secs(5), requests.recv())
+                    .await?
+                    .unwrap(),
+                vec![
+                    "env".to_owned(),
+                    environment[0].0.clone(),
+                    environment[0].1.clone()
+                ]
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(5), requests.recv())
+                    .await?
+                    .unwrap(),
+                expected
+            );
+        }
+        connection
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await?;
+        timeout(Duration::from_secs(5), server).await???;
+        Ok(())
+    }
 
     fn decode(chunks: &[&[u8]], key: Option<u8>) -> (Vec<u8>, Vec<&'static str>) {
         let mut parser = Escapes::new(key);

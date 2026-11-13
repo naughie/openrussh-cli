@@ -1,6 +1,6 @@
 use crate::{
-    Config, ConnectionConfig, Destination, Error, LocalForward, ResolveConfig, ResolveOptions,
-    Resolved, Result, Session,
+    AddressFamily, Config, ConnectionConfig, Destination, Error, HostOverrides, LocalForward,
+    ResolveConfig, ResolveOptions, Resolved, Result, Session,
 };
 use crate::{defaults, lua, openssh, toml};
 
@@ -25,6 +25,10 @@ use std::path::{Path, PathBuf};
 /// | [`identities()`](Self::identities) | No builder-supplied identities; retain file settings. |
 /// | [`proxy_jump()`](Self::proxy_jump) | No builder override; retain the configured route. |
 /// | [`tty()`](Self::tty) | No override; use the file policy, or [`RequestTty::ForShell`](openrussh_client::config::RequestTty::ForShell). |
+/// | [`host_overrides()`](Self::host_overrides) | Retain source hostname, authentication, algorithms, and metadata. |
+/// | [`address_family()`](Self::address_family) | [`AddressFamily::Any`]. |
+/// | [`send_env()`](Self::send_env) | No environment patterns. |
+/// | [`remote_command()`](Self::remote_command) | Retain the supplied session. |
 /// | [`verbose()`](Self::verbose) | `false`. |
 /// | [`stdin_null()`](Self::stdin_null) | `false`. |
 /// | [`escape_char()`](Self::escape_char) | `Some(b'~')`. |
@@ -51,6 +55,10 @@ pub struct ConfigBuilder {
     pub(super) compression: bool,
     pub(super) ciphers: Option<String>,
     pub(super) macs: Option<String>,
+    pub(super) host_overrides: HostOverrides,
+    pub(super) address_family: AddressFamily,
+    pub(super) send_env: Option<Vec<String>>,
+    pub(super) remote_command: Option<String>,
 }
 
 impl Default for ConfigBuilder {
@@ -68,11 +76,64 @@ impl Default for ConfigBuilder {
             compression: false,
             ciphers: None,
             macs: None,
+            host_overrides: HostOverrides::default(),
+            address_family: AddressFamily::Any,
+            send_env: None,
+            remote_command: None,
         }
     }
 }
 
 impl ConfigBuilder {
+    /// Replaces explicit final-target overrides, independently of file format.
+    ///
+    /// The original destination selects file records and jump routes before
+    /// these settings apply. Omitted fields retain the selected source values.
+    pub fn host_overrides(mut self, overrides: HostOverrides) -> Self {
+        self.host_overrides = overrides;
+        self
+    }
+
+    /// Replaces the address family for direct target sockets and local TCP listeners.
+    ///
+    /// Jump connections and remote forwarding retain their own resolution policy.
+    pub fn address_family(mut self, family: AddressFamily) -> Self {
+        self.address_family = family;
+        self
+    }
+
+    /// Replaces the ordered environment-variable patterns for remote sessions.
+    ///
+    /// `*` and `?` match names. A leading `-` removes earlier matching pattern
+    /// strings. The caller sends selected values as SSH environment requests;
+    /// the server's `AcceptEnv` policy determines which names it accepts.
+    pub fn send_env<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.send_env = Some(patterns.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Replaces an OpenSSH-style remote command used for a shell session.
+    ///
+    /// When [`Self::build()`] receives [`Session::Shell`], this command selects
+    /// [`Session::Exec`] after resolving the final host and applying invocation
+    /// overrides. Quoting, whitespace, and dollar expressions remain unchanged;
+    /// the supported percent tokens are `%%`, `%d`, `%h`, `%k`, `%L`, `%l`, `%n`,
+    /// `%p`, `%r`, and `%u`. An unsupported or incomplete token is an error.
+    ///
+    /// Other supplied session variants ignore this setting. In particular,
+    /// a supplied [`Session::Exec`] command is never expanded or replaced.
+    pub fn remote_command<S>(mut self, command: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.remote_command = Some(command.into());
+        self
+    }
+
     /// Creates a builder with the [default settings](ConfigBuilder#defaults).
     ///
     /// This is equivalent to [`Config::builder()`] and [`Self::default()`]. File
@@ -397,12 +458,35 @@ impl ConfigBuilder {
     /// parsed logging metadata through [`Error::log_filter()`]. Loading errors do
     /// not fall back to another format or configuration file.
     pub fn build(self, destination: Destination, session: Session) -> Result<Config> {
+        let mut resolved = match self.resolve(&self.options(&destination)) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return Err(match self.host_overrides.log_filter {
+                    Some(filter) => error.with_log_filter(Some(filter)),
+                    None => error,
+                });
+            }
+        };
+        self.host_overrides
+            .apply(&mut resolved, &destination)
+            .map_err(|error| error.with_log_filter(resolved.meta.log_filter.take()))?;
+        let session = match (session, self.remote_command) {
+            (Session::Shell, Some(command)) => Session::Exec {
+                command: crate::overrides::expand_command(
+                    command,
+                    &resolved.chain.target.dest,
+                    &destination.host,
+                )
+                .map_err(|error| error.with_log_filter(resolved.meta.log_filter.take()))?,
+            },
+            (session, _) => session,
+        };
         let Resolved {
             temp_dir,
             mut chain,
             algorithms,
             meta,
-        } = self.resolve(&self.options(&destination))?;
+        } = resolved;
 
         if let Some(tty) = self.tty {
             chain.target.tty = tty;
@@ -423,6 +507,8 @@ impl ConfigBuilder {
             compression: self.compression,
             ciphers: self.ciphers,
             macs: self.macs,
+            address_family: self.address_family,
+            send_env: self.send_env,
         })
     }
 
@@ -431,6 +517,7 @@ impl ConfigBuilder {
             destination,
             identities: self.identities.as_deref(),
             proxy_jump: self.proxy_jump.as_deref(),
+            identity_agent: self.host_overrides.identity_agent.as_ref(),
         }
     }
 

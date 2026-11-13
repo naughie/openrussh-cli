@@ -51,6 +51,26 @@ apply.
 extensions select OpenSSH syntax. Extensions are case-sensitive. `-F none` skips
 configuration files.
 
+## Command-line overrides
+
+`-4` and `-6` select IPv4 or IPv6 for direct connections and local TCP listeners.
+`-o 'KEY=value'` sets a supported OpenSSH-style option for any configuration
+format, including `-F none`:
+
+```sh
+ssh -4 -o HostName=example.com -o User=alice -o Port=2222 my-host
+ssh -o 'IdentityFile=~/.ssh/work' -o IdentityAgent=none my-host
+ssh -o 'SendEnv=LANG LC_*' my-host
+```
+
+Supported options include `HostName`, `User`, `Port`, `IdentityFile`,
+`IdentityAgent`, `CertificateFile`, `IdentitiesOnly`, `RequestTTY`, `SendEnv`,
+`ProxyJump`, `AddressFamily`, transport preferences, forwarding, and session
+settings. See the [complete option reference](docs/configuration.md#command-line-options).
+The original alias still selects file records and jump hosts. Scalar options
+normally keep their first value; identity files accumulate in argument order.
+The current authentication API accepts one certificate and one known-host file.
+
 ## Examples
 
 `~/.ssh/config.toml`:
@@ -74,6 +94,20 @@ request-tty = "yes"
 `~/.ssh/config.lua`:
 
 ```lua
+---@class OpenRusshCli
+---@field user_name fun(): string|nil
+---@field home_dir fun(): string|nil
+---@field host_name fun(): string|nil
+---@field debug fun(value: any, indent?: integer): string
+---@field temp_file fun(fname?: string): string|nil
+---@field __file__ string
+---@field __dir__ string
+---@field __root__ string
+---@field os string
+---@field arch string
+---@field os_family string
+
+---@type OpenRusshCli
 local cli = require("cli")
 
 local home = cli.home_dir()
@@ -97,6 +131,11 @@ return {
     },
 }
 ```
+
+The [LuaLS annotations](https://luals.github.io/wiki/annotations/) describe the
+built-in module for `lua_ls` completion and type checking. Copy them with the
+example into your configuration; no separate Lua library file is needed.
+They are comments and do not change how `require("cli")` loads the module.
 
 ## TOML and Lua
 
@@ -267,6 +306,7 @@ log-level = "debug,russh=info"
 ```
 
 ```lua
+---@type { home_dir: fun(): string|nil }
 local cli = require("cli")
 local home = assert(cli.home_dir())
 return {
@@ -310,7 +350,7 @@ Scalar settings use command-line overrides, then the selected host, then the
 default table. Omitted settings use the defaults listed above. `-l`, `-p`, and
 `-t`/`-T` override the corresponding final-host settings.
 
-Identity files accumulate in this order: repeated `-i` options, host identities,
+Identity files accumulate in this order: `-i` and `-o IdentityFile` in argument order, host identities,
 then default identities. An empty identity array adds no files; it does not
 remove inherited files. `certificate-file` specifies one certificate.
 

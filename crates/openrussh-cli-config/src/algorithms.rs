@@ -14,8 +14,8 @@
 //! are rejected. Host-certificate algorithms must precede plain host-key
 //! algorithms because the transport advertises those as separate lists.
 //!
-//! OpenSSH files, disabled file loading, and omitted native settings produce
-//! unconfigured policies. An unconfigured policy preserves the preferences to
+//! Without invocation overrides, OpenSSH files, disabled file loading, and omitted
+//! native settings produce unconfigured policies. An unconfigured policy preserves the preferences to
 //! which it is applied; it does not replace them with transport defaults.
 //!
 //! # Applying a configured host policy

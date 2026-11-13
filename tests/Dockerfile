@@ -69,6 +69,7 @@ RUN rm -f /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd \
     && printf '%s\n' \
        'AllowUsers bob' \
+       'AcceptEnv OPENRUSSH_TEST_*' \
        'AuthenticationMethods publickey' \
        'AuthorizedKeysFile .ssh/authorized_keys' \
        'HostKey /etc/ssh/ssh_host_ed25519_key' \

@@ -25,6 +25,7 @@ remaining `src/` modules.
 | Module | Responsibility |
 | --- | --- |
 | `cli` | Parse arguments into an `Invocation`, validate CLI syntax, and adapt its values to `ConfigBuilder`. |
+| `connection` | Apply address-family filtering to direct TCP connections while retaining dependency-owned SSH/authentication and jump handling. |
 | `openrussh_cli_config` | Resolve format-specific configuration and supplied inputs into the application's format-independent configuration. |
 | `logging` | Initialize tracing, apply native filter directives and the CLI verbosity limit, and format client diagnostics for stderr. |
 | `known_hosts` | Load the selected trust database once and retain its save path as a setup resource. |
@@ -34,7 +35,20 @@ remaining `src/` modules.
 | `forwarding` | Bind local listeners, supervise accepted-stream tasks, and release listener resources. |
 | `lib` | Coordinate connection, session, forwarding, shutdown, and final status. |
 
-`openrussh-client` owns SSH transport, negotiation, user authentication, jump connections, and supported channel operations. Use its `Connection` methods for shells and local forwarding, and its safe `process::cmd::exec()` helper for the CLI's remote command string. That helper is also the implementation behind `Connection::exec()` and retains the connection's PTY policy when passed `conn.request_tty()`. The application's direct-channel use for `-W` adapts standard streams to a library `Child`; it does not justify duplicating helpers that already accept the required resource.
+`openrussh-client` owns SSH transport, negotiation, user authentication, jump
+connections, and supported channel operations. The application connection adapter
+retains its `Connection` for unrestricted sockets and jump chains. A restricted
+direct connection supplies a filtered TCP stream to the dependency's one-shot
+connector, preserving the original hostname for host-key checks and policy lookup.
+Session and forwarding code use the dependency's handle-based helpers.
+
+The ordinary shell/exec path uses the dependency's safe process helpers. `SendEnv`
+requires opening one session channel, requesting any PTY, and sending SSH
+environment requests before the shell/exec request on that same channel. Keep
+this path's PTY parameters aligned with the dependency helpers. Never implement
+environment transfer with shell assignments or rewrite the raw remote command.
+The `-W` path adapts a direct channel to the library's `Child` without session or
+environment requests.
 
 The CLI joins all command arguments after the destination with single ASCII spaces, without adding quotes or escaping, and constructs `Session::Exec { command }` for a nonempty result. An empty result selects `Session::Shell`. Session execution passes the command string directly to the library helper as one SSH `exec` command. The remote user's shell interprets its operators, quotes, and expansions. Preserve these OpenSSH CLI semantics across the parser, domain configuration, and session boundaries; do not preserve local argument boundaries through extra quoting or an explicit shell wrapper.
 
@@ -46,7 +60,8 @@ policies, and setup metadata. `ConfigBuilder::new()` or `Config::builder()`
 starts construction; consuming fluent setters configure optional values.
 `build(destination, session)` requires both invocation-specific values and
 combines the resolved source with the supplied application settings into
-`Config`. `cli::parse()` remains free of configuration-file IO; the parsed
+`Config`. `HostOverrides` supplies a separate, format-independent invocation
+stage after source resolution. `cli::parse()` remains free of configuration-file IO; the parsed
 `Invocation::build()` performs the builder adaptation and finalization.
 Setup metadata remains outside host/default records and is used when
 initializing resources; handlers receive the known-host resource and its
@@ -144,7 +159,7 @@ Apply these conventions during implementation and review:
 - Borrow where ownership is unnecessary. Move or clone at task boundaries; use `Arc` to express task sharing or avoid copying a large value.
 - Use generics or enums for abstraction; do not introduce trait objects. The standard `std::error::Error::source` signature remains the interoperability boundary for error causes. Keep helper visibility and import scope narrow; import traits anonymously unless their names are required for bounds or implementations.
 - Changes must not increase heap allocations. Allocate only when a value is needed. Retain optional collections as `Option<Vec<_>>` where absence is meaningful, avoid materializing strings for formatting alone, and review each clone, collection, and task spawn for a concrete purpose.
-- Use safe library process helpers appropriate to the command semantics. Pass the CLI's remote command string to `process::cmd::exec(conn.handle(), command, conn.request_tty())`; use the `Command::new().prog(...).arg(...)` builder when an operation requires literal program and argument values. Do not use `Command::new_unchecked()` for CLI execution. Keep any required unsafe operation local and satisfy its resource, initialization, and lifetime requirements.
+- Use safe library process helpers appropriate to the command semantics. The ordinary command path uses `process::cmd::exec(conn.handle(), command, conn.request_tty())`; the `SendEnv` path sends the same raw command after environment requests on its session channel. Use the `Command::new().prog(...).arg(...)` builder when an operation requires literal program and argument values. Do not use `Command::new_unchecked()` for CLI execution. Keep any required unsafe operation local and satisfy its resource, initialization, and lifetime requirements.
 - Release files, descriptors, terminal modes, listeners, and tasks promptly through scopes and guards. Preserve the original failure when cleanup also fails.
 - Use blank lines to separate semantic stages and related definitions. Keep imports, names, and type paths readable without mechanically grouping everything or spelling every type as a full path.
 - Consider LLVM optimization and allocation/context-switch costs, without CPU-specific or assembly-level optimization. Choose task spawning, async combinators, or a custom future according to ownership, cancellation, and actual cost.

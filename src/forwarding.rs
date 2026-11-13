@@ -1,6 +1,6 @@
-use openrussh_cli_config::{BindHost, LocalForward};
+use openrussh_cli_config::{AddressFamily, BindHost, LocalForward};
 
-use openrussh_client::connect::Connection;
+use crate::connection::{Connection, matches_family};
 use openrussh_client::russh::client::Handler;
 
 use anyhow::{Context as _, Result};
@@ -72,8 +72,9 @@ where
     pub(crate) async fn start(
         conn: &'a Arc<Connection<H>>,
         forwards: &'a [LocalForward],
+        family: AddressFamily,
     ) -> Result<Self> {
-        let listeners = bind(forwards).await?;
+        let listeners = bind(forwards, family).await?;
 
         Ok(Self {
             conn,
@@ -112,7 +113,7 @@ where
     }
 }
 
-async fn bind(forwards: &[LocalForward]) -> Result<Vec<Listener<'_>>> {
+async fn bind(forwards: &[LocalForward], family: AddressFamily) -> Result<Vec<Listener<'_>>> {
     let mut listeners = Vec::with_capacity(forwards.len());
 
     for conf in forwards {
@@ -129,6 +130,7 @@ async fn bind(forwards: &[LocalForward]) -> Result<Vec<Listener<'_>>> {
                             SocketAddr::from((Ipv4Addr::LOCALHOST, *port)),
                             SocketAddr::from((Ipv6Addr::LOCALHOST, *port)),
                         ],
+                        family,
                         target_host,
                         *target_port,
                         &mut listeners,
@@ -138,6 +140,7 @@ async fn bind(forwards: &[LocalForward]) -> Result<Vec<Listener<'_>>> {
                             SocketAddr::from((Ipv4Addr::UNSPECIFIED, *port)),
                             SocketAddr::from((Ipv6Addr::UNSPECIFIED, *port)),
                         ],
+                        family,
                         target_host,
                         *target_port,
                         &mut listeners,
@@ -146,7 +149,7 @@ async fn bind(forwards: &[LocalForward]) -> Result<Vec<Listener<'_>>> {
                         let addrs = tokio::net::lookup_host((host.as_str(), *port))
                             .await
                             .with_context(|| format!("resolve local forward {host}:{port}"))?;
-                        bind_tcp(addrs, target_host, *target_port, &mut listeners)
+                        bind_tcp(addrs, family, target_host, *target_port, &mut listeners)
                     }
                 };
 
@@ -183,6 +186,7 @@ async fn bind(forwards: &[LocalForward]) -> Result<Vec<Listener<'_>>> {
 
 fn bind_tcp<'conf>(
     addrs: impl IntoIterator<Item = SocketAddr>,
+    family: AddressFamily,
     target_host: &'conf String,
     target_port: u16,
     listeners: &mut Vec<Listener<'conf>>,
@@ -192,7 +196,10 @@ fn bind_tcp<'conf>(
     let before = listeners.len();
     let mut error = None;
 
-    for addr in addrs {
+    for addr in addrs
+        .into_iter()
+        .filter(|addr| matches_family(family, addr))
+    {
         let bind = || {
             let socket = if addr.is_ipv6() {
                 let socket = TcpSocket::new_v6()?;
@@ -287,19 +294,28 @@ async fn forward<H: Handler>(conn: &Connection<H>, incoming: Incoming) -> Result
             target_host,
             target_port,
         } => {
-            conn.forward_local_tcp((target_host, target_port).into(), Some(peer.into()), stream)
-                .await?
-                .wait()
-                .await?;
+            openrussh_client::local_forwarding::tcp::forward_tcp(
+                conn.handle(),
+                (target_host, target_port).into(),
+                Some(peer.into()),
+                stream,
+            )
+            .await?
+            .wait()
+            .await?;
         }
         Incoming::Unix {
             stream,
             target_path,
         } => {
-            conn.forward_local_uds(target_path, stream)
-                .await?
-                .wait()
-                .await?;
+            openrussh_client::local_forwarding::stream::forward_uds(
+                conn.handle(),
+                target_path,
+                stream,
+            )
+            .await?
+            .wait()
+            .await?;
         }
     }
 
@@ -355,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_forwards_create_no_listeners() -> Result<()> {
-        assert!(bind(&[]).await?.is_empty());
+        assert!(bind(&[], AddressFamily::Any).await?.is_empty());
 
         Ok(())
     }
@@ -376,7 +392,7 @@ mod tests {
                 target_port: 2222,
             },
         ];
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let [
             Listener::Tcp {
                 listener: first, ..
@@ -420,7 +436,7 @@ mod tests {
 
         let forwards = [tcp(BindHost::Host("127.0.0.1".to_owned()), 0)];
 
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let [listener @ Listener::Tcp { listener: tcp, .. }] = listeners.as_slice() else {
             panic!("Expected one TCP listener");
         };
@@ -458,7 +474,7 @@ mod tests {
         let dir = dir()?;
         let path = dir.path().join("forward.sock");
         let forwards = [unix(path.clone())];
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
 
         assert!(std::fs::symlink_metadata(&path)?.file_type().is_socket());
 
@@ -490,7 +506,7 @@ mod tests {
     async fn dropping_a_tcp_binding_releases_its_address() -> Result<()> {
         let forwards = [tcp(BindHost::Host("127.0.0.1".to_owned()), 0)];
 
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let [Listener::Tcp { listener, .. }] = listeners.as_slice() else {
             panic!("Expected one TCP listener");
         };
@@ -510,7 +526,7 @@ mod tests {
         let ipv6 = ipv6_available()?;
         let forwards = [tcp(BindHost::Loopback, 0)];
 
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let mut v4 = false;
         let mut v6 = false;
 
@@ -540,7 +556,7 @@ mod tests {
         let ipv6 = ipv6_available()?;
         let forwards = [tcp(BindHost::All, 0)];
 
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let mut v4 = false;
         let mut v6 = false;
 
@@ -577,7 +593,7 @@ mod tests {
 
         let forwards = [tcp(BindHost::Host("::1".to_owned()), 0)];
 
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let [Listener::Tcp { listener, .. }] = listeners.as_slice() else {
             panic!("Expected one IPv6 listener");
         };
@@ -595,7 +611,7 @@ mod tests {
         let addr = occupied.local_addr()?;
         let forwards = [tcp(BindHost::Host(addr.ip().to_string()), addr.port())];
 
-        let e = match bind(&forwards).await {
+        let e = match bind(&forwards, AddressFamily::Any).await {
             Ok(_) => panic!("An occupied port was bound twice"),
             Err(e) => e,
         };
@@ -618,6 +634,7 @@ mod tests {
         let mut listeners = Vec::new();
         bind_tcp(
             [occupied_addr, (Ipv4Addr::LOCALHOST, 0).into()],
+            AddressFamily::Any,
             &target_host,
             22,
             &mut listeners,
@@ -629,6 +646,38 @@ mod tests {
 
         assert_ne!(listener.local_addr()?, occupied_addr);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requested_family_filters_loopback_wildcard_and_named_listeners() -> Result<()> {
+        for family in [AddressFamily::Inet, AddressFamily::Inet6] {
+            if family == AddressFamily::Inet6 && !ipv6_available()? {
+                continue;
+            }
+            let explicit = if family == AddressFamily::Inet {
+                "127.0.0.1"
+            } else {
+                "::1"
+            };
+            for host in [
+                BindHost::Loopback,
+                BindHost::All,
+                BindHost::Host(explicit.into()),
+            ] {
+                let forwards = [tcp(host, 0)];
+                let listeners = bind(&forwards, family).await?;
+                assert!(!listeners.is_empty());
+                for listener in listeners {
+                    let Listener::Tcp { listener, .. } = listener else {
+                        panic!("Expected a TCP listener");
+                    };
+                    assert!(matches_family(family, &listener.local_addr()?));
+                }
+            }
+        }
+        let forwards = [tcp(BindHost::Host("127.0.0.1".into()), 0)];
+        assert!(bind(&forwards, AddressFamily::Inet6).await.is_err());
         Ok(())
     }
 
@@ -645,7 +694,7 @@ mod tests {
             tcp(BindHost::Host(addr.ip().to_string()), addr.port()),
         ];
 
-        assert!(bind(&forwards).await.is_err());
+        assert!(bind(&forwards, AddressFamily::Any).await.is_err());
 
         assert!(!first.exists());
 
@@ -664,7 +713,7 @@ mod tests {
         let before = std::fs::symlink_metadata(&path)?;
         let forwards = [unix(path.clone())];
 
-        assert!(bind(&forwards).await.is_err());
+        assert!(bind(&forwards, AddressFamily::Any).await.is_err());
 
         let after = std::fs::symlink_metadata(&path)?;
 
@@ -681,7 +730,7 @@ mod tests {
 
         let forwards = [unix(path.clone())];
 
-        assert!(bind(&forwards).await.is_err());
+        assert!(bind(&forwards, AddressFamily::Any).await.is_err());
 
         assert_eq!(std::fs::read_to_string(&path)?, "existing content");
 
@@ -694,7 +743,7 @@ mod tests {
         let path = dir.path().join("forward.sock");
         let replacement = dir.path().join("replacement");
         let forwards = [unix(path.clone())];
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         let original = std::fs::symlink_metadata(&path)?;
         std::fs::write(&replacement, "replacement content")?;
 
@@ -717,7 +766,7 @@ mod tests {
         let path = dir.path().join("forward.sock");
         let target = dir.path().join("target");
         let forwards = [unix(path.clone())];
-        let listeners = bind(&forwards).await?;
+        let listeners = bind(&forwards, AddressFamily::Any).await?;
         std::fs::write(&target, "preserved")?;
         std::fs::remove_file(&path)?;
         symlink(&target, &path)?;

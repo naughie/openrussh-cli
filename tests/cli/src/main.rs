@@ -8,14 +8,13 @@ fn main() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: ssh"));
         assert!(String::from_utf8_lossy(&output.stdout).contains("-v"));
 
-        for args in [
-            &["-o", "BatchMode=yes", "target"][..],
-            &["-s", "target", "sftp"][..],
-        ] {
-            let output = client.run(args, b"").await?;
-            assert_eq!(output.status.code(), Some(2));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
-        }
+        let output = client.run(&["-s", "target", "sftp"], b"").await?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+
+        let output = client.run(&["-o", "BatchMode=yes", "target"], b"").await?;
+        assert_eq!(output.status.code(), Some(255));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported SSH option"));
 
         for args in [
             &["-L", "8080:/tmp/remote.sock", "target"][..],
@@ -31,6 +30,198 @@ fn main() {
 
         Ok(())
     });
+
+    rt.register("-o overrides the final host in every configuration format", async || {
+        let dir = t::tempdir()?;
+        let identity = dir.path().join("identity with spaces");
+        let known_hosts = dir.path().join("trusted hosts");
+        std::fs::copy("/home/alice/.ssh/id_ed25519", &identity)?;
+        std::fs::copy("/home/alice/.ssh/known_hosts", &known_hosts)?;
+        let identity = format!("IdentityFile='{}'", identity.display());
+        let known_hosts = format!("UserKnownHostsFile='{}'", known_hosts.display());
+
+        let clients = [
+            t::Client::settings(" HostName 127.0.0.2\n User nobody\n Port 1\n CertificateFile /missing-certificate\n IdentityAgent /missing-agent\n")?,
+            t::Client::toml("[meta]\nknown-hosts = '/missing-known-hosts'\n[hosts.target]\nhost-name = '127.0.0.2'\nuser = 'nobody'\nport = 1\ncertificate-file = '/missing-certificate'\nidentity-agent = '/missing-agent'\n")?,
+            t::Client::lua("return {meta = {known_hosts = '/missing-known-hosts'}, hosts = {target = {host_name = '127.0.0.2', user = 'nobody', port = 1, certificate_file = '/missing-certificate', identity_agent = '/missing-agent'}}}")?,
+        ];
+        for client in clients {
+            let output = client.run(&[
+                "-o", "hOsTnAmE 127.0.0.1", "-o", "User=bob", "-o", "Port=2222",
+                "-o", &identity, "-o", &known_hosts, "-o", "IdentityAgent=none",
+                "-o", "CertificateFile=none", "-o", "IdentitiesOnly=yes",
+                "-o", "RequestTTY=no", "-o", "KexAlgorithms=curve25519-sha256",
+                "-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "LogLevel=ERROR",
+                "target", "printf options",
+            ], b"").await?;
+            t::expect(&output, 0, b"options", b"");
+        }
+
+        let client = t::Client::default_config()?;
+        let output = client.run(&[
+            "-F", "none", "-o", "HostName=127.0.0.1", "-o", "User=bob",
+            "-o", "Port=2222", "-o", &identity, "-o", &known_hosts,
+            "-o", "RequestTTY=no", "target", "printf defaults",
+        ], b"").await?;
+        t::expect(&output, 0, b"defaults", b"");
+        Ok(())
+    });
+
+    rt.register(
+        "-o and dedicated user and port options keep the first value",
+        async || {
+            let client = t::Client::new("")?;
+            for options in [
+                vec![
+                    "-o",
+                    "User=bob",
+                    "-l",
+                    "nobody",
+                    "-o",
+                    "Port=2222",
+                    "-p",
+                    "1",
+                ],
+                vec![
+                    "-l",
+                    "bob",
+                    "-o",
+                    "User=nobody",
+                    "-p",
+                    "2222",
+                    "-o",
+                    "Port=1",
+                ],
+                vec![
+                    "-o",
+                    "User=bob",
+                    "-o",
+                    "User=nobody",
+                    "-o",
+                    "Port=2222",
+                    "-o",
+                    "Port=1",
+                ],
+            ] {
+                let mut args = options;
+                args.extend(["target", "printf first"]);
+                let output = client.run(&args, b"").await?;
+                t::expect(&output, 0, b"first", b"");
+            }
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "address-family options filter direct connections",
+        async || {
+            let client = t::Client::new("")?;
+            for options in [
+                vec!["-4"],
+                vec!["-o", "AddressFamily=inet"],
+                vec!["-o", "AddressFamily=inet6", "-4"],
+                vec!["-4", "-o", "AddressFamily=inet6"],
+            ] {
+                let mut args = options;
+                args.extend(["target", "printf ipv4"]);
+                let output = client.run(&args, b"").await?;
+                t::expect(&output, 0, b"ipv4", b"");
+            }
+            for flag in ["-6", "-oAddressFamily=inet6"] {
+                let output = client.run(&[flag, "target", "true"], b"").await?;
+                assert_eq!(output.status.code(), Some(255));
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("requested address family")
+                );
+            }
+            Ok(())
+        },
+    );
+
+    rt.register(
+        "-o RequestTTY participates in terminal flag ordering",
+        async || {
+            let client = t::Client::new("")?;
+            for (options, expected) in [
+                (vec!["-o", "RequestTTY=force"], b"tty".as_slice()),
+                (vec!["-o", "RequestTTY=no", "-tt"], b"tty".as_slice()),
+                (vec!["-o", "RequestTTY=force", "-T"], b"pipe".as_slice()),
+                (vec!["-T", "-o", "RequestTTY=force"], b"pipe".as_slice()),
+            ] {
+                let mut args = options;
+                args.extend([
+                    "target",
+                    "if test -t 0; then printf tty; else printf pipe; fi",
+                ]);
+                let output = client.run(&args, b"").await?;
+                t::expect(&output, 0, expected, b"");
+            }
+            Ok(())
+        },
+    );
+
+    rt.register("SendEnv selects local values and removes earlier patterns", async || {
+        use t::tokio::time::{Duration, timeout};
+
+        let client = t::Client::new("")?;
+        let command = "printf '%s|%s|%s' \"${OPENRUSSH_TEST_KEEP1-unset}\" \"${OPENRUSSH_TEST_REMOVE-unset}\" \"${OPENRUSSH_TEST_SPACE-unset}\"";
+        for (options, expected) in [
+            (Vec::new(), b"unset|unset|unset".as_slice()),
+            (vec!["-o", "SendEnv=OPENRUSSH_TEST_*", "-o", "SendEnv=-OPENRUSSH_TEST_*", "-o", "SendEnv=OPENRUSSH_TEST_KEEP? OPENRUSSH_TEST_SPACE"], b"kept|unset|value with spaces".as_slice()),
+        ] {
+            let mut args = options;
+            args.extend(["target", command]);
+            let output = timeout(Duration::from_secs(15), client.command(&args)
+                .env("OPENRUSSH_TEST_KEEP1", "kept")
+                .env("OPENRUSSH_TEST_REMOVE", "removed")
+                .env("OPENRUSSH_TEST_SPACE", "value with spaces")
+                .output()).await??;
+            t::expect(&output, 0, expected, b"");
+        }
+        Ok(())
+    });
+
+    rt.register(
+        "RemoteCommand and StdinNull use the normal session path",
+        async || {
+            let client = t::Client::new("")?;
+            let output = client
+                .run(
+                    &[
+                        "-o",
+                        "RemoteCommand=cat; printf done",
+                        "-o",
+                        "StdinNull=yes",
+                        "target",
+                    ],
+                    b"ignored input",
+                )
+                .await?;
+            t::expect(&output, 0, b"done", b"");
+
+            for options in [
+                vec!["-o", "RemoteCommand=true", "target", "true"],
+                vec!["-o", "SessionType=default", "-N", "target"],
+                vec![
+                    "-o",
+                    "CertificateFile=one",
+                    "-o",
+                    "CertificateFile=two",
+                    "target",
+                ],
+                vec!["-o", "UserKnownHostsFile=one two", "target"],
+                vec!["-o", "Compression=maybe", "target"],
+                vec!["-o", "User='unterminated", "target"],
+            ] {
+                let output = client.run(&options, b"").await?;
+                assert_eq!(output.status.code(), Some(255));
+                assert!(output.stdout.is_empty());
+                assert!(!output.stderr.is_empty());
+            }
+            Ok(())
+        },
+    );
 
     rt.register("logging defaults follow verbose mode", async || {
         let openssh = t::Client::new("")?;

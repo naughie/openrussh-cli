@@ -23,7 +23,9 @@ asynchronous input resources. Its Rust crate name is `openrussh_cli_terminal`.
 | --- | --- | --- |
 | `cli::Invocation` | Parsed application arguments before loading. | Destination, session, and optional overrides retained without configuration-file IO. |
 | `config::ConfigBuilder` | Public configuration construction API. | Private fields set through consuming fluent methods; destination and session are supplied to `build`. |
-| `config::ResolveOptions<'a>` | Private borrowed inputs used during source resolution. | A destination reference and optional identity/jump slices borrowed for resolution; not part of the crate API. |
+| `config::HostOverrides` | Explicit final-target overrides independent of file syntax. | Optional hostname, authentication, algorithm, and setup values applied after alias and jump resolution. |
+| `config::AddressFamily` | Invocation policy for direct target connections and local TCP listeners. | `Any`, `Inet`, or `Inet6`; does not rewrite hostnames or constrain server-side forwarding. |
+| `config::ResolveOptions<'a>` | Private borrowed inputs used during source resolution. | Destination, optional identity/jump slices, and explicit agent selection; not part of the crate API. |
 | `config::ResolveConfig` | Private statically dispatched source-resolution protocol. | Each format's `ParsedConfig` implements `resolve()` independently and returns `Resolved`. |
 | `config::toml::ParsedConfig<'src>` | The result of parsing a TOML document. | Native profiles that can borrow from the source text. |
 | `config::lua::ParsedConfig` | The result of executing and deserializing a Lua chunk. | Owned native profiles and an optional temporary-directory owner, independent of the Lua VM and source text. |
@@ -36,7 +38,7 @@ asynchronous input resources. Its Rust crate name is `openrussh_cli_terminal`.
 | `config::LocalForward` | One supported local forwarding operation. | A TCP variant with TCP endpoints, or a Unix variant with local and remote socket paths. |
 | `config::ConnectionConfig` | A resolved connection route and the policy for each host in that route. | Private chain, policies, and an optional temporary-directory owner; read-only `chain()` and `algorithm_policy(host)` access. |
 | `config::algorithms::Policies` | Private algorithm policy associated with each resolved host. | A target policy and optional bastion policies aligned with the `Chain`. |
-| `config::Config` | Final application configuration for one invocation. | A `ConnectionConfig` and metadata plus CLI verbosity, session, stdin/escape, forwarding, cipher, MAC, and compression settings. |
+| `config::Config` | Final application configuration for one invocation. | A `ConnectionConfig` and metadata plus CLI verbosity, session, stdin/escape, forwarding, address family, environment patterns, cipher, MAC, and compression settings. |
 | `config::Error` | Configuration failure with its underlying cause. | Typed error and source chain, with an optional parsed log filter accessible through `log_filter()`. |
 
 `Config` is a struct, not a configuration-provider trait or a union of file
@@ -86,11 +88,19 @@ flowchart TD
     HL --> I
     HO --> I
     HB --> I
-    I --> J[Apply final-host CLI PTY override]
+    I --> J[Apply explicit host/setup overrides and final-host PTY policy]
     J --> K[config::Config]
     K --> L[Configure logging, known-host resource, and handler factory]
     L --> M[Connection, session, and forwarding runtime]
 ```
+
+The CLI parses `-o` using OpenSSH option quoting and ordering rules before any
+file is loaded. User/port and jump overrides participate in source resolution;
+`HostOverrides` then applies explicit target authentication, hostname, algorithm,
+and setup settings to the resolved result. The original alias continues to select
+file records and jumps. This common invocation stage is independent of each
+format's schema and preserves Lua temporary-resource ownership. Its path
+expansion rules belong to command-line input rather than either native format.
 
 `cli::parse()` produces an application-owned `Invocation`; it does not open
 configuration files or establish a connection. `Invocation::build()` adapts
@@ -101,9 +111,10 @@ the configuration crate can construct the builder directly.
 defaults leave file discovery and host settings to the resolver, select
 nonverbose logging, enable stdin, use `~` as the escape prefix, configure no
 local forwards or cipher/MAC override, and leave compression preference off.
-Each setter consumes the builder and returns it. The eleven optional settings
-are `config_file`, `identities`, `proxy_jump`, `tty`, `verbose`, `stdin_null`,
-`escape_char`, `local_forwards`, `compression`, `ciphers`, and `macs`. An empty
+Each setter consumes the builder and returns it. Optional settings include
+`config_file`, `identities`, `proxy_jump`, `host_overrides`, `tty`, `verbose`,
+`stdin_null`, `escape_char`, `local_forwards`, `address_family`, `send_env`,
+`compression`, `ciphers`, `macs`, and `remote_command`. An empty
 jump vector explicitly clears configured jumps, while `escape_char(None)`
 disables escapes.
 
@@ -363,7 +374,12 @@ existing task boundaries.
 
 ```text
 src/
-    cli.rs                 Argument parsing and the builder adapter
+    cli/
+        mod.rs             Argument parsing and the builder adapter
+        options/
+            mod.rs         OpenSSH-style CLI options and argument ordering
+            words.rs       OpenSSH option quoting and token boundaries
+    connection.rs          Direct TCP family policy and dependency connection adapter
     logging.rs             Tracing initialization and stderr formatting
     known_hosts.rs         Known-host setup resource and selected database path
     handler.rs             Runtime policy application and host-key checks
@@ -372,6 +388,7 @@ crates/openrussh-cli-config/
     src/
         lib.rs             Config, ConnectionConfig, Meta, model types, and private resolution inputs
         builder.rs         ConfigBuilder, file discovery, and static source dispatch
+        overrides.rs       Typed invocation overrides and CLI path expansion
         defaults.rs        Independent no-file connection/authentication defaults
         error.rs           Typed configuration errors and source context
         tests.rs           Cross-format loading, builder, and resolution tests
