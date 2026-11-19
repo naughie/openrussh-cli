@@ -4,7 +4,9 @@ This document covers implementation boundaries, repository conventions, validati
 
 ## Application boundaries
 
-The root Cargo package is `openrussh-cli`, its library crate is `openrussh_cli`, and the executable is `ssh`. `main.rs` creates the Tokio runtime and calls `pub async fn run() -> ExitCode`.
+The root Cargo package is `openrussh-cli`, its library crate is `openrussh_cli`,
+and its executables are `ssh` and `scp`. `src/bin/ssh.rs` and `src/bin/scp.rs`
+create the Tokio runtime and call `run_ssh()` and `run_scp()`, respectively.
 The application keeps implementation modules private and owns error reporting,
 exit status, and resource cleanup. The binary shuts the runtime down with
 `shutdown_background()` and returns the code through Rust's `Termination`
@@ -31,6 +33,7 @@ remaining `src/` modules.
 | `known_hosts` | Load the selected trust database once and retain its save path as a setup resource. |
 | `handler` | Apply per-host transport policies and integrate the library's known-host checks with local trust prompts and persistence. |
 | `session` | Select the library session operation and pump channel input/output, escapes, and terminal events. |
+| `scp` | Copy local and remote files and directory trees through an SFTP session. |
 | `openrussh_cli_terminal` | Own Unix signal streams, terminal-mode guards, input flags, size queries, suspension, and asynchronous input reading. |
 | `forwarding` | Bind local listeners, supervise accepted-stream tasks, and release listener resources. |
 | `lib` | Coordinate connection, session, forwarding, shutdown, and final status. |
@@ -40,7 +43,9 @@ connections, and supported channel operations. The application connection adapte
 retains its `Connection` for unrestricted sockets and jump chains. A restricted
 direct connection supplies a filtered TCP stream to the dependency's one-shot
 connector, preserving the original hostname for host-key checks and policy lookup.
-Session and forwarding code use the dependency's handle-based helpers.
+Session and forwarding code use the dependency's handle-based helpers. File
+transfers open an SFTP subsystem channel on the same connection handle and use
+`russh-sftp` for protocol and file IO. Directory traversal is iterative.
 
 The ordinary shell/exec path uses the dependency's safe process helpers. `SendEnv`
 requires opening one session channel, requesting any PTY, and sending SSH
@@ -61,7 +66,7 @@ starts construction; consuming fluent setters configure optional values.
 `build(destination, session)` requires both invocation-specific values and
 combines the resolved source with the supplied application settings into
 `Config`. `HostOverrides` supplies a separate, format-independent invocation
-stage after source resolution. `cli::parse()` remains free of configuration-file IO; the parsed
+stage after source resolution. `cli::parse_ssh()` and `cli::parse_scp()` remain free of configuration-file IO; the parsed
 `Invocation::build()` performs the builder adaptation and finalization.
 Setup metadata remains outside host/default records and is used when
 initializing resources; handlers receive the known-host resource and its
@@ -179,11 +184,12 @@ own outcomes directly; cross-format comparisons are regression fixtures for
 selected overlapping behavior rather than a semantic coupling requirement.
 Native additions must retain the existing OpenSSH adapter behavior.
 
-The root workspace and `tests/` are separate workspaces; `tests/` is explicitly excluded from the root workspace. Consequently, `cargo test` at the repository root runs unit tests for all three packages, public API tests, and doctests, but does not run the executable integration suites. The `tests/` workspace contains six application suites and a shared `tester` support crate:
+The root workspace and `tests/` are separate workspaces; `tests/` is explicitly excluded from the root workspace. Consequently, `cargo test` at the repository root runs unit tests for all three packages, public API tests, and doctests, but does not run the executable integration suites. The `tests/` workspace contains seven application suites and a shared `tester` support crate:
 
 | Suite | Application behavior |
 | --- | --- |
 | `cli` | CLI overrides, configuration selection/matching, native value types, path rules, and verbose logging policy. |
+| `scp` | File uploads and downloads, recursive directories, literal paths, symbolic links, and shared connection options. |
 | `stdio` | Shell/exec input, remote command joining and shell interpretation, stdout/stderr, exit status, EOF, and full-duplex output. |
 | `terminal` | PTY policy, resize, escapes, suspension, and terminal restoration. |
 | `signals` | Termination and suspension across session modes and host-key confirmation. |
@@ -192,7 +198,7 @@ The root workspace and `tests/` are separate workspaces; `tests/` is explicitly 
 
 Each suite is an executable using `libtest-mimic`; `tester` supplies a shared Tokio runtime, CLI subprocess/PTY operations, fixtures, and timeouts. Tests run serially by default because some cases temporarily mutate fixture configuration or known-host files. Keep fixture mutation scoped and restore it on failure. The helper checks the fixture home before making these changes. Spawned CLI processes use cancellation/kill guards so a failed assertion does not leave a long-running client behind.
 
-The Docker fixture builds this project's actual `ssh` binary and the selected suite, launches a real OpenSSH server, and runs the suite as a separate non-root client user. The server listens on `127.0.0.1:2222`, uses an Ed25519 host key and public-key authentication for the fixture server user, and starts with a known host entry for ordinary tests. Prompt tests temporarily remove or replace that entry. The fixture pins its Debian/OpenSSH package inputs in `tests/x.sh` and `tests/Dockerfile`.
+The Docker fixture builds this project's actual `ssh` and `scp` binaries and the selected suite, launches a real OpenSSH server with its SFTP subsystem, and runs the suite as a separate non-root client user. The server listens on `127.0.0.1:2222`, uses an Ed25519 host key and public-key authentication for the fixture server user, and starts with a known host entry for ordinary tests. Prompt tests temporarily remove or replace that entry. The fixture pins its Debian/OpenSSH package inputs in `tests/x.sh` and `tests/Dockerfile`.
 
 Integration coverage belongs to this application: CLI interpretation, configuration, process streams, Unix lifecycle handling, and forwarding ownership. Do not replace the OpenSSH fixture with a mock SSH server or add tests whose only assertion follows immediately from a dependency API's behavior.
 

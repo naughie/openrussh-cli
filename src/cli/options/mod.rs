@@ -1,4 +1,4 @@
-use super::{Args, HostOverrides};
+use super::{ConnectionArgs, HostOverrides, SessionArgs};
 
 use openrussh_cli_config::{AddressFamily, IdentityAgent, LogFilter};
 use openrussh_client::config::RequestTty;
@@ -44,7 +44,11 @@ enum Argument {
 }
 
 impl Options {
-    pub(super) fn from_args(args: &mut Args, matches: &clap::ArgMatches) -> Result<Self> {
+    pub(super) fn from_args(
+        args: &mut ConnectionArgs,
+        session: Option<&mut SessionArgs>,
+        matches: &clap::ArgMatches,
+    ) -> Result<Self> {
         fn append<T>(
             events: &mut Vec<(usize, Argument)>,
             matches: &clap::ArgMatches,
@@ -62,9 +66,9 @@ impl Options {
             + args.port.as_ref().map_or(0, Vec::len)
             + args.identities.as_ref().map_or(0, Vec::len)
             + args.jump.as_ref().map_or(0, Vec::len)
-            + usize::from(args.no_session)
-            + args.tty.len()
-            + args.no_tty.len()
+            + session.as_ref().map_or(0, |session| {
+                usize::from(session.no_session) + session.tty.len() + session.no_tty.len()
+            })
             + args.ipv4.len()
             + args.ipv6.len()
             + args.forwards.as_ref().map_or(0, Vec::len);
@@ -104,27 +108,29 @@ impl Options {
             args.jump.take().into_iter().flatten(),
             Argument::Jump,
         );
-        append(
-            &mut events,
-            matches,
-            "no_session",
-            args.no_session.then_some(()),
-            |_| Argument::NoSession,
-        );
-        append(
-            &mut events,
-            matches,
-            "tty",
-            std::mem::take(&mut args.tty),
-            |_| Argument::Tty(true),
-        );
-        append(
-            &mut events,
-            matches,
-            "no_tty",
-            std::mem::take(&mut args.no_tty),
-            |_| Argument::Tty(false),
-        );
+        if let Some(session) = session {
+            append(
+                &mut events,
+                matches,
+                "no_session",
+                session.no_session.then_some(()),
+                |_| Argument::NoSession,
+            );
+            append(
+                &mut events,
+                matches,
+                "tty",
+                std::mem::take(&mut session.tty),
+                |_| Argument::Tty(true),
+            );
+            append(
+                &mut events,
+                matches,
+                "no_tty",
+                std::mem::take(&mut session.no_tty),
+                |_| Argument::Tty(false),
+            );
+        }
         append(
             &mut events,
             matches,

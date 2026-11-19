@@ -10,11 +10,12 @@ Lua 5.4 is bundled; release binaries do not require a separate Lua installation.
 ## Release binaries
 
 Download and extract an archive from [Releases](https://github.com/naughie/openrussh-cli/releases).
-From the extracted directory, install `ssh` into a directory on your `PATH`:
+From the extracted directory, install the binaries into a directory on your `PATH`:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
 install -m 755 ssh "$HOME/.local/bin/ssh"
+install -m 755 scp "$HOME/.local/bin/scp"
 ```
 
 Add the directory to your shell configuration if needed:
@@ -35,7 +36,35 @@ cargo install --locked --path .
 
 Ensure `$HOME/.cargo/bin` is on your `PATH`.
 
+# Copying files
+
+Use `scp` to upload or download files. Add `-r` to copy directories, including
+their nested files and empty directories:
+
+```sh
+scp report.txt alice@my-host:reports/report.txt
+scp alice@my-host:reports/report.txt ./report.txt
+scp -r ./project alice@my-host:backups/
+scp -r alice@my-host:backups/project ./project
+```
+
+Remote operands use `[user@]host:path`; use brackets around IPv6 addresses, as
+in `alice@[::1]:report.txt`. Relative remote paths use the server's working
+directory, normally the remote user's home directory. Paths are literal, with no wildcard or shell expansion. Use
+`./` before a local filename containing a colon.
+
+Multiple sources require an existing destination directory. Each invocation
+copies between the local machine and one remote host. Local-to-local and
+remote-to-remote copies are not supported.
+
+Connection options, configuration formats, host-key verification, and jump hosts
+follow `ssh`. `-p PORT` selects the port, and `-P PORT` is an alias for `scp`.
+Transfers use the server's SFTP subsystem and never allocate a terminal or run
+a configured `RemoteCommand`.
+
 # Configuration
+
+Both `ssh` and `scp` use the configuration described below.
 
 Without `-F`, the first existing file is used:
 

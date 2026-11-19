@@ -2,11 +2,16 @@
 name = "openrussh-cli"
 version = "0.3.0"
 edition = "2024"
+default-run = "ssh"
 repository = "https://github.com/naughie/openrussh-cli"
 
 [[bin]]
 name = "ssh"
-path = "src/main.rs"
+path = "src/bin/ssh.rs"
+
+[[bin]]
+name = "scp"
+path = "src/bin/scp.rs"
 
 [workspace]
 members = [".", "crates/*"]
@@ -30,8 +35,9 @@ openrussh-client = { workspace = true, features = ["aws-lc-rs", "rsa", "flate2",
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 libc = "0.2"
+russh-sftp = "2.4"
 socket2 = "0.6"
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "tracing-log"] }
 

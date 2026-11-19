@@ -4,6 +4,7 @@ mod forwarding;
 mod handler;
 mod known_hosts;
 mod logging;
+mod scp;
 mod session;
 
 use crate::connection::Connection;
@@ -15,15 +16,39 @@ use anyhow::Result;
 
 use std::process::ExitCode;
 
-/// Runs one CLI invocation and returns its process exit code after cleanup.
+/// Runs one SSH CLI invocation and returns its process exit code after cleanup.
 ///
 /// The caller owns the Tokio runtime and its shutdown policy. Host-key prompts
 /// use blocking tasks, so runtime shutdown must not wait for an interrupted
 /// prompt to receive more terminal input.
-pub async fn run() -> ExitCode {
-    let mut conf = cli::parse().and_then(cli::Invocation::build);
+pub async fn run_ssh() -> ExitCode {
+    run_invocation(
+        "ssh",
+        cli::parse_ssh().and_then(|invocation| Ok((invocation.build()?, None))),
+    )
+    .await
+}
+
+/// Copies files using SCP command-line arguments and returns the exit code after cleanup.
+///
+/// Uses the same configuration and connection lifecycle as [`run_ssh()`]. The caller
+/// owns the Tokio runtime and must use the same shutdown policy described there.
+pub async fn run_scp() -> ExitCode {
+    run_invocation(
+        "scp",
+        cli::parse_scp()
+            .and_then(|(invocation, transfer)| Ok((invocation.build()?, Some(transfer)))),
+    )
+    .await
+}
+
+async fn run_invocation(
+    program: &'static str,
+    conf: Result<(config::Config, Option<scp::Transfer>)>,
+) -> ExitCode {
+    let mut conf = conf;
     let (verbose, log_filter) = match &mut conf {
-        Ok(conf) => (conf.verbose, conf.meta.log_filter.take()),
+        Ok((conf, _)) => (conf.verbose, conf.meta.log_filter.take()),
         Err(error) => (
             false,
             error
@@ -31,10 +56,10 @@ pub async fn run() -> ExitCode {
                 .and_then(config::Error::take_log_filter),
         ),
     };
-    logging::init(verbose, log_filter);
+    logging::init(program, verbose, log_filter);
 
     let result = match conf {
-        Ok(conf) => run_with_config(conf).await,
+        Ok((conf, transfer)) => run_with_config(conf, transfer).await,
         Err(e) => Err(e),
     };
     let status = match result {
@@ -47,7 +72,7 @@ pub async fn run() -> ExitCode {
     ExitCode::from(status)
 }
 
-async fn run_with_config(conf: config::Config) -> Result<u8> {
+async fn run_with_config(conf: config::Config, transfer: Option<scp::Transfer>) -> Result<u8> {
     use crate::handler::ClientHandlerFactory;
     use crate::known_hosts::KnownHostsFile;
     use openrussh_cli_terminal::{Event, Signals};
@@ -85,12 +110,13 @@ async fn run_with_config(conf: config::Config) -> Result<u8> {
     );
 
     drop(make_handler);
-    run_connected(conn, conf, &mut signals).await
+    run_connected(conn, conf, transfer, &mut signals).await
 }
 
 async fn run_connected<H>(
     conn: Connection<H>,
     conf: config::Config,
+    transfer: Option<scp::Transfer>,
     signals: &mut terminal::Signals,
 ) -> Result<u8>
 where
@@ -100,16 +126,21 @@ where
 
     use std::sync::Arc;
 
+    let operation = match transfer {
+        Some(transfer) => Operation::Copy {
+            transfer,
+            send_env: conf.send_env,
+        },
+        None => Operation::Session {
+            session: conf.session,
+            stdin_null: conf.stdin_null,
+            escape_char: conf.escape_char,
+            send_env: conf.send_env,
+        },
+    };
+
     let Some(forwards) = conf.local_forwards.as_deref().filter(|v| !v.is_empty()) else {
-        let res = run_session(
-            &conn,
-            conf.session,
-            conf.stdin_null,
-            conf.escape_char,
-            conf.send_env.as_deref(),
-            signals,
-        )
-        .await;
+        let res = operation.run(&conn, signals).await;
 
         return finish(&conn, res).await;
     };
@@ -124,12 +155,12 @@ where
                 Ok(forwarding) => forwarding,
                 Err(error) => return finish(&conn, Err(error)).await,
             },
-            sig = shutdown.recv() => return finish(&conn, Ok(signal_status(&conf.session, sig))).await,
+            sig = shutdown.recv() => return finish(&conn, Ok(operation.signal_status(sig))).await,
         }
     };
 
     let res = tokio::select! {
-        res = run_session(&conn, conf.session, conf.stdin_null, conf.escape_char, conf.send_env.as_deref(), signals) => res,
+        res = operation.run(&conn, signals) => res,
         res = forwarding.wait() => match res {
             Ok(never) => match never {},
             Err(e) => Err(e),
@@ -138,6 +169,71 @@ where
 
     forwarding.stop().await;
     finish(&conn, res).await
+}
+
+enum Operation {
+    Session {
+        session: config::Session,
+        stdin_null: bool,
+        escape_char: Option<u8>,
+        send_env: Option<Vec<String>>,
+    },
+    Copy {
+        transfer: scp::Transfer,
+        send_env: Option<Vec<String>>,
+    },
+}
+
+impl Operation {
+    fn signal_status(&self, sig: i32) -> u8 {
+        match self {
+            Self::Session { session, .. } => signal_status(session, sig),
+            Self::Copy { .. } => 255,
+        }
+    }
+
+    async fn run<H: Handler>(
+        self,
+        conn: &Connection<H>,
+        signals: &mut terminal::Signals,
+    ) -> Result<u8> {
+        match self {
+            Self::Session {
+                session,
+                stdin_null,
+                escape_char,
+                send_env,
+            } => {
+                run_session(
+                    conn,
+                    session,
+                    stdin_null,
+                    escape_char,
+                    send_env.as_deref(),
+                    signals,
+                )
+                .await
+            }
+            Self::Copy { transfer, send_env } => {
+                use terminal::Event;
+
+                let (shutdown, events) = signals.split();
+                let copy = transfer.run(conn, send_env.as_deref());
+                tokio::pin!(copy);
+
+                loop {
+                    tokio::select! {
+                        res = &mut copy => return res,
+                        _ = shutdown.recv() => return Ok(255),
+                        event = events.recv() => match event {
+                            Event::Suspend => terminal::suspend()?,
+                            Event::Resize | Event::Continue => {},
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn run_session<H: Handler>(

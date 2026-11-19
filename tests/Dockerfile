@@ -17,8 +17,9 @@ RUN mkdir /dist \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/cargo-target \
-       cargo build --locked --manifest-path Cargo.toml --bin ssh \
+       cargo build --locked --manifest-path Cargo.toml --bins \
     && cp /cargo-target/debug/ssh /dist/ssh \
+    && cp /cargo-target/debug/scp /dist/scp \
     && cargo build --locked --manifest-path ./tests/${SSH_TEST_ID}/Cargo.toml \
     && cp /cargo-target/debug/test-${SSH_TEST_ID} /dist/run-test
 
@@ -82,6 +83,7 @@ RUN rm -f /etc/ssh/ssh_host_* \
        'PerSourcePenalties no' \
        'Port 2222' \
        'PubkeyAuthentication yes' \
+       'Subsystem sftp internal-sftp' \
        'UsePAM no' \
        > /etc/ssh/sshd_config
 
@@ -89,6 +91,7 @@ COPY --from=toolchain /dist/setup.sh /opt/tests/setup.sh
 RUN /bin/sh /opt/tests/setup.sh
 
 COPY --from=toolchain /dist/ssh /opt/tests/ssh
+COPY --from=toolchain /dist/scp /opt/tests/scp
 
 COPY --chown=alice:alice --from=toolchain /dist/run-test /opt/tests/run-test
 COPY --chown=alice:alice --from=toolchain /dist/entrypoint.sh /opt/tests/test-entrypoint

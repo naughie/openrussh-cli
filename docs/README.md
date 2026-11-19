@@ -1,6 +1,6 @@
 # Developer reference
 
-This reference describes `openrussh-cli`, whose executable is named `ssh`. It
+This reference describes `openrussh-cli`, whose executables are `ssh` and `scp`. It
 covers the application's configuration, runtime behavior, implementation
 boundaries, and development workflow. The locked `openrussh-client` 0.4.6
 dependency is the authority for the SSH operations delegated to it.
@@ -9,7 +9,7 @@ dependency is the authority for the SSH operations delegated to it.
 | --- | --- |
 | [Configuration](configuration.md) | File discovery, OpenSSH/TOML/Lua syntax, host matching, value types, paths, defaults, overrides, and jump chains. |
 | [Configuration architecture](architecture.md) | The common configuration type, format-specific parse results, resolution stages, ownership, and dependency adapters. |
-| [Runtime](runtime.md) | CLI arguments, remote commands, standard streams, PTYs, signals, forwarding, exit status, and server host-key verification. |
+| [Runtime](runtime.md) | CLI arguments, file transfers, remote commands, standard streams, PTYs, signals, forwarding, exit status, and server host-key verification. |
 | [Development](development.md) | Module responsibilities, coding conventions, dependencies, tests, platform support, and release automation. |
 
 For a user-facing installation guide and configuration examples, see the

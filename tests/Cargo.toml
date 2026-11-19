@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "stdio", "terminal", "signals", "host-key-prompt", "listeners", "tester"]
+members = ["cli", "scp", "stdio", "terminal", "signals", "host-key-prompt", "listeners", "tester"]
 exclude = ["target"]
 resolver = "3"
 

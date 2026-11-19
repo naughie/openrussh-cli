@@ -5,7 +5,7 @@ set -e
 __proj_id="openrussh-client/cli"
 __openssh_version="1:10.0p1-7+deb13u4"
 __apt_snapshot="20261005T000000Z"
-__test_ids="cli stdio terminal signals host-key-prompt listeners"
+__test_ids="cli scp stdio terminal signals host-key-prompt listeners"
 
 __print_usage() {
     printf 'Usage: %s [test_id] [build|run]\n' "${__script}" >&2

@@ -102,7 +102,7 @@ file records and jumps. This common invocation stage is independent of each
 format's schema and preserves Lua temporary-resource ownership. Its path
 expansion rules belong to command-line input rather than either native format.
 
-`cli::parse()` produces an application-owned `Invocation`; it does not open
+`cli::parse_ssh()` produces an application-owned `Invocation`; it does not open
 configuration files or establish a connection. `Invocation::build()` adapts
 these parsed values to `ConfigBuilder` and calls its finalizer. Other users of
 the configuration crate can construct the builder directly.

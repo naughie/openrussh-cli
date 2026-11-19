@@ -11,11 +11,11 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 
 use std::fmt;
 
-pub(crate) fn init(verbose: bool, policy: Option<LogFilter>) {
+pub(crate) fn init(program: &'static str, verbose: bool, policy: Option<LogFilter>) {
     tracing_subscriber::fmt()
         .with_env_filter(filter(verbose, policy))
         .with_ansi(false)
-        .event_format(OpenSshFormat)
+        .event_format(OpenSshFormat(program))
         .with_writer(std::io::stderr)
         .finish()
         .with(verbosity(verbose))
@@ -42,7 +42,7 @@ fn verbosity(verbose: bool) -> FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool>
     filter_fn(move |meta| verbose || meta.is_span() || *meta.level() == Level::ERROR)
 }
 
-struct OpenSshFormat;
+struct OpenSshFormat(&'static str);
 
 impl<S, N> FormatEvent<S, N> for OpenSshFormat
 where
@@ -56,7 +56,7 @@ where
         event: &Event<'_>,
     ) -> fmt::Result {
         match *event.metadata().level() {
-            Level::ERROR => writer.write_str("ssh: ")?,
+            Level::ERROR => write!(writer, "{}: ", self.0)?,
             Level::DEBUG => writer.write_str("debug1: ")?,
             Level::TRACE => writer.write_str("debug2: ")?,
             Level::WARN | Level::INFO => {}
@@ -102,7 +102,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(filter(verbose, policy))
             .with_ansi(false)
-            .event_format(OpenSshFormat)
+            .event_format(OpenSshFormat("ssh"))
             .with_writer(output.clone())
             .finish()
             .with(verbosity(verbose));

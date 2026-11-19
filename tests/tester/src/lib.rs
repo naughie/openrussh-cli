@@ -80,8 +80,16 @@ impl Client {
         Ok(Self { conf: None })
     }
 
-    pub fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new("/opt/tests/ssh");
+    pub fn command_ssh(&self, args: &[&str]) -> Command {
+        self.command_for("/opt/tests/ssh", args)
+    }
+
+    pub fn command_scp(&self, args: &[&str]) -> Command {
+        self.command_for("/opt/tests/scp", args)
+    }
+
+    fn command_for(&self, binary: &str, args: &[&str]) -> Command {
+        let mut cmd = Command::new(binary);
 
         if let Some(conf) = &self.conf {
             cmd.arg("-F").arg(conf.path());
@@ -99,7 +107,7 @@ impl Client {
     pub async fn run(&self, args: &[&str], data: &[u8]) -> Result<Output> {
         use tokio::io::AsyncWriteExt as _;
 
-        let mut child = self.command(args).spawn()?;
+        let mut child = self.command_ssh(args).spawn()?;
         let mut stdin = child.stdin.take().context("Capture stdin")?;
 
         let input = async {
@@ -138,7 +146,7 @@ impl Client {
         let saved = tcgetattr(&slave)?;
         let flags = fcntl(&slave, FcntlArg::F_GETFL)?;
 
-        let mut cmd = self.command(args);
+        let mut cmd = self.command_ssh(args);
         cmd.stdin(slave.try_clone()?);
         cmd.stdout(slave.try_clone()?);
         cmd.stderr(slave.try_clone()?);

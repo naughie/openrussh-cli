@@ -209,7 +209,7 @@ fn terminal_modes(attributes: terminal::Attributes) -> [(openrussh_client::russh
     ]
 }
 
-fn selected_environment(
+pub(super) fn selected_environment(
     patterns: &[String],
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(String, String)> {

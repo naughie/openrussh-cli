@@ -59,7 +59,7 @@ fn main() {
                 };
 
                 let spec = format!("{bind}:{target}");
-                let child = client.command(&["-N", "-L", &spec, "target"]).spawn()?;
+                let child = client.command_ssh(&["-N", "-L", &spec, "target"]).spawn()?;
 
                 let transfer = async {
                     if unix {

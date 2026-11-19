@@ -172,7 +172,7 @@ fn main() {
         ] {
             let mut args = options;
             args.extend(["target", command]);
-            let output = timeout(Duration::from_secs(15), client.command(&args)
+            let output = timeout(Duration::from_secs(15), client.command_ssh(&args)
                 .env("OPENRUSSH_TEST_KEEP1", "kept")
                 .env("OPENRUSSH_TEST_REMOVE", "removed")
                 .env("OPENRUSSH_TEST_SPACE", "value with spaces")
@@ -742,7 +742,7 @@ return {{hosts = {{target = {{
                 manifest = manifest.to_str().unwrap(),
             ))?;
             let mut child = client
-                .command(&["target", "printf 'ready\\n'; read continue; printf done"])
+                .command_ssh(&["target", "printf 'ready\\n'; read continue; printf done"])
                 .spawn()?;
             let mut ready = [0_u8; 6];
             timeout(
@@ -888,7 +888,7 @@ return {hosts = {target = {
             let output = timeout(
                 Duration::from_secs(15),
                 client
-                    .command(&["target", "printf", "nil"])
+                    .command_ssh(&["target", "printf", "nil"])
                     .env("TMPDIR", dir.path().join("missing"))
                     .env("OPENRUSSH_TEMP_FILE_READY", &ready)
                     .output(),
@@ -1033,7 +1033,7 @@ return {{
                     let output = timeout(
                         Duration::from_secs(15),
                         client
-                            .command(&[
+                            .command_ssh(&[
                                 "-F",
                                 path.to_str().unwrap(),
                                 "target",
@@ -1127,7 +1127,7 @@ return {{hosts = {{target = target}}}}
 "#,
                     ),
                 )?;
-                let mut command = client.command(&[
+                let mut command = client.command_ssh(&[
                     "-F",
                     config.to_str().unwrap(),
                     "target",
@@ -1383,7 +1383,7 @@ return {
                 let output = timeout(
                     Duration::from_secs(15),
                     client
-                        .command(args)
+                        .command_ssh(args)
                         .env("SSH_AUTH_SOCK", socket)
                         .stdin(Stdio::null())
                         .output(),

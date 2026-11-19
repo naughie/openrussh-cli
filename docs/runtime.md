@@ -1,6 +1,6 @@
 # Runtime reference
 
-This document describes the CLI's behavior and its boundary with `openrussh-client`. Configuration formats and their resolution are described in [Configuration architecture](architecture.md). The executable is named `ssh`; its implementation is an application around `openrussh-client`, rather than a replacement implementation of SSH transport, authentication, or channels.
+This document describes the CLI's behavior and its boundary with `openrussh-client`. Configuration formats and their resolution are described in [Configuration architecture](architecture.md). The executables are `ssh` and `scp`. Both use `openrussh-client` for SSH transport, authentication, and channels.
 
 ## Invocation and argument semantics
 
@@ -40,11 +40,56 @@ command, and disable the remote PTY. See the [option precedence reference](confi
 
 Omitting `COMMAND` starts a remote shell. When a command is supplied, the CLI joins `COMMAND` and every following argument with one ASCII space into a remote command string, following OpenSSH CLI semantics. It adds no quoting or escaping. An empty resulting string also starts a shell. Tokens following `COMMAND`, including tokens beginning with `-`, belong to that command string. CLI connection settings take precedence over file settings; details of file selection, host matching, defaults, and list merging belong to the configuration reference.
 
-The CLI accepts the [documented `-o` settings](configuration.md#command-line-options)
+`ssh` accepts the [documented `-o` settings](configuration.md#command-line-options)
 and rejects unsupported keywords. Subsystem requests, remote forwarding (`-R`),
 dynamic SOCKS forwarding (`-D`), agent forwarding (`-A`), and X11 forwarding
 (`-X`) remain unsupported. Parsing a directive in an OpenSSH configuration file
 does not itself add an application feature.
+
+## File transfers
+
+```text
+scp [OPTIONS] SOURCE... TARGET
+```
+
+`scp` uploads local sources to `[user@]host:path`, or downloads remote sources
+from one host to a local target. Bracket IPv6 hosts, as in
+`alice@[::1]:report.txt`. A slash before the first colon makes an operand local;
+use `./name:part` for a local filename containing a colon. An empty remote path
+means `.`. Remote paths and uploaded file names must be UTF-8. Paths are literal:
+the client performs no shell, wildcard, or tilde expansion. Relative paths use the SFTP server's working
+directory, normally the remote user's home directory.
+
+A single file can replace a destination file or keep its source name inside an
+existing destination directory. `-r` copies directory trees, including empty
+directories. An absent destination becomes the copied directory; an existing
+directory receives a child with the source directory's name. A source ending in
+`/.`, or the source `.` or `/`, copies its contents into the destination.
+Multiple sources require an existing destination directory. Download sources must use the same
+host, user, and port. Local-to-local and remote-to-remote copies are rejected.
+
+Symbolic links are followed. Directory links that return to an ancestor stop
+the transfer with an error. Special source files are rejected. New regular
+files use the source permission bits subject to the destination's creation
+umask; existing file permissions are retained. Directories use the destination's
+creation defaults. File times are not preserved. A failed or interrupted copy
+can leave partially copied files and directories.
+
+Connection flags `-4`, `-6`, `-o`, `-v`, `-F`, `-p`, `-l`, `-i`, `-J`, `-L`,
+`-g`, `-C`, `-c`, and `-m` use the same parsing and configuration rules as `ssh`.
+`-P PORT` is also accepted as an alias for `-p PORT`. `-r` enables recursive
+copying. No remote PTY is allocated. Command-line `RemoteCommand` and
+`SessionType=none` settings conflict with copying and are rejected.
+
+Transfers request the server's `sftp` subsystem on the authenticated SSH
+connection, after sending any selected `SendEnv` variables. Server `AcceptEnv`
+policy applies as for SSH commands. Transfers do not invoke a remote `scp`
+program. Local stdin and stdout are unused. Completion returns `0`;
+configuration, connection, transfer, and
+termination failures return `255`. Host-key prompts, log filters, local
+forwarding cleanup, and connection cleanup follow the SSH lifecycle.
+Suspension stops the process and resumes the transfer after continuation;
+resize events have no transfer action.
 
 ## Logging
 
@@ -76,8 +121,9 @@ filter; target-specific disabling still suppresses matching errors. Repeating
 `-v` does not increase the level. Invalid directives and non-string values are
 configuration errors. An OpenSSH-file `LogLevel` does not select this native
 application setting; CLI `-o LogLevel=...` overrides it for all formats.
-Logs follow the OpenSSH client style: errors start with `ssh: `, debug messages
-start with `debug1: `, trace messages start with `debug2: `, and warnings and
+Logs follow the OpenSSH client style: errors start with `ssh: ` or `scp: `
+according to the executable. Debug messages start with `debug1: `, trace
+messages start with `debug2: `, and warnings and
 informational messages have no level prefix. They contain no timestamps, ANSI
 colors, or Rust module targets, and use CRLF line endings so messages remain
 readable in a raw terminal.

@@ -8,6 +8,8 @@ use anyhow::{Context as _, Result, bail, ensure};
 use std::path::PathBuf;
 
 mod options;
+mod scp;
+pub(crate) use scp::parse_scp;
 
 #[derive(clap::Parser)]
 #[command(
@@ -15,7 +17,25 @@ mod options;
     version,
     about = "SSH client powered by openrussh-client"
 )]
-struct Args {
+struct ArgsSsh {
+    #[command(flatten)]
+    connection: ConnectionArgs,
+
+    #[command(flatten)]
+    session: SessionArgs,
+
+    #[arg(
+        value_name = "DESTINATION",
+        help = "[user@]host[:port] or ssh://[user@]host[:port]"
+    )]
+    destination: String,
+
+    #[arg(value_name = "COMMAND", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, help = "Remote shell command (arguments are joined with spaces)")]
+    command: Option<Vec<String>>,
+}
+
+#[derive(clap::Args)]
+struct ConnectionArgs {
     #[arg(short = '4', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", help = "Use IPv4 addresses only")]
     ipv4: Vec<bool>,
 
@@ -64,6 +84,41 @@ struct Args {
     )]
     jump: Option<Vec<String>>,
 
+    #[arg(
+        short = 'L',
+        value_name = "FORWARD",
+        help = "Forward a local TCP port or Unix socket (repeatable)"
+    )]
+    forwards: Option<Vec<String>>,
+
+    #[arg(
+        short = 'g',
+        help = "Bind unspecified local forwarding addresses on all interfaces"
+    )]
+    gateway_ports: bool,
+
+    #[arg(short = 'C', help = "Prefer compression")]
+    compression: bool,
+
+    #[arg(
+        short = 'c',
+        value_name = "CIPHERS",
+        overrides_with = "ciphers",
+        help = "Use these comma-separated ciphers"
+    )]
+    ciphers: Option<String>,
+
+    #[arg(
+        short = 'm',
+        value_name = "MACS",
+        overrides_with = "macs",
+        help = "Use these comma-separated MAC algorithms"
+    )]
+    macs: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct SessionArgs {
     #[arg(short = 't', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", help = "Request a terminal (-tt forces allocation)")]
     tty: Vec<bool>,
 
@@ -89,53 +144,12 @@ struct Args {
     stdio: Option<String>,
 
     #[arg(
-        short = 'L',
-        value_name = "FORWARD",
-        help = "Forward a local TCP port or Unix socket (repeatable)"
-    )]
-    forwards: Option<Vec<String>>,
-
-    #[arg(
-        short = 'g',
-        help = "Bind unspecified local forwarding addresses on all interfaces"
-    )]
-    gateway_ports: bool,
-
-    #[arg(
         short = 'e',
         value_name = "CHAR",
         overrides_with = "escape",
         help = "Set the terminal escape character, or none (default: ~)"
     )]
     escape: Option<String>,
-
-    #[arg(short = 'C', help = "Prefer compression")]
-    compression: bool,
-
-    #[arg(
-        short = 'c',
-        value_name = "CIPHERS",
-        overrides_with = "ciphers",
-        help = "Use these comma-separated ciphers"
-    )]
-    ciphers: Option<String>,
-
-    #[arg(
-        short = 'm',
-        value_name = "MACS",
-        overrides_with = "macs",
-        help = "Use these comma-separated MAC algorithms"
-    )]
-    macs: Option<String>,
-
-    #[arg(
-        value_name = "DESTINATION",
-        help = "[user@]host[:port] or ssh://[user@]host[:port]"
-    )]
-    destination: String,
-
-    #[arg(value_name = "COMMAND", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, help = "Remote shell command (arguments are joined with spaces)")]
-    command: Option<Vec<String>>,
 }
 
 pub(crate) struct Invocation {
@@ -198,48 +212,38 @@ impl Invocation {
     }
 }
 
-pub(crate) fn parse() -> Result<Invocation> {
+pub(crate) fn parse_ssh() -> Result<Invocation> {
     use clap::{CommandFactory as _, FromArgMatches as _};
 
-    let matches = Args::command().get_matches();
-    Args::from_arg_matches(&matches)?.into_invocation(&matches)
+    let matches = ArgsSsh::command().get_matches();
+    ArgsSsh::from_arg_matches(&matches)?.into_invocation(&matches)
 }
 
-impl Args {
+impl ArgsSsh {
     fn into_invocation(self, matches: &clap::ArgMatches) -> Result<Invocation> {
-        let mut args = self;
-        let mut options = options::Options::from_args(&mut args, matches)?;
-        if args.verbose && options.host.log_filter.is_some() {
-            options.host.log_filter =
-                Some(openrussh_cli_config::LogFilter::try_from_filter("debug")?);
-        }
-
-        let remote_command = options
-            .remote_command
-            .filter(|command| !command.eq_ignore_ascii_case("none"));
-        let mut destination = parse_destination(args.destination)?;
-
-        if let Some(user) = options.user {
-            destination.user = Some(user);
-        }
-
-        if let Some(port) = options.port {
-            destination.port = Some(port);
-        }
-
-        let session = if args.no_session {
+        let Self {
+            mut connection,
+            mut session,
+            destination,
+            command,
+        } = self;
+        let options = options::Options::from_args(&mut connection, Some(&mut session), matches)?;
+        let no_session = session.no_session || options.no_session.unwrap_or(false);
+        let mut invocation =
+            connection.into_invocation(parse_destination(destination)?, options)?;
+        invocation.session = if session.no_session {
             Session::None
-        } else if let Some(s) = &args.stdio {
+        } else if let Some(s) = &session.stdio {
             let (host, port) = parse_tcp_endpoint(s)?;
             Session::Forward {
                 host: host.to_owned(),
                 port,
             }
-        } else if options.no_session.unwrap_or(false) {
+        } else if no_session {
             Session::None
-        } else if let Some(command) = args.command {
+        } else if let Some(command) = command {
             ensure!(
-                remote_command.is_none(),
+                invocation.remote_command.is_none(),
                 "Cannot execute a command-line command and RemoteCommand"
             );
             let mut words = command.into_iter();
@@ -259,12 +263,33 @@ impl Args {
         } else {
             Session::Shell
         };
+        if matches!(invocation.session, Session::Forward { .. } | Session::None) {
+            invocation.tty = Some(RequestTty::Never);
+        }
+        invocation.stdin_null |= session.stdin_null;
+        if let Some(escape) = session.escape {
+            invocation.escape_char = parse_escape(&escape)?;
+        }
+        Ok(invocation)
+    }
+}
 
-        let tty = if matches!(session, Session::Forward { .. } | Session::None) {
-            Some(RequestTty::Never)
-        } else {
-            options.tty
-        };
+impl ConnectionArgs {
+    fn into_invocation(
+        self,
+        mut destination: Destination,
+        mut options: options::Options,
+    ) -> Result<Invocation> {
+        if self.verbose && options.host.log_filter.is_some() {
+            options.host.log_filter =
+                Some(openrussh_cli_config::LogFilter::try_from_filter("debug")?);
+        }
+        if let Some(user) = options.user {
+            destination.user = Some(user);
+        }
+        if let Some(port) = options.port {
+            destination.port = Some(port);
+        }
 
         let local_forwards = options
             .forwards
@@ -273,7 +298,7 @@ impl Args {
                     .map(|s| {
                         parse_forward(
                             s,
-                            args.gateway_ports || options.gateway_ports.unwrap_or(false),
+                            self.gateway_ports || options.gateway_ports.unwrap_or(false),
                         )
                     })
                     .collect::<Result<Vec<_>>>()
@@ -282,27 +307,24 @@ impl Args {
 
         Ok(Invocation {
             destination,
-            config_file: args.config,
+            config_file: self.config,
             identities: options.identities,
             proxy_jump: options.proxy_jump,
-            tty,
-            verbose: args.verbose || options.verbose,
-            session,
-            stdin_null: args.stdin_null || options.stdin_null.unwrap_or(false),
-            escape_char: parse_escape(
-                args.escape
-                    .as_deref()
-                    .or(options.escape.as_deref())
-                    .unwrap_or("~"),
-            )?,
+            tty: options.tty,
+            verbose: self.verbose || options.verbose,
+            session: Session::Shell,
+            stdin_null: options.stdin_null.unwrap_or(false),
+            escape_char: parse_escape(options.escape.as_deref().unwrap_or("~"))?,
             local_forwards,
-            compression: args.compression || options.compression.unwrap_or(false),
-            ciphers: args.ciphers.or(options.ciphers),
-            macs: args.macs.or(options.macs),
+            compression: self.compression || options.compression.unwrap_or(false),
+            ciphers: self.ciphers.or(options.ciphers),
+            macs: self.macs.or(options.macs),
             host_overrides: options.host,
             address_family: options.address_family.unwrap_or_default(),
             send_env: options.send_env,
-            remote_command,
+            remote_command: options
+                .remote_command
+                .filter(|s| !s.eq_ignore_ascii_case("none")),
         })
     }
 }
@@ -481,9 +503,9 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Invocation> {
         use clap::{CommandFactory as _, FromArgMatches as _};
 
-        let matches = Args::command()
+        let matches = ArgsSsh::command()
             .try_get_matches_from(std::iter::once("ssh").chain(args.iter().copied()))?;
-        Args::from_arg_matches(&matches)?.into_invocation(&matches)
+        ArgsSsh::from_arg_matches(&matches)?.into_invocation(&matches)
     }
 
     #[test]
