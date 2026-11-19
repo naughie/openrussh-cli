@@ -1,6 +1,6 @@
 [package]
 name = "openrussh-cli"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 default-run = "ssh"
 repository = "https://github.com/naughie/openrussh-cli"
