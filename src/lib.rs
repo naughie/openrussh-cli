@@ -73,58 +73,42 @@ async fn run_invocation(
 }
 
 async fn run_with_config(conf: config::Config, transfer: Option<scp::Transfer>) -> Result<u8> {
+    use crate::connection::ConnectError;
+    use crate::forwarding::Forwarding;
     use crate::handler::ClientHandlerFactory;
     use crate::known_hosts::KnownHostsFile;
-    use openrussh_cli_terminal::{Event, Signals};
-
-    let preferred = conf.preferred()?;
-    let known_hosts = KnownHostsFile::load(conf.meta.known_hosts.as_deref())?;
-    let make_handler = ClientHandlerFactory::new(preferred, known_hosts, &conf.connection);
-
-    let mut signals = Signals::new()?;
-
-    let conn = {
-        let conn = Connection::connect(conf.connection.chain(), &make_handler, conf.address_family);
-        tokio::pin!(conn);
-        let (shutdown, events) = signals.split();
-
-        loop {
-            tokio::select! {
-                res = &mut conn => break res.map_err(|e| anyhow::anyhow!(e))?,
-                _ = shutdown.recv() => return Ok(255),
-                event = events.recv() => {
-                    match event {
-                        Event::Suspend => terminal::suspend()?,
-                        Event::Resize | Event::Continue => {}
-                    }
-                }
-            }
-        }
-    };
-
-    tracing::info!(
-        "Authenticated to {} (port {}) as '{}'.",
-        conf.connection.chain().target.dest.name,
-        conf.connection.chain().target.dest.port,
-        conf.connection.chain().target.dest.user
-    );
-
-    drop(make_handler);
-    run_connected(conn, conf, transfer, &mut signals).await
-}
-
-async fn run_connected<H>(
-    conn: Connection<H>,
-    conf: config::Config,
-    transfer: Option<scp::Transfer>,
-    signals: &mut terminal::Signals,
-) -> Result<u8>
-where
-    H: Handler + Send + 'static,
-{
-    use crate::forwarding::Forwarding;
 
     use std::sync::Arc;
+
+    let preferred = conf.preferred()?;
+    let known_hosts_path = conf.meta.known_hosts.as_deref();
+    let known_hosts = KnownHostsFile::load(known_hosts_path)?;
+    let mut signals = terminal::Signals::new()?;
+
+    let chain = conf.connection.chain();
+    let family = conf.address_family;
+    let connect = async |known_hosts| {
+        let make_handler = ClientHandlerFactory::new(&preferred, known_hosts, &conf.connection);
+        let conn = Connection::connect(chain, make_handler, family).await?;
+
+        let dest = &chain.target.dest;
+        tracing::info!(
+            "Authenticated to {} (port {}) as '{}'.",
+            dest.name,
+            dest.port,
+            dest.user
+        );
+
+        Ok::<_, ConnectError>(conn)
+    };
+
+    let conn = tokio::select! {
+        res = connect(known_hosts) => res.map_err(|e| anyhow::anyhow!(e))?,
+        res = wait_for_shutdown(&mut signals) => {
+            res?;
+            return Ok(255);
+        }
+    };
 
     let operation = match transfer {
         Some(transfer) => Operation::Copy {
@@ -140,7 +124,7 @@ where
     };
 
     let Some(forwards) = conf.local_forwards.as_deref().filter(|v| !v.is_empty()) else {
-        let res = operation.run(&conn, signals).await;
+        let res = operation.run(&conn, &mut signals).await;
 
         return finish(&conn, res).await;
     };
@@ -151,7 +135,7 @@ where
         let (shutdown, _) = signals.split();
 
         tokio::select! {
-            res = Forwarding::start(&conn, forwards, conf.address_family) => match res {
+            res = Forwarding::start(Arc::clone(&conn), forwards, family) => match res {
                 Ok(forwarding) => forwarding,
                 Err(error) => return finish(&conn, Err(error)).await,
             },
@@ -159,16 +143,57 @@ where
         }
     };
 
-    let res = tokio::select! {
-        res = operation.run(&conn, signals) => res,
-        res = forwarding.wait() => match res {
-            Ok(never) => match never {},
-            Err(e) => Err(e),
-        },
+    let reconnect = async || {
+        let known_hosts =
+            KnownHostsFile::load(known_hosts_path).map_err(ConnectError::MakeHandler)?;
+        connect(known_hosts).await
+    };
+    let (session_conn, reconnect) = if matches!(
+        operation,
+        Operation::Session {
+            session: config::Session::None,
+            ..
+        }
+    ) {
+        tracing::debug!("Entering forwarding-only session.");
+        drop(conn);
+        (None, Some(reconnect))
+    } else {
+        (Some(conn), None)
     };
 
-    forwarding.stop().await;
+    let session = async {
+        match session_conn {
+            Some(conn) => operation.run(&conn, &mut signals).await,
+            None => wait_for_shutdown(&mut signals)
+                .await
+                .map(|sig| operation.signal_status(sig)),
+        }
+    };
+    let res = tokio::select! {
+        res = session => res,
+        Err(e) = forwarding.wait(reconnect) => Err(e),
+    };
+
+    let conn = forwarding.stop().await;
     finish(&conn, res).await
+}
+
+async fn wait_for_shutdown(signals: &mut terminal::Signals) -> Result<i32> {
+    use terminal::Event;
+
+    let (shutdown, events) = signals.split();
+
+    loop {
+        tokio::select! {
+            sig = shutdown.recv() => return Ok(sig),
+            event = events.recv() => {
+                if matches!(event, Event::Suspend) {
+                    terminal::suspend()?;
+                }
+            }
+        }
+    }
 }
 
 enum Operation {
