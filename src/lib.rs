@@ -73,8 +73,8 @@ async fn run_invocation(
 }
 
 async fn run_with_config(conf: config::Config, transfer: Option<scp::Transfer>) -> Result<u8> {
-    use crate::connection::ConnectError;
-    use crate::forwarding::Forwarding;
+    use crate::connection::{ConnectError, is_terminal_connect_error};
+    use crate::forwarding::{Forwarding, ReconnectError};
     use crate::handler::ClientHandlerFactory;
     use crate::known_hosts::KnownHostsFile;
 
@@ -144,9 +144,20 @@ async fn run_with_config(conf: config::Config, transfer: Option<scp::Transfer>) 
     };
 
     let reconnect = async || {
-        let known_hosts =
-            KnownHostsFile::load(known_hosts_path).map_err(ConnectError::MakeHandler)?;
-        connect(known_hosts).await
+        let res = match KnownHostsFile::load(known_hosts_path) {
+            Ok(known_hosts) => connect(known_hosts).await,
+            Err(e) => Err(ConnectError::MakeHandler(e)),
+        };
+
+        res.map_err(|e| {
+            let terminal = is_terminal_connect_error(&e);
+            let e = anyhow::anyhow!(e);
+            if terminal {
+                ReconnectError::Fatal(e)
+            } else {
+                ReconnectError::Transient(e)
+            }
+        })
     };
     let (session_conn, reconnect) = if matches!(
         operation,

@@ -1,7 +1,7 @@
 use openrussh_cli_config::{AddressFamily, BindHost, LocalForward};
 
-use crate::connection::{ConnectError, Connection, is_terminal_connect_error, matches_family};
-use crate::handler::ClientHandler;
+use crate::connection::{Connection, matches_family};
+use openrussh_client::russh::client::Handler;
 
 use anyhow::{Context as _, Result};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
@@ -16,11 +16,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-pub(crate) struct Forwarding<'a> {
-    conn: Arc<Connection<ClientHandler>>,
+pub(crate) struct Forwarding<'a, H: Handler> {
+    conn: Arc<Connection<H>>,
     listeners: Vec<Listener<'a>>,
     tasks: JoinSet<Result<()>>,
     next_listener: usize,
+}
+
+pub(crate) enum ReconnectError {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 enum Listener<'a> {
@@ -66,9 +71,9 @@ impl Drop for SocketPath {
     }
 }
 
-impl<'a> Forwarding<'a> {
+impl<'a, H: Handler> Forwarding<'a, H> {
     pub(crate) async fn start(
-        conn: Arc<Connection<ClientHandler>>,
+        conn: Arc<Connection<H>>,
         forwards: &'a [LocalForward],
         family: AddressFamily,
     ) -> Result<Self> {
@@ -84,8 +89,11 @@ impl<'a> Forwarding<'a> {
 
     pub(crate) async fn wait(
         &mut self,
-        reconnect: Option<impl AsyncFn() -> Result<Connection<ClientHandler>, ConnectError>>,
-    ) -> Result<Infallible> {
+        reconnect: Option<impl AsyncFn() -> Result<Connection<H>, ReconnectError>>,
+    ) -> Result<Infallible>
+    where
+        H: 'static,
+    {
         const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
         let mut last_failure: Option<Instant> = None;
@@ -127,10 +135,10 @@ impl<'a> Forwarding<'a> {
                                 self.conn = Arc::new(conn);
                                 last_failure = None;
                             }
-                            Err(e) if is_terminal_connect_error(&e) => {
-                                return Err(anyhow::anyhow!(e)).context("reconnect SSH for local forwarding");
+                            Err(ReconnectError::Fatal(e)) => {
+                                return Err(e).context("reconnect SSH for local forwarding");
                             }
-                            Err(e) => {
+                            Err(ReconnectError::Transient(e)) => {
                                 last_failure = Some(Instant::now());
                                 tracing::error!("local forward: reconnect SSH: {e}");
                                 continue;
@@ -145,7 +153,7 @@ impl<'a> Forwarding<'a> {
         }
     }
 
-    pub(crate) async fn stop(mut self) -> Arc<Connection<ClientHandler>> {
+    pub(crate) async fn stop(mut self) -> Arc<Connection<H>> {
         self.listeners.clear();
         self.tasks.shutdown().await;
         self.conn
@@ -325,7 +333,7 @@ impl Listener<'_> {
     }
 }
 
-async fn forward(conn: &Connection<ClientHandler>, incoming: Incoming) -> Result<()> {
+async fn forward<H: Handler>(conn: &Connection<H>, incoming: Incoming) -> Result<()> {
     match incoming {
         Incoming::Tcp {
             stream,
