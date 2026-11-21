@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 pub(crate) struct ClientHandlerFactory<'a> {
     known_hosts: KnownHostsFile,
-    preferred: Preferred,
+    preferred: &'a Preferred,
     connection: &'a ConnectionConfig,
 }
 
 impl<'a> ClientHandlerFactory<'a> {
     pub(crate) fn new(
-        preferred: Preferred,
+        preferred: &'a Preferred,
         known_hosts: KnownHostsFile,
         connection: &'a ConnectionConfig,
     ) -> Self {
@@ -515,11 +515,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("selected_hosts");
         let connection = connection("SERVER.Example", 2222).unwrap();
+        let preferred = Preferred {
+            cipher: Cow::Borrowed(&[cipher::AES_256_CTR]),
+            ..Default::default()
+        };
         let maker = ClientHandlerFactory::new(
-            Preferred {
-                cipher: Cow::Borrowed(&[cipher::AES_256_CTR]),
-                ..Default::default()
-            },
+            &preferred,
             KnownHostsFile::load(Some(&path)).unwrap(),
             &connection,
         );
@@ -546,6 +547,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("known_hosts");
         let key = key();
+        let preferred = Preferred::default();
 
         for (name, expected) in [
             ("SERVER.Example", "server.example"),
@@ -554,7 +556,7 @@ mod tests {
         ] {
             let connection = connection(name, 2222)?;
             let maker = ClientHandlerFactory::new(
-                Preferred::default(),
+                &preferred,
                 KnownHostsFile::load(Some(&path))?,
                 &connection,
             );
@@ -601,8 +603,9 @@ mod tests {
             &path,
             format!("server.example {}\n", key.public_key().to_openssh()?),
         )?;
+        let preferred = Preferred::default();
         let maker = ClientHandlerFactory::new(
-            Preferred::default(),
+            &preferred,
             KnownHostsFile::load(Some(&path))?,
             &resolved.connection,
         );

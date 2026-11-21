@@ -20,7 +20,7 @@ ssh [OPTIONS] DESTINATION [COMMAND [ARGUMENT ...]]
 | `-J JUMP` | Supply a comma-separated jump-host chain. `none`, compared without regard to ASCII case, clears the chain. |
 | `-t`, `-tt`, `-T` | Request a remote PTY when local stdin is a terminal, force a remote PTY, or disable the remote PTY. |
 | `-n` | Send channel EOF without reading local stdin. |
-| `-N` | Keep the connection and local forwards alive without starting a remote shell or command. |
+| `-N` | Run without starting a remote shell or command. |
 | `-W HOST:PORT` | Connect local stdin/stdout to a TCP endpoint reached from the SSH server. |
 | `-L FORWARD` | Create a local TCP or Unix-domain listener; repeatable, preserving order. |
 | `-g` | Bind unspecified local TCP listener addresses on all interfaces. |
@@ -174,11 +174,11 @@ Local input EOF sends SSH channel EOF after forwarding an unfinished escape pref
 | Channel closes without `exit-status` | `0`, following the current dependency's initial status. |
 | Local runtime/configuration/connection error | `255`, with `ssh: ...` on stderr unless client logging is disabled. |
 | Interactive disconnect escape | `255`. |
-| Connection closes during `-N` | `255`. |
+| Connection closes during `-N` without local listeners | `255`. |
 
 The current dependency does not translate an SSH `exit-signal` message into the local process being terminated by that signal. Its absence of an `exit-status` therefore follows the no-status behavior above. Clap handles its own help, version, and argument-parsing exits before the runtime path.
 
-When a connected operation ends, including a local-listener setup failure, the application sends an SSH disconnect with reason `ByApplication`. An existing operation error takes precedence over a disconnect error. A disconnect error can turn an otherwise successful operation into a failure while the connection handle remains open.
+When a connected operation ends, including a local-listener setup failure, the application requests an SSH disconnect with reason `ByApplication`. An existing operation error takes precedence over a disconnect error. A disconnect error can turn an otherwise successful operation into a failure while the connection handle remains open.
 
 ## PTYs, local terminal state, and escapes
 
@@ -210,9 +210,10 @@ The application registers Unix signal streams for `SIGHUP`, `SIGINT`, `SIGQUIT`,
 
 | State | `SIGHUP`, `SIGINT`, `SIGQUIT` | `SIGTERM` |
 | --- | --- | --- |
-| Connecting, including host-key confirmation | `255` | `255` |
+| Initial connection setup, including host-key confirmation | `255` | `255` |
 | Connected shell or command | `255` | `255` |
-| Connected `-N` or `-W` | `255` | `0` |
+| `-N` after initial connection setup, including while reconnecting | `255` | `0` |
+| Connected `-W` | `255` | `0` |
 
 These statuses are subject to the normal cleanup/error policy. Local forwarding tasks are stopped before the connection is disconnected.
 
@@ -232,20 +233,45 @@ TCP address parsing supports bracketed IPv6 addresses. Brackets delimit host fie
 
 An unspecified TCP bind address means loopback, or all interfaces with `-g`. An explicit empty bind address or `*` means all interfaces. An explicit address remains explicit regardless of `-g`. Bindings try IPv4 and IPv6 unless `-4`/`-6` restricts the family; IPv6 sockets use `IPV6_V6ONLY` so each listener has a distinct address family. An explicit hostname is resolved and filtered under the same family policy. A forwarding specification succeeds if at least one of its addresses can be bound, and fails if none can be bound.
 
-All requested local listeners are bound before accepting connections. If a later specification fails, earlier bindings are dropped. A Unix-domain listener never removes an existing path to make room. Its cleanup guard records the created socket's device and inode and removes the path only if that same filesystem object is still present, preserving replacements and symlinks. If the initial metadata lookup fails,
-the listener is closed and that error is returned; the path may remain because
-its ownership could not be established.
+The client connects and authenticates to the SSH server before binding the
+requested listeners. It binds all listeners before accepting local connections.
+If a later specification fails, earlier bindings are dropped.
+
+A Unix-domain listener never removes an existing path to make room. Its
+cleanup guard records the created socket's device and inode and removes the
+path only if that same filesystem object is still present, preserving
+replacements and symlinks. If the initial metadata lookup fails, the listener
+closes and the client returns the error. The path may remain because the client
+could not establish its ownership.
+
+In a forwarding-only invocation (`-N` or `-o SessionType=none`), TCP and
+Unix-domain listeners stay bound if the SSH connection drops. Streams using
+that connection end, including a stream whose forwarding channel is still
+opening. Once the client detects the disconnect, the next accepted stream
+triggers a reconnect using the same connection settings, including
+`ProxyJump`. The client makes one reconnect attempt at a time, and concurrent
+arrivals can use the recovered connection.
+
+A transient reconnect failure closes the triggering stream. Streams accepted
+during a short retry delay also close. After the delay, another stream can
+trigger a reconnect. An authentication or host-key verification failure ends
+the invocation with status `255`.
 
 One supervisor polls all listeners in rotation and owns the tasks for accepted
-connections. Listeners do not run in separate tasks. TCP-to-TCP and Unix-to-Unix
-forwarding use the dependency's handle-based forwarding helpers. TCP forwarding
-supplies the local peer address as the originator. Both wait for the library
-forwarding handle. Failure of one accepted stream is logged as an error and
-leaves the listeners running; listener failure or a task panic ends forwarding.
-Ending the session releases listener bindings and cancels and joins all
+connections. TCP forwarding supplies the local peer address as the originator.
+The client logs forwarding channel errors, including server channel refusals,
+and keeps the listeners running. Listener failure or a task panic ends
+forwarding.
+
+Shell, command, `scp`, and `-W` operations use the original SSH connection.
+When an invocation ends, it releases listener bindings and cancels and joins
 accepted-stream tasks before disconnecting the SSH connection.
 
-`-W HOST:PORT` has no local listener. It opens an SSH `direct-tcpip` channel with originator `127.0.0.1:0`, wraps that channel in the dependency's `Child`, and uses the standard-stream pump. This lower-level channel opening is necessary because the dependency's local forwarding helpers take a network stream. It does not add a subsystem or a second forwarding implementation.
+`-W HOST:PORT` forwards stdin and stdout through an SSH `direct-tcpip` channel
+with originator `127.0.0.1:0`. The client wraps the channel in the dependency's
+`Child` and uses the standard-stream pump. This lower-level channel opening
+is necessary because the dependency's local forwarding helpers take a network
+stream.
 
 ## Server host-key policy
 

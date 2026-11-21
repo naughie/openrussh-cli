@@ -1,7 +1,10 @@
 //! Application socket policy around the dependency's SSH connection helpers.
 
+use crate::handler::ClientHandler;
+
 use openrussh_cli_config::AddressFamily;
 use openrussh_client::auth::AuthMethods;
+use openrussh_client::auth::Error as AuthError;
 use openrussh_client::config::{Chain, RequestTty};
 use openrussh_client::connect::{self, Context, MakeHandler};
 use openrussh_client::russh;
@@ -11,6 +14,43 @@ use std::io;
 use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
+
+pub(crate) type ConnectError = connect::Error<ClientHandler, anyhow::Error>;
+
+pub(crate) fn is_terminal_connect_error(error: &ConnectError) -> bool {
+    match error {
+        ConnectError::Establish(error) => !error
+            .downcast_ref::<russh::Error>()
+            .is_some_and(is_transport_error),
+        ConnectError::AuthError(AuthError::Connection(error)) => !is_transport_error(error),
+        ConnectError::AuthError(AuthError::RequestAgent(russh::AgentAuthError::Send(_))) => false,
+        ConnectError::ProxyJump(error) => {
+            use russh::ChannelOpenFailure::{ConnectFailed, ResourceShortage};
+
+            !(is_transport_error(error)
+                || matches!(
+                    error,
+                    russh::Error::ChannelOpenFailure(ConnectFailed | ResourceShortage)
+                ))
+        }
+        ConnectError::AuthError(_) | ConnectError::AuthFailure | ConnectError::MakeHandler(_) => {
+            true
+        }
+    }
+}
+
+fn is_transport_error(error: &russh::Error) -> bool {
+    matches!(
+        error,
+        russh::Error::IO(_)
+            | russh::Error::Disconnect
+            | russh::Error::HUP
+            | russh::Error::ConnectionTimeout
+            | russh::Error::KeepaliveTimeout
+            | russh::Error::InactivityTimeout
+            | russh::Error::SendError
+    )
+}
 
 pub(crate) enum Connection<H: Handler> {
     Managed(connect::Connection<H>),
@@ -121,6 +161,50 @@ pub(crate) fn matches_family(family: AddressFamily, address: &SocketAddr) -> boo
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn reconnect_classifies_connection_setup_errors() {
+        use russh::ChannelOpenFailure::{AdministrativelyProhibited, ConnectFailed};
+
+        for (error, terminal) in [
+            (
+                ConnectError::Establish(
+                    russh::Error::IO(io::ErrorKind::ConnectionRefused.into()).into(),
+                ),
+                false,
+            ),
+            (
+                ConnectError::AuthError(AuthError::Connection(russh::Error::SendError)),
+                false,
+            ),
+            (
+                ConnectError::AuthError(AuthError::RequestAgent(russh::SendError {}.into())),
+                false,
+            ),
+            (
+                ConnectError::ProxyJump(russh::Error::ChannelOpenFailure(ConnectFailed)),
+                false,
+            ),
+            (ConnectError::AuthFailure, true),
+            (ConnectError::AuthError(AuthError::NoPrivateKey), true),
+            (
+                ConnectError::Establish(russh::Error::UnknownKey.into()),
+                true,
+            ),
+            (
+                ConnectError::Establish(anyhow::anyhow!("Host key mismatch")),
+                true,
+            ),
+            (
+                ConnectError::ProxyJump(russh::Error::ChannelOpenFailure(
+                    AdministrativelyProhibited,
+                )),
+                true,
+            ),
+        ] {
+            assert_eq!(is_terminal_connect_error(&error), terminal, "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn direct_connections_obey_the_family_without_changing_the_hostname() -> io::Result<()> {

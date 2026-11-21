@@ -6,6 +6,7 @@ use openrussh_client::russh::client::Handler;
 use anyhow::{Context as _, Result};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
 use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 
 use std::convert::Infallible;
 use std::io;
@@ -16,10 +17,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 pub(crate) struct Forwarding<'a, H: Handler> {
-    conn: &'a Arc<Connection<H>>,
+    conn: Arc<Connection<H>>,
     listeners: Vec<Listener<'a>>,
     tasks: JoinSet<Result<()>>,
     next_listener: usize,
+}
+
+pub(crate) enum ReconnectError {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 enum Listener<'a> {
@@ -65,12 +71,9 @@ impl Drop for SocketPath {
     }
 }
 
-impl<'a, H> Forwarding<'a, H>
-where
-    H: Handler,
-{
+impl<'a, H: Handler> Forwarding<'a, H> {
     pub(crate) async fn start(
-        conn: &'a Arc<Connection<H>>,
+        conn: Arc<Connection<H>>,
         forwards: &'a [LocalForward],
         family: AddressFamily,
     ) -> Result<Self> {
@@ -84,32 +87,76 @@ where
         })
     }
 
-    pub(crate) async fn wait(&mut self) -> Result<Infallible>
+    pub(crate) async fn wait(
+        &mut self,
+        reconnect: Option<impl AsyncFn() -> Result<Connection<H>, ReconnectError>>,
+    ) -> Result<Infallible>
     where
         H: 'static,
     {
+        const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+
+        let mut last_failure: Option<Instant> = None;
+        // The fixed 200 ms period satisfies Tokio's nonzero interval requirement.
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 Some(res) = self.tasks.join_next() => {
                     match res {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => tracing::error!("local forward: {e:#}"),
+                        Err(e) if e.is_cancelled() => {}
                         Err(e) => return Err(e).context("local forwarding task failed"),
+                    }
+                }
+                _ = tick.tick(), if reconnect.is_some() && !self.tasks.is_empty() => {
+                    // A forward can still be waiting for input from its local peer after SSH closes.
+                    if self.conn.handle().is_closed() {
+                        self.tasks.abort_all();
                     }
                 }
                 res = accept_next(&self.listeners, &mut self.next_listener) => {
                     let incoming = res?;
                     tracing::debug!("Local forwarding connection accepted.");
-                    let conn = Arc::clone(self.conn);
+
+                    if let Some(reconnect) = &reconnect
+                        && self.conn.handle().is_closed()
+                    {
+                        self.tasks.abort_all();
+                        if last_failure.is_some_and(|at| at.elapsed() < RECONNECT_BACKOFF) {
+                            continue;
+                        }
+
+                        tracing::debug!("Reconnecting SSH for local forwarding.");
+                        match reconnect().await {
+                            Ok(conn) => {
+                                self.conn = Arc::new(conn);
+                                last_failure = None;
+                            }
+                            Err(ReconnectError::Fatal(e)) => {
+                                return Err(e).context("reconnect SSH for local forwarding");
+                            }
+                            Err(ReconnectError::Transient(e)) => {
+                                last_failure = Some(Instant::now());
+                                tracing::error!("local forward: reconnect SSH: {e}");
+                                continue;
+                            }
+                        }
+                    }
+
+                    let conn = Arc::clone(&self.conn);
                     self.tasks.spawn(async move { forward(&conn, incoming).await });
                 }
             }
         }
     }
 
-    pub(crate) async fn stop(&mut self) {
+    pub(crate) async fn stop(mut self) -> Arc<Connection<H>> {
         self.listeners.clear();
         self.tasks.shutdown().await;
+        self.conn
     }
 }
 

@@ -3,6 +3,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::time::{Duration, sleep, timeout};
 
+mod reconnect;
+
 fn main() {
     let mut rt = t::runtime();
 
@@ -130,6 +132,11 @@ fn main() {
 
         Ok(())
     });
+
+    rt.register(
+        "-N -L reconnects on demand through the same listeners",
+        async || timeout(Duration::from_secs(15), reconnect::check()).await?,
+    );
 
     rt.run();
 }
